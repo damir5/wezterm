@@ -116,7 +116,42 @@ Both system-installed `/Applications/WezTerm.app` and custom experimental builds
 ### Known limitations
 
 - **Glium (OpenGL) backend**: GuiPanes render only the pane background under OpenGL (egui-wgpu is WebGpu-only). WebGpu is WezTerm's default on macOS and most Linux setups.
-- **Slider state-fighting under the deferred model**: the Lua tree refreshes at ~10 Hz while egui renders at frame rate, so an actively-dragged continuous control can snap back to the last-flushed value until the next refresh. Mitigation is to let an in-progress drag own the value egui-side until the next flush — left as a follow-up since interaction is otherwise functional.
+- **Radio-group state**: each `radio` node persists only its own selected flag; selecting one does not clear siblings in the same logical group (needs cross-node coordination). Checkbox/toggle/slider value persistence and readback (`ui:value(id)`) are handled.
+- **Interactive click-test**: input forwarding is wired (`forward_mouse_to_egui` / `forward_key_to_egui`) and on the correct dispatch path, but was not exercised end-to-end because synthesizing clicks into wezterm requires macOS Accessibility permission. Render of the full widget set is verified under WebGpu.
+
+---
+
+## 5. Next phase: dashboard component coverage & gaps
+
+The egui integration is functional. The following maps the intended dashboard
+elements onto the existing widget set, then lists the gaps the design still
+needs from the fork.
+
+### Covered by the existing widget set
+
+| Element | Node |
+| :--- | :--- |
+| Machine / dir group | `collapsing_header` |
+| Agent row | `frame` + `horizontal` |
+| Urgency bar & tint | `style{fill, stroke, rounding}` |
+| Harness / activity glyph | `label` (Nerd Font) or `image` node |
+| Progress `2/3` | `label` + `monospace` |
+| Summary chips | `horizontal` + `metric` |
+| Card grid | `columns` + `card` |
+| Health arc | `progress_bar` (a true arc needs a node) |
+| Row activation | `button` + `ui:clicked(id)` |
+| Overflow | already wrapped in `ScrollArea` |
+
+### Gaps this design needs from the fork
+
+| Need | Why |
+| :--- | :--- |
+| `ui:width()` | Size classes are unbuildable without the pane's pixel width in the render callback. Smallest, highest-value addition on this list. |
+| `ui:collapsed(id)` | egui owns collapse state in its own memory. Lua can't persist the layout across a config reload, or skip building a closed subtree. |
+| Frame time / clock | Breathing and spinner phase need a monotonic `t`. Either drive it from Rust or expose elapsed seconds to Lua. |
+| Full-row hit target | `button` is a button. A source-list row is a borderless full-width click region — needs a `selectable` node or `frame{clickable=true, id=…}`. |
+| Animated position | Urgency ordering needs interpolated row positions, or it snaps. egui can do it; the `UiNode` tree has nowhere to say so. |
+| Arc / donut node | For the card health ring. Optional — a stacked bar substitutes. |
 
 ---
 *Summary of Architectural Decision:* `egui` is embedded into `wezterm-gui` via `egui-wgpu`, composited in a second render pass over the WebGpu surface. Lua drives it through a deferred `UiNode` tree built by `LuaUi` and replayed each frame, with mouse/keyboard input forwarded back into egui. Dual-instance activity tracking works out of the box using file locks and atomic JSON snapshots.
