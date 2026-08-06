@@ -21,7 +21,7 @@ use crate::renderable::{RenderableDimensions, StableCursorPosition};
 use async_trait::async_trait;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use rangeset::RangeSet;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -379,6 +379,11 @@ pub struct GuiPane {
     /// pass, surfaced to the next `render-gui-pane` fire via `clicked()`.
     /// ponytail: one-frame latency is inherent to deferred immediate-mode.
     events: Mutex<HashSet<String>>,
+    /// Latest widget values (sliders) keyed by id, written every render pass
+    /// and read back by Lua via `ui:value(id)`. Owned by render so an in-flight
+    /// drag is smooth between the ~10 Hz Lua refreshes (no snap to a stale
+    /// tree value); Lua catches up each refresh.
+    values: Mutex<HashMap<String, f64>>,
     /// Monotonic generation bumped each time a `render-gui-pane` fire is
     /// scheduled. The async flush checks it so a slow, older handler can't
     /// overwrite a newer widget tree (out-of-order flush guard).
@@ -397,6 +402,7 @@ impl GuiPane {
             nodes: Mutex::new(Vec::new()),
             theme: Mutex::new(UiTheme::default()),
             events: Mutex::new(HashSet::new()),
+            values: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         })
     }
@@ -438,6 +444,19 @@ impl GuiPane {
     /// ~100 ms between refresh ticks even though render runs every frame.
     pub fn set_events(&self, events: HashSet<String>) {
         self.events.lock().extend(events);
+    }
+
+    /// Snapshot of the latest widget values (sliders), for Lua readback via
+    /// `ui:value(id)`. Read semantics: values persist until a later render
+    /// updates them.
+    pub fn values_snapshot(&self) -> HashMap<String, f64> {
+        self.values.lock().clone()
+    }
+
+    /// Replace the widget-value map with the values collected this render
+    /// pass. Called every frame so `value(id)` always reflects the live value.
+    pub fn set_values(&self, values: HashMap<String, f64>) {
+        *self.values.lock() = values;
     }
 
     /// Bump and return the generation; captured by an async flush to detect

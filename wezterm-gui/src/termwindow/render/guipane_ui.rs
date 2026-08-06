@@ -6,10 +6,11 @@
 //! collected into a `HashSet` of widget ids and surfaced back to the Lua
 //! handler on the next `render-gui-pane` fire.
 //!
-//! ponytail: input events (mouse/keyboard) are not yet forwarded from winit
-//! into egui's `RawInput`, so widgets render but do not yet react. The
-//! `clicked` plumbing is wired end-to-end; enabling interaction only needs
-//! `RawInput` population in `call_draw_webgpu`.
+//! ponytail: input is forwarded from winit (`forward_mouse_to_egui` /
+//! `forward_key_to_egui`) into egui's `RawInput` each frame. Interaction
+//! (clicks/toggles/slider changes) is collected into `clicked` and surfaced
+//! to the next `render-gui-pane` fire; slider values are read back via
+//! `ui:value(id)`.
 
 use egui::{Color32, CornerRadius, Frame, Id, Response, RichText, Shape, Stroke, TextureHandle, Ui, Vec2};
 use mux::guipane::{Color, UiNode, UiStyle, UiTheme};
@@ -112,14 +113,27 @@ fn with_tooltip(response: Response, style: &UiStyle) -> Response {
 }
 
 /// Render a slice of nodes into `ui`, appending any activated widget ids to
-/// `clicked`. Container nodes recurse into their children.
-pub fn render_nodes(ui: &mut Ui, nodes: &[UiNode], theme: &UiTheme, clicked: &mut HashSet<String>) {
+/// `clicked` and recording slider values into `values`. Container nodes
+/// recurse into their children.
+pub fn render_nodes(
+    ui: &mut Ui,
+    nodes: &[UiNode],
+    theme: &UiTheme,
+    clicked: &mut HashSet<String>,
+    values: &mut HashMap<String, f64>,
+) {
     for node in nodes {
-        render_node(ui, node, theme, clicked);
+        render_node(ui, node, theme, clicked, values);
     }
 }
 
-fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSet<String>) {
+fn render_node(
+    ui: &mut Ui,
+    node: &UiNode,
+    theme: &UiTheme,
+    clicked: &mut HashSet<String>,
+    values: &mut HashMap<String, f64>,
+) {
     match node {
         UiNode::Metric {
             label,
@@ -171,8 +185,11 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
             checked,
             style,
         } => {
-            let mut v = *checked;
+            // Prefer persisted state (1.0/0.0) so toggles persist between Lua
+            // refreshes and are read back via `ui:value(id)`.
+            let mut v = values.get(id).map(|x| *x != 0.0).unwrap_or(*checked);
             let r = ui.checkbox(&mut v, styled_text(label.clone(), style, theme));
+            values.insert(id.clone(), if v { 1.0 } else { 0.0 });
             if r.changed() {
                 clicked.insert(id.clone());
             }
@@ -185,8 +202,9 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
             on,
             style,
         } => {
-            let mut v = *on;
+            let mut v = values.get(id).map(|x| *x != 0.0).unwrap_or(*on);
             let r = ui.checkbox(&mut v, styled_text(label.clone(), style, theme));
+            values.insert(id.clone(), if v { 1.0 } else { 0.0 });
             if r.changed() {
                 clicked.insert(id.clone());
             }
@@ -212,7 +230,11 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
             label,
             style,
         } => {
-            let mut v = *value;
+            // Prefer the value persisted by the last render pass over the
+            // (possibly stale, up to ~100 ms old) tree value. This lets an
+            // active drag stay smooth frame-to-frame instead of snapping back
+            // to the last-flushed Lua value; Lua catches up via `ui:value(id)`.
+            let mut v = values.get(id).copied().unwrap_or(*value);
             let mut s = egui::Slider::new(&mut v, (*min)..=(*max));
             if let Some(step) = step {
                 s = s.step_by(*step);
@@ -221,6 +243,9 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
                 s = s.text(text);
             }
             let r = ui.add(s);
+            // Always record the rendered value so it survives until the next
+            // Lua refresh, and report a change so Lua can react.
+            values.insert(id.clone(), v);
             if r.changed() {
                 clicked.insert(id.clone());
             }
@@ -267,7 +292,7 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
                     ui.heading(title);
                     ui.add_space(2.0);
                 }
-                render_nodes(ui, children, theme, clicked);
+                render_nodes(ui, children, theme, clicked, values);
             });
         }
         UiNode::CollapsingHeader {
@@ -279,12 +304,12 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
             egui::CollapsingHeader::new(title)
                 .default_open(*default_open)
                 .show(ui, |ui| {
-                    render_nodes(ui, children, theme, clicked);
+                    render_nodes(ui, children, theme, clicked, values);
                 });
         }
         UiNode::Frame { style, children } => {
             frame_for(style, theme, false).show(ui, |ui| {
-                render_nodes(ui, children, theme, clicked);
+                render_nodes(ui, children, theme, clicked, values);
             });
         }
         UiNode::Horizontal {
@@ -292,7 +317,7 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
             children,
         } => {
             ui.horizontal(|ui| {
-                render_nodes(ui, children, theme, clicked);
+                render_nodes(ui, children, theme, clicked, values);
             });
         }
         UiNode::Vertical {
@@ -300,7 +325,7 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
             children,
         } => {
             ui.vertical(|ui| {
-                render_nodes(ui, children, theme, clicked);
+                render_nodes(ui, children, theme, clicked, values);
             });
         }
         UiNode::Columns {
@@ -313,7 +338,7 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
             ui.columns(n, |uis| {
                 for (col, cui) in uis.iter_mut().enumerate() {
                     for child in children.iter().skip(col).step_by(n) {
-                        render_node(cui, child, theme, clicked);
+                        render_node(cui, child, theme, clicked, values);
                     }
                 }
             });
@@ -324,7 +349,7 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
             children,
         } => {
             ui.horizontal_wrapped(|ui| {
-                render_nodes(ui, children, theme, clicked);
+                render_nodes(ui, children, theme, clicked, values);
             });
         }
     }

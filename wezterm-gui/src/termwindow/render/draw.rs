@@ -11,7 +11,7 @@ use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
 use config::FreeTypeLoadTarget;
 use mux::guipane::GuiPane;
 use mux::pane::Pane;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 impl crate::TermWindow {
@@ -359,6 +359,9 @@ fn composite_egui_panes(
         let theme = g.theme();
         let nodes = g.nodes();
         let mut clicked: HashSet<String> = HashSet::new();
+        // Seed widget values from the pane so an in-flight drag stays smooth
+        // between Lua refreshes (render owns the value until Lua catches up).
+        let mut values = g.values_snapshot();
         let pos = egui::pos2(rect.origin.x / pixels_per_point, rect.origin.y / pixels_per_point);
         egui::Area::new(egui::Id::new(pane.pane_id()))
             .order(egui::Order::Foreground)
@@ -377,16 +380,16 @@ fn composite_egui_panes(
                     .max_width(size.x)
                     .max_height(size.y)
                     .show(ui, |ui| {
-                        guipane_ui::render_nodes(ui, &nodes, &theme, &mut clicked);
+                        guipane_ui::render_nodes(ui, &nodes, &theme, &mut clicked, &mut values);
                     });
             });
         g.set_events(clicked);
+        g.set_values(values);
     }
 
     let full_output = ctx.end_frame();
-    let shapes = full_output.shapes;
     let textures_delta = full_output.textures_delta;
-    let paint_jobs = ctx.tessellate(shapes, pixels_per_point);
+    let paint_jobs = ctx.tessellate(full_output.shapes, pixels_per_point);
 
     let screen_descriptor = egui_wgpu::ScreenDescriptor {
         size_in_pixels: [pixel_w, pixel_h],

@@ -15,7 +15,7 @@ use mux::guipane::{Color, GuiPane, UiNode, UiStyle, UiTheme};
 use mux::pane::Pane;
 use mux::tab::{SplitDirection, SplitRequest, SplitSize};
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Builder userdata that accumulates a `UiNode` tree from Lua calls.
@@ -32,6 +32,9 @@ pub struct LuaUi {
     /// Widget ids reported as activated by the last egui render pass;
     /// `ui:clicked(id)` lets the handler react with one-frame latency.
     events: Arc<Mutex<HashSet<String>>>,
+    /// Latest widget values (sliders) from the last render pass, read back by
+    /// `ui:value(id)`. Seeded from the GuiPane at the start of each fire.
+    values: Arc<Mutex<HashMap<String, f64>>>,
 }
 
 impl LuaUi {
@@ -41,6 +44,7 @@ impl LuaUi {
             pending: Arc::new(Mutex::new(UiStyle::default())),
             theme: Arc::new(Mutex::new(None)),
             events: Arc::new(Mutex::new(HashSet::new())),
+            values: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -48,6 +52,18 @@ impl LuaUi {
     /// so `ui:clicked(id)` reflects the most recent interaction.
     pub fn set_events(&self, events: HashSet<String>) {
         *self.events.lock() = events;
+    }
+
+    /// Pre-load the latest widget values (sliders) so `ui:value(id)` reflects
+    /// the most recent render pass during this fire.
+    pub fn set_values(&self, values: HashMap<String, f64>) {
+        *self.values.lock() = values;
+    }
+
+    /// Direct accessor for the latest value of a stateful widget (slider),
+    /// keyed by id. The `ui:value(id)` Lua method delegates here.
+    pub fn value(&self, id: &str) -> Option<f64> {
+        self.values.lock().get(id).copied()
     }
 
     fn push_leaf(&self, mut node: UiNode) {
@@ -254,6 +270,13 @@ impl UserData for LuaUi {
         methods.add_method("clicked", |_, this, id: String| {
             Ok(this.events.lock().contains(&id))
         });
+
+        // ui:value("workers") -> number|nil; the latest value of a stateful
+        // widget (slider) from the last render pass, or nil if never set. Lets a
+        // handler feed the live value back into the widget so drags persist:
+        //   local v = ui:value("workers") or DEFAULT
+        //   ui:slider({ id = "workers", value = v, min = 1, max = 16 })
+        methods.add_method("value", |_, this, id: String| Ok(this.value(&id)));
 
         // --- Leaf widgets ----------------------------------------------
 
@@ -617,6 +640,12 @@ pub fn split_dashboard(opts: Option<mlua::Table>) -> mlua::Result<MuxPane> {
         });
 
     let gui: Arc<dyn Pane> = GuiPane::new(title, dims);
+    // Register the GuiPane with the mux's pane map. The tab's prune_dead_panes
+    // treats any pane not in the mux as dead and removes it (wezterm #4030);
+    // normal PTY panes are registered by their spawn domain, but a GuiPane is
+    // created directly, so register it ourselves or it's pruned on first paint.
+    mux.add_pane(&gui)
+        .map_err(|e| mlua::Error::external(format!("add_pane: {e:#}")))?;
     let request = SplitRequest {
         direction: SplitDirection::Horizontal,
         target_is_second: true,
@@ -768,6 +797,27 @@ mod test {
             }
             other => panic!("expected Image, got {:?}", std::mem::discriminant(other)),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn value_readback_round_trips_to_lua() -> anyhow::Result<()> {
+        // Simulate the render pass writing a slider value onto the pane, then a
+        // refresh handing that snapshot to a fresh LuaUi. Lua must read it back
+        // via ui:value(id), and an unknown id returns nil.
+        let pane = GuiPane::new(
+            "x",
+            mux::renderable::RenderableDimensions::default(),
+        );
+        let mut vals = HashMap::new();
+        vals.insert("workers".to_string(), 9.0);
+        pane.set_values(vals);
+
+        let ui = LuaUi::new();
+        ui.set_values(pane.values_snapshot());
+
+        assert_eq!(ui.value("workers"), Some(9.0));
+        assert_eq!(ui.value("missing"), None);
         Ok(())
     }
 

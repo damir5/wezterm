@@ -281,10 +281,9 @@ impl super::TermWindow {
         });
 
         // Only forward events that are inside a GuiPane.
-        let gui_rect = match gui_rect {
-            Some(r) => r,
-            None => return,
-        };
+        if gui_rect.is_none() {
+            return;
+        }
 
         match event.kind {
             WMEK::Move => {
@@ -311,7 +310,7 @@ impl super::TermWindow {
                         modifiers: self.modifiers_to_egui(),
                     });
             }
-            WMEK::VertWheel(delta) | WMEK::HorzWheel(delta) => {
+            WMEK::VertWheel(delta) => {
                 let unit = if delta.abs() > 30 {
                     egui::MouseWheelUnit::Line
                 } else {
@@ -325,7 +324,20 @@ impl super::TermWindow {
                         modifiers: self.modifiers_to_egui(),
                     });
             }
-            _ => {}
+            WMEK::HorzWheel(delta) => {
+                let unit = if delta.abs() > 30 {
+                    egui::MouseWheelUnit::Line
+                } else {
+                    egui::MouseWheelUnit::Point
+                };
+                let delta = egui::vec2(delta as f32 / pixels_per_point, 0.0);
+                self.egui_input_events
+                    .push(egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers: self.modifiers_to_egui(),
+                    });
+            }
         }
     }
 
@@ -342,6 +354,9 @@ impl super::TermWindow {
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
         self.current_mouse_event = None;
+        // Tell egui the pointer left the window so it clears hover/active
+        // state instead of leaving widgets stuck hovered.
+        self.egui_input_events.push(egui::Event::PointerGone);
         self.update_title();
         context.set_cursor(Some(MouseCursor::Arrow));
         context.invalidate();
