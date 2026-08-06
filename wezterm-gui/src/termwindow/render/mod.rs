@@ -38,6 +38,7 @@ pub mod borders;
 pub mod corners;
 pub mod draw;
 pub mod fancy_tab_bar;
+pub mod guipane_ui;
 pub mod paint;
 pub mod pane;
 pub mod screen_line;
