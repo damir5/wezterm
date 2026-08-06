@@ -1658,6 +1658,7 @@ impl TermWindow {
             let ui = mux_lua::LuaUi::new();
             let g_generation = if let Some(g) = pos.pane.downcast_ref::<mux::guipane::GuiPane>() {
                 ui.set_events(g.drain_clicked());
+                ui.set_values(g.values_snapshot());
                 g.bump_generation()
             } else {
                 0
