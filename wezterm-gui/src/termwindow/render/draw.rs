@@ -1,4 +1,5 @@
 use crate::colorease::ColorEaseUniform;
+use crate::termwindow::render::guipane_ui;
 use crate::termwindow::webgpu::ShaderUniform;
 use crate::termwindow::RenderFrame;
 use crate::uniforms::UniformBuilder;
@@ -8,6 +9,10 @@ use ::window::glium::uniforms::{
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
 use config::FreeTypeLoadTarget;
+use mux::guipane::GuiPane;
+use mux::pane::Pane;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 impl crate::TermWindow {
     pub fn call_draw(&mut self, frame: &mut RenderFrame) -> anyhow::Result<()> {
@@ -20,7 +25,7 @@ impl crate::TermWindow {
     fn call_draw_webgpu(&mut self) -> anyhow::Result<()> {
         use crate::termwindow::webgpu::WebGpuTexture;
 
-        let webgpu = self.webgpu.as_mut().unwrap();
+        let webgpu = self.webgpu.as_ref().unwrap();
         let render_state = self.render_state.as_ref().unwrap();
 
         let output = webgpu.surface.get_current_texture()?;
@@ -142,8 +147,32 @@ impl crate::TermWindow {
             }
         }
 
-        // submit will accept anything that implements IntoIter
-        webgpu.queue.submit(std::iter::once(encoder.finish()));
+        // egui compositing pass for GuiPane dashboards: replay each pane's
+        // widget tree into a real egui frame and record it into the same
+        // surface view via a second LoadOp::Load render pass. Skipped when no
+        // GuiPane is visible this frame.
+        let egui_cmd_bufs: Vec<wgpu::CommandBuffer> = if !self.gui_render_list.is_empty() {
+            let format = webgpu.config.borrow().format;
+            composite_egui_panes(
+                &mut self.egui_ctx,
+                &mut self.egui_renderer,
+                &self.gui_render_list,
+                self.dimensions.pixel_width as u32,
+                self.dimensions.pixel_height as u32,
+                (self.dimensions.dpi as f32 / 96.0).max(1.0),
+                &webgpu.device,
+                &webgpu.queue,
+                format,
+                &view,
+                &mut encoder,
+            )?
+        } else {
+            Vec::new()
+        };
+
+        // Submit order matches the canonical egui-wgpu flow: the callback
+        // command buffers from update_buffers first, then the encoded pass.
+        webgpu.queue.submit(egui_cmd_bufs.into_iter().chain(std::iter::once(encoder.finish())));
         output.present();
 
         Ok(())
@@ -273,4 +302,123 @@ impl crate::TermWindow {
 
         Ok(())
     }
+}
+
+/// Drive egui for every visible `GuiPane` and record its paint jobs into the
+/// given encoder + surface view. Lazily initializes the egui context and
+/// wgpu renderer on first use. Returns auxiliary command buffers produced by
+/// `egui_wgpu::Renderer::update_buffers` that must be submitted alongside the
+/// main encoder.
+///
+/// ponytail: `RawInput` carries no pointer/keyboard events yet, so widgets
+/// render but do not interact. Forwarding winit events here (the plan's
+/// "Event Interception" step) makes the deferred `clicked` plumbing live;
+/// events accumulate on each pane and are drained per refresh tick, so clicks
+/// won't be lost to the frame/refresh rate mismatch.
+fn composite_egui_panes(
+    egui_ctx: &mut Option<egui::Context>,
+    egui_renderer: &mut Option<egui_wgpu::Renderer>,
+    render_list: &[(euclid::default::Rect<f32>, Arc<dyn Pane>)],
+    pixel_w: u32,
+    pixel_h: u32,
+    pixels_per_point: f32,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    view: &wgpu::TextureView,
+    encoder: &mut wgpu::CommandEncoder,
+) -> anyhow::Result<Vec<wgpu::CommandBuffer>> {
+    if egui_ctx.is_none() {
+        *egui_ctx = Some(egui::Context::default());
+    }
+    let ctx = egui_ctx.as_ref().unwrap();
+    if egui_renderer.is_none() {
+        *egui_renderer = Some(egui_wgpu::Renderer::new(
+            device, format, None, 1, false,
+        ));
+    }
+    let renderer = egui_renderer.as_mut().unwrap();
+
+    ctx.set_pixels_per_point(pixels_per_point);
+    let screen_rect = egui::Rect::from_min_size(
+        egui::pos2(0.0, 0.0),
+        egui::vec2(pixel_w as f32 / pixels_per_point, pixel_h as f32 / pixels_per_point),
+    );
+    let raw_input = egui::RawInput {
+        screen_rect: Some(screen_rect),
+        ..Default::default()
+    };
+    ctx.begin_frame(raw_input);
+
+    for (rect, pane) in render_list.iter() {
+        let Some(g) = pane.downcast_ref::<GuiPane>() else {
+            continue;
+        };
+        let theme = g.theme();
+        let nodes = g.nodes();
+        let mut clicked: HashSet<String> = HashSet::new();
+        let pos = egui::pos2(rect.origin.x / pixels_per_point, rect.origin.y / pixels_per_point);
+        egui::Area::new(egui::Id::new(pane.pane_id()))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .interactable(true)
+            .show(ctx, |ui| {
+                // Theme + clip are scoped to this pane's Ui so concurrent
+                // GuiPanes don't bleed visuals into one another, and overflow
+                // scrolls instead of spilling onto neighbouring panes.
+                guipane_ui::apply_theme(ui, &theme);
+                let size = egui::vec2(
+                    rect.size.width / pixels_per_point,
+                    rect.size.height / pixels_per_point,
+                );
+                egui::ScrollArea::vertical()
+                    .max_width(size.x)
+                    .max_height(size.y)
+                    .show(ui, |ui| {
+                        guipane_ui::render_nodes(ui, &nodes, &theme, &mut clicked);
+                    });
+            });
+        g.set_events(clicked);
+    }
+
+    let full_output = ctx.end_frame();
+    let shapes = full_output.shapes;
+    let textures_delta = full_output.textures_delta;
+    let paint_jobs = ctx.tessellate(shapes, pixels_per_point);
+
+    let screen_descriptor = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [pixel_w, pixel_h],
+        pixels_per_point,
+    };
+
+    for (id, delta) in &textures_delta.set {
+        renderer.update_texture(device, queue, *id, delta);
+    }
+    let user_cmd_bufs =
+        renderer.update_buffers(device, queue, encoder, &paint_jobs, &screen_descriptor);
+    for id in &textures_delta.free {
+        renderer.free_texture(id);
+    }
+
+    // Second pass over the surface view, preserving WezTerm's drawn pixels.
+    {
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("egui pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        let mut render_pass = render_pass.forget_lifetime();
+        renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
+    }
+
+    Ok(user_cmd_bufs)
 }

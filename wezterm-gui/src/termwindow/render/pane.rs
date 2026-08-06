@@ -29,11 +29,100 @@ impl crate::TermWindow {
         self.render_element(&computed, gl_state, None)
     }
 
+    /// Render a `GuiPane`: fills its pane rect via the native quad renderer,
+    /// then stashes `(rect, pane)` for the egui compositing pass in
+    /// `call_draw_webgpu`, which replays the widget tree produced by the Lua
+    /// `render-gui-pane` callback. The background fill ensures the dashboard
+    /// has a solid base even before egui paints widgets on top.
+    pub fn paint_gui_pane(
+        &mut self,
+        pos: &PositionedPane,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let (padding_left, padding_top) = self.padding_left_top();
+        let tab_bar_height = if self.show_tab_bar {
+            self.tab_bar_pixel_height()
+                .context("tab_bar_pixel_height")?
+        } else {
+            0.
+        };
+        let top_bar_height = if self.config.tab_bar_at_bottom {
+            0.0
+        } else {
+            tab_bar_height
+        };
+        let border = self.get_os_border();
+        let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
+
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+
+        let pane_rect = {
+            let (x, width_delta) = if pos.left == 0 {
+                (0., padding_left + border.left.get() as f32 + (cell_width / 2.0))
+            } else {
+                (
+                    padding_left + border.left.get() as f32 - (cell_width / 2.0)
+                        + (pos.left as f32 * cell_width),
+                    cell_width,
+                )
+            };
+            let (y, height_delta) = if pos.top == 0 {
+                (top_pixel_y - padding_top, padding_top + (cell_height / 2.0))
+            } else {
+                (
+                    top_pixel_y + (pos.top as f32 * cell_height) - (cell_height / 2.0),
+                    cell_height,
+                )
+            };
+            euclid::rect(
+                x,
+                y,
+                if pos.left + pos.width >= self.terminal_size.cols as usize {
+                    self.dimensions.pixel_width as f32 - x
+                } else {
+                    (pos.width as f32 * cell_width) + width_delta
+                },
+                if pos.top + pos.height >= self.terminal_size.rows as usize {
+                    self.dimensions.pixel_height as f32 - y
+                } else {
+                    (pos.height as f32 * cell_height) + height_delta as f32
+                },
+            )
+        };
+
+        let palette = pos.pane.palette();
+
+        // Pane background.
+        let _bg = self.filled_rectangle(
+            layers,
+            0,
+            pane_rect,
+            palette
+                .background
+                .to_linear()
+                .mul_alpha(self.config.window_background_opacity),
+        )?;
+
+        // The widget tree itself is drawn by the egui pass in
+        // `call_draw_webgpu`; record this pane's screen rect so egui knows
+        // where to composite it. egui clips to its own Area rect.
+        self.gui_render_list
+            .push((pane_rect.to_untyped(), std::sync::Arc::clone(&pos.pane)));
+
+        Ok(())
+    }
+
     pub fn paint_pane(
         &mut self,
         pos: &PositionedPane,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
+        // GUI panes own their pixels; route them to the GUI render pass
+        // instead of rasterizing terminal cells.
+        if pos.pane.downcast_ref::<mux::guipane::GuiPane>().is_some() {
+            return self.paint_gui_pane(pos, layers);
+        }
         if self.config.use_box_model_render {
             return self.paint_pane_box_model(pos);
         }

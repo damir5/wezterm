@@ -466,6 +466,19 @@ pub struct TermWindow {
     gl: Option<Rc<glium::backend::Context>>,
     webgpu: Option<Rc<WebGpuState>>,
     config_subscription: Option<config::ConfigSubscription>,
+
+    /// egui state for `GuiPane` dashboards. Lazy-initialized in the WebGpu
+    /// draw path on first frame (needs device + surface format).
+    egui_ctx: Option<egui::Context>,
+    egui_renderer: Option<egui_wgpu::Renderer>,
+    /// `(screen_rect, GuiPane)` pairs collected during `paint_pass`, consumed
+    /// by the egui compositing pass in `call_draw_webgpu`. Cleared each frame.
+    pub(crate) gui_render_list:
+        Vec<(euclid::default::Rect<f32>, std::sync::Arc<dyn mux::pane::Pane>)>,
+
+    /// Throttle for `refresh_gui_panes` so `render-gui-pane` doesn't fire
+    /// more often than the dashboard can usefully update.
+    last_gui_refresh: Option<Instant>,
 }
 
 impl TermWindow {
@@ -691,6 +704,10 @@ impl TermWindow {
             os_parameters: None,
             gl: None,
             webgpu: None,
+            egui_ctx: None,
+            egui_renderer: None,
+            gui_render_list: Vec::new(),
+            last_gui_refresh: None,
             window: None,
             window_background,
             config: config.clone(),
@@ -1610,6 +1627,59 @@ impl TermWindow {
         .detach();
     }
 
+    /// Emit `wezterm.on("render-gui-pane", function(window, pane, ui))` for
+    /// every visible `GuiPane`, then flush the handler-built `LuaUi` tree onto
+    /// the pane so the egui render pass picks it up. Throttled to ~10 Hz.
+    pub fn refresh_gui_panes(&mut self) {
+        use std::time::Duration;
+
+        if self.window.is_none() {
+            return;
+        }
+        if matches!(self.last_gui_refresh, Some(t) if t.elapsed() < Duration::from_millis(100)) {
+            return;
+        }
+        self.last_gui_refresh = Some(Instant::now());
+
+        for pos in self.get_panes_to_render() {
+            if pos.pane.downcast_ref::<mux::guipane::GuiPane>().is_none() {
+                continue;
+            }
+            let window = GuiWin::new(self);
+            let pane = MuxPane(pos.pane.pane_id());
+            let ui = mux_lua::LuaUi::new();
+            if let Some(g) = pos.pane.downcast_ref::<mux::guipane::GuiPane>() {
+                ui.set_events(g.drain_clicked());
+            }
+            let gp = pos.pane.clone();
+            let name = "render-gui-pane".to_string();
+            promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
+                let name = name;
+                let window = window;
+                let pane = pane;
+                let ui = ui;
+                let gp = gp;
+                async move {
+                    if let Some(lua) = lua {
+                        if let Ok(args) = lua.pack_multi((window.clone(), pane.clone(), ui.clone()))
+                        {
+                            if let Err(err) =
+                                config::lua::emit_event(&lua, (name.clone(), args)).await
+                            {
+                                log::error!("while processing {} event: {:#}", name, err);
+                            }
+                        }
+                    }
+                    if let Some(g) = gp.downcast_ref::<mux::guipane::GuiPane>() {
+                        mux_lua::flush_ui_to_pane(&ui, g);
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+            }))
+            .detach();
+        }
+    }
+
     /// Called as part of finishing up a callout to lua.
     /// If again==false it means that there isn't a lua config
     /// to execute against, so we should just mark as done.
@@ -1956,6 +2026,8 @@ impl TermWindow {
     /// been updated; let's update the bar
     pub fn update_title_post_status(&mut self) {
         self.update_title_impl();
+        // Rebuild any GuiPane dashboards from their render-gui-pane handlers.
+        self.refresh_gui_panes();
     }
 
     fn update_title_impl(&mut self) {

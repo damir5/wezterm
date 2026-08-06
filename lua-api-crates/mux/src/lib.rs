@@ -15,11 +15,13 @@ use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_term::TerminalSize;
 
 mod domain;
+mod gui;
 mod pane;
 mod tab;
 mod window;
 
 pub use domain::MuxDomain;
+pub use gui::{flush_ui_to_pane, split_dashboard, LuaUi};
 pub use pane::MuxPane;
 pub use tab::MuxTab;
 pub use window::MuxWindow;
@@ -166,6 +168,17 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
             mux.set_default_domain(&domain);
             Ok(())
         })?,
+    )?;
+
+    // wezterm.gui: LuaUi dashboard builder handed to render-gui-pane handlers.
+    let gui_mod = get_or_create_sub_module(lua, "gui")?;
+    gui_mod.set(
+        "new_ui",
+        lua.create_function(|_, _: ()| Ok(LuaUi::new()))?,
+    )?;
+    gui_mod.set(
+        "split_dashboard",
+        lua.create_function(|_, opts: Option<mlua::Table>| split_dashboard(opts))?,
     )?;
 
     Ok(())

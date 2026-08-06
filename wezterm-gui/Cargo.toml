@@ -46,6 +46,8 @@ dhat = {workspace=true, optional=true}
 dirs-next.workspace = true
 downcast-rs.workspace = true
 emojis.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
 env-bootstrap.workspace = true
 euclid.workspace = true
 fastrand.workspace = true

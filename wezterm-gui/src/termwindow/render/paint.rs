@@ -171,6 +171,8 @@ impl crate::TermWindow {
 
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
+        // Rebuild the GuiPane render list each frame (consumed in call_draw).
+        self.gui_render_list.clear();
 
         let panes = self.get_panes_to_render();
         let focused = self.focused.is_some();
