@@ -3,7 +3,7 @@ use crate::termwindow::{
     GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
-    CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
+    Modifiers, CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
     WindowDecorations, WindowOps, WindowState,
 };
 use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
@@ -60,6 +60,11 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+
+        // Forward to egui if position is inside a GuiPane.
+        // Check this before any early returns so egui gets all moves.
+        self.forward_mouse_to_egui(&event);
+
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
@@ -241,6 +246,97 @@ impl super::TermWindow {
 
         if prior_ui_item != ui_item {
             self.update_title_post_status();
+        }
+    }
+
+    /// Forward mouse events to egui if they fall inside a GuiPane rect.
+    /// Converts WezTerm physical pixels to egui points and filters to GuiPanes.
+    fn forward_mouse_to_egui(&mut self, event: &MouseEvent) {
+        let pixels_per_point = (self.dimensions.dpi as f32 / 96.0).max(1.0);
+
+        // Convert WezTerm physical pixels to egui points.
+        let pos = egui::pos2(
+            event.coords.x as f32 / pixels_per_point,
+            event.coords.y as f32 / pixels_per_point,
+        );
+        self.egui_pointer_pos = pos;
+
+        // Check if position is inside any GuiPane rect.
+        let gui_rect = self.gui_render_list.iter().find_map(|(rect, _pane)| {
+            let egui_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.origin.x as f32 / pixels_per_point,
+                    rect.origin.y as f32 / pixels_per_point,
+                ),
+                egui::vec2(
+                    rect.size.width as f32 / pixels_per_point,
+                    rect.size.height as f32 / pixels_per_point,
+                ),
+            );
+            if egui_rect.contains(pos) {
+                Some(egui_rect)
+            } else {
+                None
+            }
+        });
+
+        // Only forward events that are inside a GuiPane.
+        let gui_rect = match gui_rect {
+            Some(r) => r,
+            None => return,
+        };
+
+        match event.kind {
+            WMEK::Move => {
+                self.egui_input_events
+                    .push(egui::Event::PointerMoved(pos));
+            }
+            WMEK::Press(ref press) => {
+                let btn = mouse_press_to_egui(press);
+                self.egui_input_events
+                    .push(egui::Event::PointerButton {
+                        pos,
+                        button: btn,
+                        pressed: true,
+                        modifiers: self.modifiers_to_egui(),
+                    });
+            }
+            WMEK::Release(ref press) => {
+                let btn = mouse_press_to_egui(press);
+                self.egui_input_events
+                    .push(egui::Event::PointerButton {
+                        pos,
+                        button: btn,
+                        pressed: false,
+                        modifiers: self.modifiers_to_egui(),
+                    });
+            }
+            WMEK::VertWheel(delta) | WMEK::HorzWheel(delta) => {
+                let unit = if delta.abs() > 30 {
+                    egui::MouseWheelUnit::Line
+                } else {
+                    egui::MouseWheelUnit::Point
+                };
+                let delta = egui::vec2(0.0, -delta as f32 / pixels_per_point);
+                self.egui_input_events
+                    .push(egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers: self.modifiers_to_egui(),
+                    });
+            }
+            _ => {}
+        }
+    }
+
+    fn modifiers_to_egui(&self) -> egui::Modifiers {
+        let (mods, _leds) = &self.current_modifier_and_leds;
+        egui::Modifiers {
+            alt: mods.contains(Modifiers::ALT),
+            ctrl: mods.contains(Modifiers::CTRL) || mods.contains(Modifiers::SUPER),
+            shift: mods.contains(Modifiers::SHIFT),
+            mac_cmd: mods.contains(Modifiers::SUPER),
+            command: mods.contains(Modifiers::SUPER), // On all platforms, treat SUPER as Command
         }
     }
 
@@ -1049,5 +1145,13 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
         MousePress::Left => TMB::Left,
         MousePress::Right => TMB::Right,
         MousePress::Middle => TMB::Middle,
+    }
+}
+
+fn mouse_press_to_egui(press: &MousePress) -> egui::PointerButton {
+    match press {
+        MousePress::Left => egui::PointerButton::Primary,
+        MousePress::Right => egui::PointerButton::Secondary,
+        MousePress::Middle => egui::PointerButton::Middle,
     }
 }

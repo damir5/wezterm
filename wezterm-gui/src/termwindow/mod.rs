@@ -479,6 +479,12 @@ pub struct TermWindow {
     /// Throttle for `refresh_gui_panes` so `render-gui-pane` doesn't fire
     /// more often than the dashboard can usefully update.
     last_gui_refresh: Option<Instant>,
+
+    /// Accumulated egui input events for the next frame. Cleared after each
+    /// egui pass. Stores pointer and keyboard events that fall inside GuiPane rects.
+    egui_input_events: Vec<egui::Event>,
+    /// Last known pointer position for egui (in points, not pixels).
+    egui_pointer_pos: egui::Pos2,
 }
 
 impl TermWindow {
@@ -708,6 +714,8 @@ impl TermWindow {
             egui_renderer: None,
             gui_render_list: Vec::new(),
             last_gui_refresh: None,
+            egui_input_events: Vec::new(),
+            egui_pointer_pos: egui::pos2(0.0, 0.0),
             window: None,
             window_background,
             config: config.clone(),
@@ -1648,17 +1656,24 @@ impl TermWindow {
             let window = GuiWin::new(self);
             let pane = MuxPane(pos.pane.pane_id());
             let ui = mux_lua::LuaUi::new();
-            if let Some(g) = pos.pane.downcast_ref::<mux::guipane::GuiPane>() {
+            let g_generation = if let Some(g) = pos.pane.downcast_ref::<mux::guipane::GuiPane>() {
                 ui.set_events(g.drain_clicked());
-            }
+                g.bump_generation()
+            } else {
+                0
+            };
             let gp = pos.pane.clone();
             let name = "render-gui-pane".to_string();
+            // Bump generation; the flush skips if a newer refresh superseded
+            // this one, so a slow handler can't overwrite a fresher tree.
+            let generation = g_generation;
             promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
                 let name = name;
                 let window = window;
                 let pane = pane;
                 let ui = ui;
                 let gp = gp;
+                let generation = generation;
                 async move {
                     if let Some(lua) = lua {
                         if let Ok(args) = lua.pack_multi((window.clone(), pane.clone(), ui.clone()))
@@ -1671,7 +1686,10 @@ impl TermWindow {
                         }
                     }
                     if let Some(g) = gp.downcast_ref::<mux::guipane::GuiPane>() {
-                        mux_lua::flush_ui_to_pane(&ui, g);
+                        // Out-of-order flush guard: drop stale results.
+                        if g.generation() == generation {
+                            mux_lua::flush_ui_to_pane(&ui, g);
+                        }
                     }
                     Ok::<(), anyhow::Error>(())
                 }

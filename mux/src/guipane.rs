@@ -297,6 +297,15 @@ pub enum UiNode {
         height: Option<f32>,
         style: UiStyle,
     },
+    /// A raster image (decoded bytes, e.g. PNG/JPEG). `id` is the cache key;
+    /// change it when the content changes. Optional width/height are in egui
+    /// points.
+    Image {
+        id: String,
+        bytes: Arc<[u8]>,
+        width: Option<f32>,
+        height: Option<f32>,
+    },
     /// Container: framed card with optional title and translucent "glass".
     Card {
         title: Option<String>,
@@ -370,6 +379,10 @@ pub struct GuiPane {
     /// pass, surfaced to the next `render-gui-pane` fire via `clicked()`.
     /// ponytail: one-frame latency is inherent to deferred immediate-mode.
     events: Mutex<HashSet<String>>,
+    /// Monotonic generation bumped each time a `render-gui-pane` fire is
+    /// scheduled. The async flush checks it so a slow, older handler can't
+    /// overwrite a newer widget tree (out-of-order flush guard).
+    generation: AtomicU64,
 }
 
 impl GuiPane {
@@ -384,6 +397,7 @@ impl GuiPane {
             nodes: Mutex::new(Vec::new()),
             theme: Mutex::new(UiTheme::default()),
             events: Mutex::new(HashSet::new()),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -424,6 +438,16 @@ impl GuiPane {
     /// ~100 ms between refresh ticks even though render runs every frame.
     pub fn set_events(&self, events: HashSet<String>) {
         self.events.lock().extend(events);
+    }
+
+    /// Bump and return the generation; captured by an async flush to detect
+    /// that a newer refresh superseded it.
+    pub fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 }
 
