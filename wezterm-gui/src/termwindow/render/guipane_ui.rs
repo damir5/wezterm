@@ -11,9 +11,9 @@
 //! `clicked` plumbing is wired end-to-end; enabling interaction only needs
 //! `RawInput` population in `call_draw_webgpu`.
 
-use egui::{Color32, CornerRadius, Frame, Response, RichText, Shape, Stroke, Ui, Vec2};
+use egui::{Color32, CornerRadius, Frame, Id, Response, RichText, Shape, Stroke, TextureHandle, Ui, Vec2};
 use mux::guipane::{Color, UiNode, UiStyle, UiTheme};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Convert a linear-ish RGBA (0.0..=1.0) to an egui `Color32`.
 /// ponytail: no gamma correction; dashboard colors are approximate.
@@ -250,6 +250,12 @@ fn render_node(ui: &mut Ui, node: &UiNode, theme: &UiTheme, clicked: &mut HashSe
             height,
             style: _,
         } => render_sparkline(ui, values, *color, *fill, *height, theme),
+        UiNode::Image {
+            id,
+            bytes,
+            width,
+            height,
+        } => render_image(ui, id, bytes, *width, *height),
         UiNode::Card {
             title,
             glass,
@@ -360,4 +366,48 @@ fn render_sparkline(
         painter.add(Shape::convex_polygon(poly, col.linear_multiply(0.25), Stroke::NONE));
     }
     painter.add(Shape::line(pts, Stroke::new(1.5, col)));
+}
+
+/// egui Context temp-data key for the per-window GuiPane image texture cache.
+const IMAGE_CACHE: &str = "guipane-images";
+
+/// Decode `bytes` (PNG/JPEG/etc. via the `image` crate) into an egui texture.
+fn load_image_texture(ctx: &egui::Context, bytes: &[u8]) -> Option<TextureHandle> {
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color = egui::epaint::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture("guipane-image", color, Default::default()))
+}
+
+/// Render an image node, caching decoded textures in egui context temp data so
+/// repeated frames don't re-decode/re-upload. Keyed by the node's `id`.
+fn render_image(ui: &mut Ui, id: &str, bytes: &[u8], width: Option<f32>, height: Option<f32>) {
+    let ctx = ui.ctx().clone();
+    let cache_id = Id::new(IMAGE_CACHE);
+
+    let missing = ctx.data(|d| {
+        d.get_temp::<HashMap<String, TextureHandle>>(cache_id)
+            .map(|c| !c.contains_key(id))
+            .unwrap_or(true)
+    });
+    if missing {
+        if let Some(tex) = load_image_texture(&ctx, bytes) {
+            ctx.data_mut(|d| {
+                d.get_temp_mut_or_default::<HashMap<String, TextureHandle>>(cache_id)
+                    .insert(id.to_string(), tex);
+            });
+        }
+    }
+
+    let tex = ctx.data(|d| {
+        d.get_temp::<HashMap<String, TextureHandle>>(cache_id)
+            .and_then(|c| c.get(id).cloned())
+    });
+    if let Some(tex) = tex {
+        let nat = tex.size_vec2();
+        let size = Vec2::new(width.unwrap_or(nat.x), height.unwrap_or(nat.y));
+        ui.add(egui::Image::from_texture(&tex).max_size(size));
+    } else {
+        ui.label("[image decode failed]");
+    }
 }

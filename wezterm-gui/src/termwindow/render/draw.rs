@@ -151,6 +151,7 @@ impl crate::TermWindow {
         // widget tree into a real egui frame and record it into the same
         // surface view via a second LoadOp::Load render pass. Skipped when no
         // GuiPane is visible this frame.
+        let egui_events = std::mem::take(&mut self.egui_input_events);
         let egui_cmd_bufs: Vec<wgpu::CommandBuffer> = if !self.gui_render_list.is_empty() {
             let format = webgpu.config.borrow().format;
             composite_egui_panes(
@@ -165,6 +166,7 @@ impl crate::TermWindow {
                 format,
                 &view,
                 &mut encoder,
+                egui_events,
             )?
         } else {
             Vec::new()
@@ -309,12 +311,6 @@ impl crate::TermWindow {
 /// wgpu renderer on first use. Returns auxiliary command buffers produced by
 /// `egui_wgpu::Renderer::update_buffers` that must be submitted alongside the
 /// main encoder.
-///
-/// ponytail: `RawInput` carries no pointer/keyboard events yet, so widgets
-/// render but do not interact. Forwarding winit events here (the plan's
-/// "Event Interception" step) makes the deferred `clicked` plumbing live;
-/// events accumulate on each pane and are drained per refresh tick, so clicks
-/// won't be lost to the frame/refresh rate mismatch.
 fn composite_egui_panes(
     egui_ctx: &mut Option<egui::Context>,
     egui_renderer: &mut Option<egui_wgpu::Renderer>,
@@ -327,9 +323,14 @@ fn composite_egui_panes(
     format: wgpu::TextureFormat,
     view: &wgpu::TextureView,
     encoder: &mut wgpu::CommandEncoder,
+    input_events: Vec<egui::Event>,
 ) -> anyhow::Result<Vec<wgpu::CommandBuffer>> {
     if egui_ctx.is_none() {
         *egui_ctx = Some(egui::Context::default());
+        let ctx = egui_ctx.as_ref().unwrap();
+        // Register JetBrainsMono and SymbolsNerdFontMono for icon support.
+        // Only run once when context is first created.
+        register_egui_fonts(ctx);
     }
     let ctx = egui_ctx.as_ref().unwrap();
     if egui_renderer.is_none() {
@@ -346,6 +347,7 @@ fn composite_egui_panes(
     );
     let raw_input = egui::RawInput {
         screen_rect: Some(screen_rect),
+        events: input_events,
         ..Default::default()
     };
     ctx.begin_frame(raw_input);
@@ -422,3 +424,42 @@ fn composite_egui_panes(
 
     Ok(user_cmd_bufs)
 }
+
+/// Register JetBrainsMono and SymbolsNerdFontMono into the egui context so
+/// Nerd Font / powerline glyphs render in dashboards. Embeds the same vendored
+/// assets WezTerm uses for its terminal fonts (compile-time, no runtime fs).
+/// Called once when the egui context is first created.
+fn register_egui_fonts(ctx: &egui::Context) {
+    use std::sync::Arc;
+
+    let mut fonts = egui::FontDefinitions::default();
+
+    fonts.font_data.insert(
+        "JetBrainsMono".to_string(),
+        Arc::new(egui::FontData::from_owned(
+            include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf").to_vec(),
+        )),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_insert_with(Vec::new)
+            .insert(0, "JetBrainsMono".to_string());
+    }
+
+    fonts.font_data.insert(
+        "SymbolsNerdFontMono".to_string(),
+        Arc::new(egui::FontData::from_owned(
+            include_bytes!("../../../../assets/fonts/SymbolsNerdFontMono-Regular.ttf").to_vec(),
+        )),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_insert_with(Vec::new)
+        .push("SymbolsNerdFontMono".to_string());
+
+    ctx.set_fonts(fonts);
+}
+

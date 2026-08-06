@@ -91,7 +91,7 @@ Both system-installed `/Applications/WezTerm.app` and custom experimental builds
 
 ### Event wiring & spawn path
 
-- `wezterm.on("render-gui-pane", function(window, pane, ui))` is emitted by `TermWindow::refresh_gui_panes` (hooked into the periodic `update_title_post_status` path, throttled to ~10 Hz). Each fire builds a fresh `LuaUi`, runs the handler, and flushes the tree onto the pane via `mux_lua::flush_ui_to_pane`.
+- `wezterm.on("render-gui-pane", function(window, pane, ui))` is emitted by `TermWindow::refresh_gui_panes` (hooked into the periodic `update_title_post_status` path, throttled to ~10 Hz). Each fire builds a fresh `LuaUi`, runs the handler, and flushes the tree onto the pane via `mux_lua::flush_ui_to_pane`. A per-pane generation counter guards the async flush so a slow, older handler can't overwrite a fresher tree.
 - `wezterm.gui.split_dashboard({ title=..., size=50 })` (`mux_lua::split_dashboard`) creates a `GuiPane` and split-inserts it into the active tab so a dashboard can actually appear.
 - Example handler:
   ```lua
@@ -101,14 +101,22 @@ Both system-installed `/Applications/WezTerm.app` and custom experimental builds
       ui:metric({ label = "Active", value = "3", status = "running" })
       ui:sparkline({ data = { 10, 20, 15, 30, 45 }, color = "#39ff14", fill = true })
       ui:slider({ id = "workers", value = 4, min = 1, max = 16 })
+      ui:image({ path = "/opt/logo.png", width = 24, height = 24 })
       if ui:clicked("save") then print("saved!") end
     end)
   end)
   ```
 
-### Known limitation: input forwarding
+### Interaction, fonts, and images (implemented)
 
-Widgets render through real egui, but winit mouse/keyboard events are not yet forwarded into egui's `RawInput`, so clicks/toggles don't take effect interactively. The deferred `clicked` plumbing and `set_events` are wired end-to-end; enabling interaction only requires populating `RawInput` from `TermWindow`'s winit handlers (the plan's "Event Interception" step).
+- **Input forwarding**: `TermWindow` forwards winit mouse (move/press/release/wheel) and keyboard events into the egui `Context`. Mouse events are hit-tested against `gui_render_list` and converted from physical pixels to egui points; key events forward only while a `GuiPane` is the active pane (terminal input is untouched otherwise). `Response::clicked()`/`changed()` fire; interactions accumulate on the pane via `set_events` and surface to Lua next fire via `ui:clicked(id)`.
+- **Nerd Font / typography**: JetBrainsMono and SymbolsNerdFontMono are registered into the egui `FontDefinitions` (embedded at compile time via `include_bytes!`), so powerline and Nerd Font glyphs render in dashboards.
+- **Images**: `ui:image({ path=..., bytes=..., id=..., width=, height= })` decodes PNG/JPEG/etc. (via the `image` crate) into an egui texture cached in context temp data, keyed by `id` so frames don't re-decode/re-upload.
+
+### Known limitations
+
+- **Glium (OpenGL) backend**: GuiPanes render only the pane background under OpenGL (egui-wgpu is WebGpu-only). WebGpu is WezTerm's default on macOS and most Linux setups.
+- **Slider state-fighting under the deferred model**: the Lua tree refreshes at ~10 Hz while egui renders at frame rate, so an actively-dragged continuous control can snap back to the last-flushed value until the next refresh. Mitigation is to let an in-progress drag own the value egui-side until the next flush — left as a follow-up since interaction is otherwise functional.
 
 ---
-*Summary of Architectural Decision:* `egui` is embedded into `wezterm-gui` via `egui-wgpu`, composited in a second render pass over the WebGpu surface. Lua drives it through a deferred `UiNode` tree built by `LuaUi` and replayed each frame. Dual-instance activity tracking works out of the box using file locks and atomic JSON snapshots.
+*Summary of Architectural Decision:* `egui` is embedded into `wezterm-gui` via `egui-wgpu`, composited in a second render pass over the WebGpu surface. Lua drives it through a deferred `UiNode` tree built by `LuaUi` and replayed each frame, with mouse/keyboard input forwarded back into egui. Dual-instance activity tracking works out of the box using file locks and atomic JSON snapshots.

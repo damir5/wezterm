@@ -128,7 +128,7 @@ fn style_mut(node: &mut UiNode) -> Option<&mut UiStyle> {
         | UiNode::Vertical { style, .. }
         | UiNode::Columns { style, .. }
         | UiNode::Grid { style, .. } => Some(style),
-        UiNode::Spacing { .. } => None,
+        UiNode::Spacing { .. } | UiNode::Image { .. } => None,
     }
 }
 
@@ -451,6 +451,44 @@ impl UserData for LuaUi {
             Ok(())
         });
 
+        // ui:image({ path="...", bytes=..., id=..., width=, height= })
+        // `path` reads a file (PNG/JPEG/etc.); `bytes` takes raw encoded bytes
+        // (read as a Lua byte string, so binary formats like PNG work).
+        // `id` is the texture cache key — change it when the content changes.
+        methods.add_method("image", |_, this, opts: mlua::Table| {
+            let path: Option<String> = opts.get("path").ok().flatten();
+            let bytes_lua: Option<mlua::String> = opts.get("bytes").ok().flatten();
+            let bytes: Arc<[u8]> = match (path, bytes_lua) {
+                (Some(p), _) => std::fs::read(&p)
+                    .map_err(|e| mlua::Error::external(format!("image path {p:?}: {e}")))?
+                    .into(),
+                (None, Some(s)) => s.as_bytes().to_vec().into(),
+                (None, None) => {
+                    return Err(mlua::Error::external(
+                        "ui:image requires `path` or `bytes`",
+                    ))
+                }
+            };
+            let id: String = opts.get("id").ok().flatten().unwrap_or_else(|| {
+                // Default id from a small hash of the bytes so identical images
+                // share a texture without caller bookkeeping.
+                let mut h: u64 = 0xcbf29ce484222325;
+                for b in bytes.iter() {
+                    h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+                }
+                format!("img-{h:x}")
+            });
+            let width = opt::<f32>(&opts, "width");
+            let height = opt::<f32>(&opts, "height");
+            this.push_leaf(UiNode::Image {
+                id,
+                bytes,
+                width,
+                height,
+            });
+            Ok(())
+        });
+
         // --- Containers (take a callback that fills the scope) ----------
 
         // ui:card({ title=..., glass=... }, function(ui) ... end)
@@ -702,6 +740,34 @@ mod test {
         // Current style (strong=true) applies to every widget after the call,
         // until overridden; the first label predates it, the last opts out.
         assert_eq!(strongs, vec![None, Some(true), Some(true), Some(false)]);
+        Ok(())
+    }
+
+    #[test]
+    fn image_node_builds() -> anyhow::Result<()> {
+        let lua = Lua::new();
+        let ui = LuaUi::new();
+        lua.globals().set("ui", ui.clone())?;
+        lua.load(
+            r##"
+            ui:image({ bytes = "\137PNG\r\n\10placeholder", id = "logo", width = 64, height = 64 })
+            "##,
+        )
+        .exec()?;
+        let (nodes, _) = ui.take();
+        match &nodes[0] {
+            UiNode::Image {
+                id,
+                bytes,
+                width,
+                height,
+            } => {
+                assert_eq!(id, "logo");
+                assert_eq!(width, &Some(64.0));
+                assert!(bytes.starts_with(b"\x89PNG"));
+            }
+            other => panic!("expected Image, got {:?}", std::mem::discriminant(other)),
+        }
         Ok(())
     }
 
