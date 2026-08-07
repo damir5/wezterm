@@ -306,16 +306,16 @@ fn render_node(
         } => {
             // The header id is the egui state key and the id Lua reads back via
             // ui:collapsed(id); default to the title so state survives a reload
-            // even when Lua omits an explicit id.
-            let hid = id.clone().unwrap_or_else(|| title.clone());
+            // even when Lua omits an explicit id. Borrow instead of cloning.
+            let hid: &str = id.as_deref().unwrap_or(title.as_str());
             let resp = egui::CollapsingHeader::new(title)
-                .id_salt(&hid)
+                .id_salt(hid)
                 .default_open(*default_open)
                 .show(ui, |ui| {
                     render_nodes(ui, children, theme, clicked, values, collapsed);
                 });
             // body_response is None iff collapsed.
-            collapsed.insert(hid, resp.body_response.is_none());
+            collapsed.insert(hid.to_string(), resp.body_response.is_none());
         }
         UiNode::Frame {
             clickable,
@@ -326,18 +326,23 @@ fn render_node(
             // Animate a vertical lead offset toward `target`; egui owns the
             // eased value so it advances every frame, smooth between refreshes.
             if let Some(anim) = anim {
-                ui.add_space(frame_anim_offset(ui.ctx(), anim));
+                ui.add_space(frame_anim_offset(ui, anim));
             }
+            // Snapshot click count so a child widget clicked this frame can win
+            // over the row (a nested button shouldn't also select the row).
+            let clicks_before = clicked.len();
             let inner = frame_for(style, theme, false).show(ui, |ui| {
                 render_nodes(ui, children, theme, clicked, values, collapsed);
             });
             // Whole-rect hit target (a borderless source-list row). Drawn after
-            // children so the frame is visible; the interact adds a click region
-            // over it without displacing child widgets.
+            // children; the interact adds a click region over the frame. The id
+            // is scoped to this Ui so the same row id in another pane/tab does
+            // not collide in egui's interaction memory.
             if let Some(id) = clickable {
                 let rect = inner.response.rect;
-                let r = ui.interact(rect, Id::new(id.as_str()), egui::Sense::click());
-                if r.clicked() {
+                let r = ui.interact(rect, ui.make_persistent_id(id.as_str()), egui::Sense::click());
+                let child_clicked = clicked.len() > clicks_before;
+                if r.clicked() && !child_clicked {
                     clicked.insert(id.clone());
                 }
             }
@@ -432,10 +437,12 @@ fn render_sparkline(
 
 /// Eased vertical offset for an animated Frame, advanced every frame by egui
 /// (so motion is smooth between the ~10 Hz Lua refreshes). `target` is the
-/// offset in points.
-fn frame_anim_offset(ctx: &egui::Context, anim: &FrameAnim) -> f32 {
+/// offset in points. The animation id is scoped to the pane's Ui so the same
+/// id in another pane doesn't share the eased value.
+fn frame_anim_offset(ui: &Ui, anim: &FrameAnim) -> f32 {
     let dur = anim.duration.unwrap_or(0.2).max(0.0);
-    ctx.animate_value_with_time(Id::new(anim.id.as_str()), anim.target, dur)
+    ui.ctx()
+        .animate_value_with_time(ui.id().with(anim.id.as_str()), anim.target, dur)
 }
 
 /// Draw a donut/ring gauge: a dim track plus a colored arc for `value`
@@ -456,8 +463,12 @@ fn render_arc(
     let (rect, _) = ui.allocate_at_least(Vec2::splat(size), egui::Sense::hover());
     let painter = ui.painter();
     let center = rect.center();
-    let radius = rect.width().min(rect.height()) * 0.5;
-    let stroke_w = thickness.unwrap_or((radius * 0.22).max(3.0));
+    let half = rect.width().min(rect.height()) * 0.5;
+    let stroke_w = thickness.unwrap_or((half * 0.44).max(3.0)).min(half);
+    // egui strokes straddle the radius by w/2 each side, so center the ring
+    // inside the allocated rect (outer edge on the bounds) instead of letting
+    // it bleed past by thickness/2.
+    let radius = (half - stroke_w * 0.5).max(stroke_w * 0.5);
     let col = color.map(c).unwrap_or(c(theme.accent));
 
     // Dim full ring as the background track.
