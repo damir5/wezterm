@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub const COMPACT_WIDTH_CELLS: usize = 6;
+pub const ROW_HEIGHT_PX: usize = 40;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SidebarGroup {
@@ -164,7 +165,7 @@ impl TermWindow {
         let max = max_scroll_rows(
             sidebar_rows(&self.tab_sidebar).len(),
             self.dimensions.pixel_height,
-            24,
+            ROW_HEIGHT_PX,
         );
         self.tab_sidebar.scroll_rows = if rows < 0 {
             self.tab_sidebar.scroll_rows.saturating_sub(rows.unsigned_abs())
@@ -499,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_rows_roll_up_state_and_ui_rows_are_24px() {
+    fn compact_rows_roll_up_state_and_ui_rows_match_shared_height() {
         let mut first = entry(1, &["remote", "project-a"]);
         first.active = true;
         let mut second = entry(2, &["remote", "project-b"]);
@@ -517,10 +518,10 @@ mod tests {
         assert!(group.active);
         assert_eq!(group.urgency, 2);
 
-        let items = ui_items_for_rows(&rows, 0, 0, 24, 120, 48);
+        let items = ui_items_for_rows(&rows, 0, 0, ROW_HEIGHT_PX, 120, ROW_HEIGHT_PX);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].y, 0);
-        assert_eq!(items[0].height, 24);
-        assert_eq!(max_scroll_rows(5, 48, 24), 3);
+        assert_eq!(items[0].height, ROW_HEIGHT_PX);
+        assert_eq!(max_scroll_rows(5, ROW_HEIGHT_PX, ROW_HEIGHT_PX), 4);
     }
 }
