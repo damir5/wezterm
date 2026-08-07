@@ -698,6 +698,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window"],
             icon: None,
         },
+        ToggleTabSidebarMode => CommandDef {
+            brief: "Toggle tab sidebar mode".into(),
+            doc: "Switches the tab sidebar between regular and compact mode".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["View"],
+            icon: None,
+        },
         SetWindowLevel(WindowLevel::AlwaysOnTop) => CommandDef {
             brief: "Always on Top".into(),
             doc: "Set the window level to be on top of other windows.".into(),

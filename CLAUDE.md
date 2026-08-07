@@ -1,51 +1,37 @@
 # wezterm (fork)
 
-Fork of wezterm adding a **`GuiPane`** — a pane whose contents are an egui widget tree
-built from Lua — so a config can render dashboards inside the terminal.
+Fork of wezterm adding a window-owned tab sidebar. It is terminal chrome, not
+a pane: it never creates splits, mux panes, or forwards input into egui.
 
 Upstream base: `4b1c3c1`. Branch: `feat/egui-guipane-dashboards`.
 
-## What the fork adds
+## Tab sidebar
+
+- Enable with `enable_tab_sidebar = true` and `front_end = 'WebGpu'`.
+- `tab_sidebar_width` is the regular width in terminal cells; compact mode is
+  six cells and is toggled with `ToggleTabSidebarMode`.
+- Lua may optionally implement synchronous `format-tab-sidebar(tabs)`, returning
+  `{ entries = {...}, refresh_after_ms = n }`. Entries are keyed by an existing
+  `tab_id`; malformed data falls back to the native snapshot.
+- Rust owns snapshots, grouping, scrolling, hit rectangles, activation, and
+  painting. The callback runs only after queued mux changes or an explicitly
+  requested one-shot refresh.
+
+Relevant files:
 
 | Area | File |
 | --- | --- |
-| The pane + `UiNode` tree | `mux/src/guipane.rs` |
-| Lua bindings (`LuaUi`, `split_dashboard`, `set_split_size`) | `lua-api-crates/mux/src/gui.rs` |
-| `UiNode` -> egui | `wezterm-gui/src/termwindow/render/guipane_ui.rs` |
-| Input forwarding into egui | `wezterm-gui/src/termwindow/{mouseevent,keyevent}.rs` |
-| `render-gui-pane` emit, 10 Hz throttle | `wezterm-gui/src/termwindow/mod.rs` |
-
-Lua sees `wezterm.on('render-gui-pane', function(window, pane, ui) ... end)`. The `ui`
-object accumulates a `UiNode` tree that the egui pass replays each frame; interaction
-comes back on the *next* fire via `ui:clicked(id)` / `ui:value(id)`.
+| Sidebar model/callback decoding | `wezterm-gui/src/termwindow/tab_sidebar.rs` |
+| Native input/activation | `wezterm-gui/src/termwindow/mouseevent.rs` |
+| WebGpu compositing | `wezterm-gui/src/termwindow/render/draw.rs` |
+| Lua snapshot fields | `wezterm-gui/src/termwindow/mod.rs` |
 
 ## Checking a change
 
 ```sh
-cargo check -p mux-lua && cargo test -p mux-lua   # fast, covers mux + the Lua bindings
-cargo build --release                             # the real thing; needs submodules
+cargo test -p wezterm-gui tab_sidebar
+cargo check -p wezterm-gui -p mux -p mux-lua
 ```
 
-`cargo test -p mux-lua` does not need the freetype/harfbuzz submodules, so it is the
-cheap loop for anything in `gui.rs` or `guipane.rs`.
-
-## Conventions worth keeping
-
-- **New `split_dashboard` options must default to the previous behaviour.** It already
-  takes `side`, `size_cols`, `top_level`, `focus` and `pane_id`; every default
-  reproduces the original right-edge, percent-sized, focus-stealing split so existing
-  callers are unaffected.
-- `set_split_size` exists because `AdjustPaneSize` only moves the *active* pane's edge,
-  so a sidebar could not resize without first stealing focus. Keep it addressing the
-  split by pane id.
-- Widgets are described by Lua and rendered by Rust; do not hand a live `&mut egui::Ui`
-  across the mlua boundary. Containers take a Lua callback and push onto a child-list
-  stack instead.
-- A `GuiPane` must be registered with `mux.add_pane` or the tab's `prune_dead_panes`
-  removes it on first paint (wezterm #4030).
-
-## Consumer
-
-`../../test/wezterm-agent-poc` drives this API (FleetView sidebar). It feature-detects,
-so it still runs on stock wezterm — do not assume the fork is present when changing the
-Lua-facing surface, but do keep it additive.
+The sidebar is deliberately disabled for non-WebGpu windows; it must not reserve
+space or intercept input if it cannot be rendered.

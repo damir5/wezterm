@@ -476,6 +476,16 @@ pub struct Config {
     /// active tab.  Clicking on a tab activates it.
     #[dynamic(default = "default_true")]
     pub enable_tab_bar: bool,
+
+    /// Show the window-owned tab sidebar.  Unlike the tab bar this does not
+    /// create a mux pane or change the tab layout.
+    #[dynamic(default)]
+    pub enable_tab_sidebar: bool,
+
+    /// Width of the regular tab sidebar in terminal cells.
+    #[dynamic(default = "default_tab_sidebar_width")]
+    pub tab_sidebar_width: usize,
+
     #[dynamic(default = "default_true")]
     pub use_fancy_tab_bar: bool,
 
@@ -1879,6 +1889,10 @@ fn default_enq_answerback() -> String {
 
 fn default_tab_max_width() -> usize {
     16
+}
+
+fn default_tab_sidebar_width() -> usize {
+    34
 }
 
 fn default_update_interval() -> u64 {

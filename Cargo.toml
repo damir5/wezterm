@@ -84,9 +84,8 @@ embed-resource = "1.7"
 emojis = "0.6"
 encoding_rs = "0.8"
 enum-display-derive = "0.1"
-# egui immediate-mode GUI, rendered into the wgpu surface for GuiPane
-# dashboards. egui-wgpu 0.32 / egui_plot 0.32 pin wgpu ^25, matching the
-# workspace wgpu.
+# egui immediate-mode renderer for the window-owned tab sidebar. egui-wgpu
+# 0.32 pins wgpu ^25, matching the workspace wgpu.
 egui = { version = "0.32", default-features = false, features = ["default_fonts"] }
 egui-wgpu = { version = "0.32", default-features = false }
 env-bootstrap = { path = "env-bootstrap" }

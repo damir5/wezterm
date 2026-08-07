@@ -428,9 +428,6 @@ impl super::TermWindow {
     }
 
     pub fn raw_key_event_impl(&mut self, key: RawKeyEvent, context: &dyn WindowOps) {
-        // Forward to egui if a GuiPane is active.
-        self.forward_key_to_egui(&key.key, key.modifiers, key.key_is_down);
-
         // The leader key is a kind of modal modifier key.
         // It is allowed to be active for up to the leader timeout duration,
         // after which it auto-deactivates.
@@ -600,9 +597,6 @@ impl super::TermWindow {
     }
 
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
-        // Forward to egui if a GuiPane is active.
-        self.forward_key_to_egui(&window_key.key, window_key.modifiers, window_key.key_is_down);
-
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
@@ -875,136 +869,4 @@ impl super::TermWindow {
         Key::Code(code)
     }
 
-    /// Forward keyboard events to egui if a GuiPane is active.
-    /// Called at the start of key_event_impl and raw_key_event_impl.
-    fn forward_key_to_egui(&mut self, key: &::window::KeyCode, modifiers: ::window::Modifiers, pressed: bool) {
-        // Only forward if a GuiPane is active.
-        if let Some(pane) = self.get_active_pane_or_overlay() {
-            if pane.downcast_ref::<mux::guipane::GuiPane>().is_none() {
-                return;
-            }
-        } else {
-            return;
-        }
-
-        let egui_key = match self.win_key_code_to_termwiz_key_code(key) {
-            Key::Code(kc) => kc_to_egui_key(kc),
-            Key::Composed(s) => {
-                // Forward composed text as character events.
-                for c in s.chars() {
-                    self.egui_input_events.push(egui::Event::Text(c.to_string()));
-                }
-                return;
-            }
-            Key::None => return,
-        };
-
-        let egui_mods = modifiers_to_egui(modifiers);
-        self.egui_input_events.push(egui::Event::Key {
-            key: egui_key,
-            physical_key: None,
-            pressed,
-            repeat: false, // Could track repeat state for completeness.
-            modifiers: egui_mods,
-        });
-    }
 }
-
-fn kc_to_egui_key(kc: wezterm_term::KeyCode) -> egui::Key {
-    use wezterm_term::KeyCode as KC;
-    match kc {
-        KC::Enter => egui::Key::Enter,
-        KC::Tab => egui::Key::Tab,
-        KC::Backspace => egui::Key::Backspace,
-        KC::Escape => egui::Key::Escape,
-        KC::Char(' ') => egui::Key::Space,
-        KC::Insert => egui::Key::Insert,
-        KC::Delete => egui::Key::Delete,
-        KC::Home => egui::Key::Home,
-        KC::End => egui::Key::End,
-        KC::PageUp => egui::Key::PageUp,
-        KC::PageDown => egui::Key::PageDown,
-        KC::LeftArrow => egui::Key::ArrowLeft,
-        KC::RightArrow => egui::Key::ArrowRight,
-        KC::UpArrow => egui::Key::ArrowUp,
-        KC::DownArrow => egui::Key::ArrowDown,
-        KC::Function(n) => match n {
-            1 => egui::Key::F1,
-            2 => egui::Key::F2,
-            3 => egui::Key::F3,
-            4 => egui::Key::F4,
-            5 => egui::Key::F5,
-            6 => egui::Key::F6,
-            7 => egui::Key::F7,
-            8 => egui::Key::F8,
-            9 => egui::Key::F9,
-            10 => egui::Key::F10,
-            11 => egui::Key::F11,
-            12 => egui::Key::F12,
-            _ => egui::Key::F12, // Clamp to F12 for higher function keys
-        },
-        KC::Char(c) => match c {
-            'a' | 'A' => egui::Key::A,
-            'b' | 'B' => egui::Key::B,
-            'c' | 'C' => egui::Key::C,
-            'd' | 'D' => egui::Key::D,
-            'e' | 'E' => egui::Key::E,
-            'f' | 'F' => egui::Key::F,
-            'g' | 'G' => egui::Key::G,
-            'h' | 'H' => egui::Key::H,
-            'i' | 'I' => egui::Key::I,
-            'j' | 'J' => egui::Key::J,
-            'k' | 'K' => egui::Key::K,
-            'l' | 'L' => egui::Key::L,
-            'm' | 'M' => egui::Key::M,
-            'n' | 'N' => egui::Key::N,
-            'o' | 'O' => egui::Key::O,
-            'p' | 'P' => egui::Key::P,
-            'q' | 'Q' => egui::Key::Q,
-            'r' | 'R' => egui::Key::R,
-            's' | 'S' => egui::Key::S,
-            't' | 'T' => egui::Key::T,
-            'u' | 'U' => egui::Key::U,
-            'v' | 'V' => egui::Key::V,
-            'w' | 'W' => egui::Key::W,
-            'x' | 'X' => egui::Key::X,
-            'y' | 'Y' => egui::Key::Y,
-            'z' | 'Z' => egui::Key::Z,
-            '0' => egui::Key::Num0,
-            '1' => egui::Key::Num1,
-            '2' => egui::Key::Num2,
-            '3' => egui::Key::Num3,
-            '4' => egui::Key::Num4,
-            '5' => egui::Key::Num5,
-            '6' => egui::Key::Num6,
-            '7' => egui::Key::Num7,
-            '8' => egui::Key::Num8,
-            '9' => egui::Key::Num9,
-            ',' => egui::Key::Comma,
-            '.' => egui::Key::Period,
-            '-' => egui::Key::Minus,
-            '=' => egui::Key::Equals,
-            ';' => egui::Key::Semicolon,
-            '/' => egui::Key::Slash,
-            '\\' => egui::Key::Backslash,
-            '[' => egui::Key::OpenBracket,
-            ']' => egui::Key::CloseBracket,
-            '`' => egui::Key::Backtick,
-            '\'' => egui::Key::Quote,
-            ':' => egui::Key::Colon,
-            _ => egui::Key::Space, // Fallback for other characters
-        },
-        _ => egui::Key::Space, // Fallback for unknown keys
-    }
-}
-
-fn modifiers_to_egui(mods: ::window::Modifiers) -> egui::Modifiers {
-    egui::Modifiers {
-        alt: mods.contains(::window::Modifiers::ALT),
-        ctrl: mods.contains(::window::Modifiers::CTRL) || mods.contains(::window::Modifiers::SUPER),
-        shift: mods.contains(::window::Modifiers::SHIFT),
-        mac_cmd: mods.contains(::window::Modifiers::SUPER),
-        command: mods.contains(::window::Modifiers::SUPER),
-    }
-}
-

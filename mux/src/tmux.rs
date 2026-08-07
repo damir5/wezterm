@@ -333,6 +333,12 @@ impl TmuxDomainState {
 }
 
 impl TmuxDomain {
+    /// Pane that owns the tmux control connection.  GUI consumers use this to
+    /// associate tmux-created tabs with their original connection pane.
+    pub fn controller_pane_id(&self) -> PaneId {
+        self.inner.pane_id
+    }
+
     pub fn new(pane_id: PaneId) -> Self {
         let domain_id = alloc_domain_id();
         let cmd_queue = VecDeque::new();
