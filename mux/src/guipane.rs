@@ -313,15 +313,22 @@ pub enum UiNode {
         style: UiStyle,
         children: Vec<UiNode>,
     },
-    /// Collapsible section.
+    /// Collapsible section. `id` (defaults to `title`) is the egui state key and
+    /// the id read back via `ui:collapsed(id)` so Lua can persist layout / skip a
+    /// closed subtree. egui owns the open/closed memory, not the tree.
     CollapsingHeader {
+        id: Option<String>,
         title: String,
         default_open: bool,
         style: UiStyle,
         children: Vec<UiNode>,
     },
-    /// Generic framed region.
+    /// Generic framed region. `clickable` turns the whole frame rect into a
+    /// borderless hit target (a source-list row); `anim` eases a vertical offset
+    /// toward `target` each frame so rows can slide (urgency reordering).
     Frame {
+        clickable: Option<String>,
+        anim: Option<FrameAnim>,
         style: UiStyle,
         children: Vec<UiNode>,
     },
@@ -347,6 +354,26 @@ pub enum UiNode {
         style: UiStyle,
         children: Vec<UiNode>,
     },
+    /// Donut/ring gauge. `value` is a 0..=1 fraction of the colored arc; the
+    /// remainder is a dim track. Optional center `label` is drawn on top.
+    Arc {
+        value: f32,
+        label: Option<String>,
+        color: Option<Color>,
+        thickness: Option<f32>,
+        style: UiStyle,
+    },
+}
+
+/// Per-frame eased animation for a `Frame`'s vertical offset. The render layer
+/// owns the animated value (via egui `animate_value_with_time`), advancing every
+/// frame even between Lua refreshes, so motion is smooth instead of stepping at
+/// the ~10 Hz refresh rate. `target` is the offset in egui points.
+#[derive(Clone, Debug)]
+pub struct FrameAnim {
+    pub id: String,
+    pub target: f32,
+    pub duration: Option<f32>,
 }
 
 impl UiNode {
@@ -384,6 +411,13 @@ pub struct GuiPane {
     /// drag is smooth between the ~10 Hz Lua refreshes (no snap to a stale
     /// tree value); Lua catches up each refresh.
     values: Mutex<HashMap<String, f64>>,
+    /// Pane width in egui points, measured by the render pass and read back by
+    /// `ui:width()` so Lua can build size-classed layouts without guessing.
+    width: Mutex<f32>,
+    /// Collapsing-header open/closed state keyed by header id, collected by the
+    /// render pass (egui owns the memory) and read back via `ui:collapsed(id)`.
+    /// true == collapsed.
+    collapsed: Mutex<HashMap<String, bool>>,
     /// Monotonic generation bumped each time a `render-gui-pane` fire is
     /// scheduled. The async flush checks it so a slow, older handler can't
     /// overwrite a newer widget tree (out-of-order flush guard).
@@ -403,6 +437,8 @@ impl GuiPane {
             theme: Mutex::new(UiTheme::default()),
             events: Mutex::new(HashSet::new()),
             values: Mutex::new(HashMap::new()),
+            width: Mutex::new(0.0),
+            collapsed: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         })
     }
@@ -457,6 +493,29 @@ impl GuiPane {
     /// pass. Called every frame so `value(id)` always reflects the live value.
     pub fn set_values(&self, values: HashMap<String, f64>) {
         *self.values.lock() = values;
+    }
+
+    /// Pane width in egui points, set by the render pass and read by Lua via
+    /// `ui:width()`. 0 until the first paint measures the pane.
+    pub fn width(&self) -> f32 {
+        *self.width.lock()
+    }
+
+    /// Record the pane width measured by this render pass (in egui points).
+    pub fn set_width(&self, width: f32) {
+        *self.width.lock() = width;
+    }
+
+    /// Snapshot of collapsing-header states (id → collapsed). Read by Lua via
+    /// `ui:collapsed(id)` to persist layout or skip building closed subtrees.
+    pub fn collapsed_map(&self) -> HashMap<String, bool> {
+        self.collapsed.lock().clone()
+    }
+
+    /// Replace the collapsing-header state map with what the render pass
+    /// observed from egui this frame.
+    pub fn set_collapsed_map(&self, collapsed: HashMap<String, bool>) {
+        *self.collapsed.lock() = collapsed;
     }
 
     /// Bump and return the generation; captured by an async flush to detect

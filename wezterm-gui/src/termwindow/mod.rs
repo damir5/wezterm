@@ -1659,6 +1659,9 @@ impl TermWindow {
             let g_generation = if let Some(g) = pos.pane.downcast_ref::<mux::guipane::GuiPane>() {
                 ui.set_events(g.drain_clicked());
                 ui.set_values(g.values_snapshot());
+                ui.set_width(g.width());
+                ui.set_collapsed(g.collapsed_map());
+                ui.set_clock(self.created.elapsed().as_secs_f64());
                 g.bump_generation()
             } else {
                 0
