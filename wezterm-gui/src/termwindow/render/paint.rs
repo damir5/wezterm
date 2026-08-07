@@ -181,7 +181,7 @@ impl crate::TermWindow {
                 &self.tab_sidebar_rows,
                 self.tab_sidebar.scroll_rows,
                 0,
-                24,
+                crate::termwindow::tab_sidebar::ROW_HEIGHT_PX,
                 self.tab_sidebar_width_pixels(),
                 self.dimensions.pixel_height,
             ));

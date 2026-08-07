@@ -368,9 +368,9 @@ fn composite_tab_sidebar(
         [rect.right_top(), rect.right_bottom()],
         egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)),
     );
-    // UIItem rectangles use physical pixels; convert the shared 24 px row
+    // UIItem rectangles use physical pixels; convert the shared row-height
     // contract to egui points so visual and hit-test geometry stay identical.
-    let row_height = 24.0 / pixels_per_point;
+    let row_height = crate::termwindow::tab_sidebar::ROW_HEIGHT_PX as f32 / pixels_per_point;
     let font = egui::FontId::monospace(13.0);
     for (row, item) in rows.iter().skip(scroll_rows).enumerate() {
         let y = row as f32 * row_height;
@@ -381,31 +381,66 @@ fn composite_tab_sidebar(
             egui::pos2(0.0, y),
             egui::vec2(rect.width(), row_height),
         );
-        let (label, right, active, urgency, status_color, is_group, indent) = match item {
+        let (label, right, active, urgency, status_glyph, status_color, is_group, indent) = match item {
             SidebarRow::Group(group) => (
-                group.label.clone(), String::new(), group.active, group.urgency, None, true,
+                format!("▾ {}", group.label.to_uppercase()), String::new(), group.active, group.urgency,
+                String::new(), None, true,
                 group.depth as f32 * 12.0,
             ),
             SidebarRow::Tab(entry) => (
-                if compact { entry.title.chars().take(2).collect() } else { format!("{} {}", entry.status_glyph, entry.title) },
-                entry.right.clone(), entry.active, entry.urgency, entry.status_color.clone(), false, 0.0,
+                if compact { entry.title.chars().take(2).collect() } else { entry.title.clone() },
+                entry.right.clone(), entry.active, entry.urgency, entry.status_glyph.clone(),
+                entry.status_color.clone(), false, entry.groups.len() as f32 * 12.0,
             ),
         };
-        if active {
-            painter.rect_filled(row_rect.shrink2(egui::vec2(3.0, 2.0)), 4.0, egui::Color32::from_rgb(30, 120, 230));
+        let inner = row_rect.shrink2(egui::vec2(3.0, 2.0));
+        if active && (!is_group || compact) {
+            painter.rect_filled(inner, 4.0, egui::Color32::from_rgb(24, 132, 245));
+            painter.rect_filled(
+                egui::Rect::from_min_size(inner.left_top(), egui::vec2(2.0, inner.height())),
+                1.0,
+                egui::Color32::WHITE,
+            );
+        } else if !is_group && urgency > 0 {
+            let fill = if urgency == 2 {
+                egui::Color32::from_rgb(55, 37, 43)
+            } else {
+                egui::Color32::from_rgb(49, 46, 39)
+            };
+            let accent = if urgency == 2 {
+                egui::Color32::from_rgb(238, 92, 108)
+            } else {
+                egui::Color32::from_rgb(225, 185, 97)
+            };
+            painter.rect_filled(inner, 4.0, fill);
+            painter.rect_filled(
+                egui::Rect::from_min_size(inner.left_top(), egui::vec2(2.0, inner.height())),
+                1.0,
+                accent,
+            );
         }
         let color = status_color.as_deref().and_then(parse_color).unwrap_or_else(|| {
             if urgency == 2 { egui::Color32::from_rgb(255, 104, 110) }
             else if urgency == 1 { egui::Color32::from_rgb(235, 185, 80) }
-            else if is_group { egui::Color32::from_gray(145) }
+            else if is_group { egui::Color32::from_gray(125) }
             else { egui::Color32::from_rgb(220, 222, 228) }
         });
+        let text_x = row_rect.left() + 8.0 + indent;
+        if !status_glyph.is_empty() && !is_group && !compact {
+            painter.text(
+                egui::pos2(text_x, row_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                &status_glyph,
+                font.clone(),
+                if active { egui::Color32::WHITE } else { color },
+            );
+        }
         painter.text(
-            row_rect.left_center() + egui::vec2(8.0 + indent, 0.0),
+            egui::pos2(text_x + if status_glyph.is_empty() || is_group || compact { 0.0 } else { 18.0 }, row_rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
             font.clone(),
-            color,
+            if active && !is_group { egui::Color32::WHITE } else { color },
         );
         if !compact && !right.is_empty() {
             painter.text(
@@ -413,7 +448,7 @@ fn composite_tab_sidebar(
                 egui::Align2::RIGHT_CENTER,
                 &right,
                 font.clone(),
-                egui::Color32::from_gray(150),
+                if active { egui::Color32::WHITE } else { egui::Color32::from_gray(150) },
             );
         }
     }
