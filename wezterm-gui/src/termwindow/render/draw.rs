@@ -381,6 +381,34 @@ fn composite_tab_sidebar(
             egui::pos2(0.0, y),
             egui::vec2(rect.width(), row_height),
         );
+        if compact {
+            let SidebarRow::Group(group) = item else { continue };
+            let tile = row_rect.shrink2(egui::vec2(3.0, 2.0));
+            painter.rect_filled(tile, 6.0, egui::Color32::from_rgb(43, 47, 56));
+            let name = if group.key == "@local" {
+                "MAC".to_string()
+            } else {
+                group.label.rsplit('@').next().unwrap_or(&group.label)
+                    .chars().filter(|ch| ch.is_alphanumeric()).take(2)
+                    .collect::<String>().to_uppercase()
+            };
+            painter.text(
+                tile.center(),
+                egui::Align2::CENTER_CENTER,
+                name,
+                egui::FontId::monospace(13.0),
+                egui::Color32::from_gray(190),
+            );
+            if group.urgency > 0 {
+                let color = if group.urgency == 2 {
+                    egui::Color32::from_rgb(238, 92, 108)
+                } else {
+                    egui::Color32::from_rgb(225, 185, 97)
+                };
+                painter.circle_filled(tile.right_top() - egui::vec2(5.0, -5.0), 3.0, color);
+            }
+            continue;
+        }
         let (label, right, active, urgency, status_glyph, status_color, is_group, indent) = match item {
             SidebarRow::Group(group) => (
                 format!("▾ {}", group.label.to_uppercase()), String::new(), group.active, group.urgency,
