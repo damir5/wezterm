@@ -792,6 +792,30 @@ pub async fn emit_event<'lua>(
     }
 }
 
+/// Emit handlers without creating a Lua coroutine.  Intended for callbacks
+/// that run in synchronous GUI paths and therefore must not yield.
+pub fn emit_sync_event<'lua>(
+    lua: &'lua Lua,
+    (name, args): (String, mlua::MultiValue<'lua>),
+) -> mlua::Result<bool> {
+    lua.set_named_registry_value(IS_EVENT, true)?;
+
+    let decorated_name = format!("wezterm-event-{}", name);
+    let tbl: mlua::Value = lua.named_registry_value(&decorated_name)?;
+    match tbl {
+        mlua::Value::Table(tbl) => {
+            for func in tbl.sequence_values::<mlua::Function>() {
+                match func?.call(args.clone())? {
+                    mlua::Value::Boolean(false) => return Ok(false),
+                    _ => {}
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(true),
+    }
+}
+
 pub fn emit_sync_callback<'lua, A>(
     lua: &'lua Lua,
     (name, args): (String, A),
@@ -949,6 +973,25 @@ assert(wezterm.emit('bar', 42, 'woot') == true)
 
         assert_eq!(*total.lock().unwrap(), 6);
 
+        Ok(())
+    }
+
+    #[test]
+    fn sync_event_runs_handlers_until_false() -> anyhow::Result<()> {
+        let lua = Lua::new();
+        let total = Arc::new(Mutex::new(0));
+        for (amount, keep_going) in [(1, true), (2, false), (4, true)] {
+            let total = Arc::clone(&total);
+            let handler = lua.create_function(move |_, ()| {
+                *total.lock().unwrap() += amount;
+                Ok(keep_going)
+            })?;
+            register_event(&lua, ("sync-test".to_string(), handler))?;
+        }
+
+        let args = lua.pack_multi(())?;
+        assert!(!emit_sync_event(&lua, ("sync-test".to_string(), args))?);
+        assert_eq!(*total.lock().unwrap(), 3);
         Ok(())
     }
 }

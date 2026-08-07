@@ -82,6 +82,7 @@ pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
+mod tab_sidebar;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
@@ -154,6 +155,8 @@ pub enum TermWindowNotif {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UIItemType {
     TabBar(TabBarItem),
+    TabSidebar(TabId),
+    TabSidebarGroup(String),
     CloseTab(usize),
     AboveScrollThumb,
     ScrollThumb,
@@ -214,6 +217,9 @@ pub struct TabInformation {
     pub is_active: bool,
     pub is_last_active: bool,
     pub active_pane: Option<PaneInformation>,
+    /// Snapshot of every pane in this tab.  Lua formatting must not walk the
+    /// live mux while a window is being redrawn.
+    pub panes: Vec<PaneInformation>,
     pub window_id: MuxWindowId,
     pub tab_title: String,
 }
@@ -232,16 +238,7 @@ impl UserData for TabInformation {
             }
         });
         fields.add_field_method_get("panes", |_, this| {
-            let mux = Mux::get();
-            let mut panes = vec![];
-            if let Some(tab) = mux.get_tab(this.tab_id) {
-                panes = tab
-                    .iter_panes()
-                    .iter()
-                    .map(TermWindow::pos_pane_to_pane_info)
-                    .collect();
-            }
-            Ok(panes)
+            Ok(this.panes.clone())
         });
         fields.add_field_method_get("window_id", |_, this| Ok(this.window_id));
         fields.add_field_method_get("tab_title", |_, this| Ok(this.tab_title.clone()));
@@ -272,6 +269,12 @@ pub struct PaneInformation {
     pub title: String,
     pub user_vars: HashMap<String, String>,
     pub progress: Progress,
+    /// The pane that owns a tmux control connection, when this pane was
+    /// created by that connection.
+    pub controller_pane_id: Option<PaneId>,
+    pub current_working_dir: Option<url::Url>,
+    pub foreground_process_name: String,
+    pub domain_name: String,
 }
 
 impl UserData for PaneInformation {
@@ -288,19 +291,11 @@ impl UserData for PaneInformation {
         fields.add_field_method_get("pixel_width", |_, this| Ok(this.pixel_width));
         fields.add_field_method_get("pixel_height", |_, this| Ok(this.pixel_height));
         fields.add_field_method_get("progress", |lua, this| lua.to_value(&this.progress));
+        fields.add_field_method_get("controller_pane_id", |_, this| Ok(this.controller_pane_id));
         fields.add_field_method_get("title", |_, this| Ok(this.title.clone()));
         fields.add_field_method_get("user_vars", |_, this| Ok(this.user_vars.clone()));
         fields.add_field_method_get("foreground_process_name", |_, this| {
-            let mut name = None;
-            if let Some(mux) = Mux::try_get() {
-                if let Some(pane) = mux.get_pane(this.pane_id) {
-                    name = pane.get_foreground_process_name(CachePolicy::AllowStale);
-                }
-            }
-            match name {
-                Some(name) => Ok(name),
-                None => Ok("".to_string()),
-            }
+            Ok(this.foreground_process_name.clone())
         });
         fields.add_field_method_get("tty_name", |_, this| {
             let mut name = None;
@@ -312,29 +307,13 @@ impl UserData for PaneInformation {
             Ok(name)
         });
         fields.add_field_method_get("current_working_dir", |_, this| {
-            if let Some(mux) = Mux::try_get() {
-                if let Some(pane) = mux.get_pane(this.pane_id) {
-                    return Ok(pane
-                        .get_current_working_dir(CachePolicy::AllowStale)
-                        .map(|url| url_funcs::Url { url }));
-                }
-            }
-            Ok(None)
+            Ok(this
+                .current_working_dir
+                .clone()
+                .map(|url| url_funcs::Url { url }))
         });
         fields.add_field_method_get("domain_name", |_, this| {
-            let mut name = None;
-            if let Some(mux) = Mux::try_get() {
-                if let Some(pane) = mux.get_pane(this.pane_id) {
-                    let domain_id = pane.domain_id();
-                    name = mux
-                        .get_domain(domain_id)
-                        .map(|dom| dom.domain_name().to_string());
-                }
-            }
-            match name {
-                Some(name) => Ok(name),
-                None => Ok("".to_string()),
-            }
+            Ok(this.domain_name.clone())
         });
     }
 }
@@ -393,6 +372,10 @@ pub struct TermWindow {
     show_tab_bar: bool,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
+    tab_sidebar: tab_sidebar::TabSidebar,
+    tab_sidebar_rows: Vec<tab_sidebar::SidebarRow>,
+    tab_sidebar_refresh_queued: bool,
+    tab_sidebar_enabled: bool,
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
@@ -467,24 +450,9 @@ pub struct TermWindow {
     webgpu: Option<Rc<WebGpuState>>,
     config_subscription: Option<config::ConfigSubscription>,
 
-    /// egui state for `GuiPane` dashboards. Lazy-initialized in the WebGpu
-    /// draw path on first frame (needs device + surface format).
+    /// Window-owned sidebar renderer, lazy-initialized in the WebGpu draw path.
     egui_ctx: Option<egui::Context>,
     egui_renderer: Option<egui_wgpu::Renderer>,
-    /// `(screen_rect, GuiPane)` pairs collected during `paint_pass`, consumed
-    /// by the egui compositing pass in `call_draw_webgpu`. Cleared each frame.
-    pub(crate) gui_render_list:
-        Vec<(euclid::default::Rect<f32>, std::sync::Arc<dyn mux::pane::Pane>)>,
-
-    /// Throttle for `refresh_gui_panes` so `render-gui-pane` doesn't fire
-    /// more often than the dashboard can usefully update.
-    last_gui_refresh: Option<Instant>,
-
-    /// Accumulated egui input events for the next frame. Cleared after each
-    /// egui pass. Stores pointer and keyboard events that fall inside GuiPane rects.
-    egui_input_events: Vec<egui::Event>,
-    /// Last known pointer position for egui (in points, not pixels).
-    egui_pointer_pos: egui::Pos2,
 }
 
 impl TermWindow {
@@ -664,6 +632,17 @@ impl TermWindow {
         };
         let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
         let padding_right = resize::effective_right_padding(&config, h_context) as usize;
+        let tab_sidebar_enabled = config.enable_tab_sidebar
+            && config.front_end == FrontEndSelection::WebGpu;
+        if config.enable_tab_sidebar && !tab_sidebar_enabled {
+            log::warn!("enable_tab_sidebar requires front_end = 'WebGpu'; sidebar disabled for this window");
+        }
+        let sidebar_width = if tab_sidebar_enabled {
+            config.tab_sidebar_width.max(tab_sidebar::COMPACT_WIDTH_CELLS + 1)
+                * render_metrics.cell_size.width as usize
+        } else {
+            0
+        };
         let v_context = DimensionContext {
             dpi: dpi as f32,
             pixel_max: terminal_size.pixel_height as f32,
@@ -673,7 +652,7 @@ impl TermWindow {
         let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
 
         let mut dimensions = Dimensions {
-            pixel_width: (terminal_size.pixel_width + padding_left + padding_right) as usize,
+            pixel_width: (terminal_size.pixel_width + padding_left + padding_right + sidebar_width) as usize,
             pixel_height: ((terminal_size.rows * render_metrics.cell_size.height as usize)
                 + padding_top
                 + padding_bottom) as usize
@@ -712,10 +691,6 @@ impl TermWindow {
             webgpu: None,
             egui_ctx: None,
             egui_renderer: None,
-            gui_render_list: Vec::new(),
-            last_gui_refresh: None,
-            egui_input_events: Vec::new(),
-            egui_pointer_pos: egui::pos2(0.0, 0.0),
             window: None,
             window_background,
             config: config.clone(),
@@ -740,6 +715,13 @@ impl TermWindow {
             show_tab_bar,
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
+            tab_sidebar: tab_sidebar::TabSidebar {
+                dirty: tab_sidebar_enabled,
+                ..Default::default()
+            },
+            tab_sidebar_rows: vec![],
+            tab_sidebar_refresh_queued: false,
+            tab_sidebar_enabled,
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -1283,6 +1265,7 @@ impl TermWindow {
                     window_id: _,
                     tab_id,
                 } => {
+                    self.mark_tab_sidebar_dirty();
                     let mux = Mux::get();
                     let mut size = self.terminal_size;
                     if let Some(tab) = mux.get_tab(tab_id) {
@@ -1309,12 +1292,14 @@ impl TermWindow {
                             tab.resize(self.terminal_size);
                         }
                     }
+                    self.emit_status_event();
                 }
                 MuxNotification::PaneOutput(pane_id) => {
                     self.mux_pane_output_event(pane_id);
                 }
                 MuxNotification::WindowInvalidated(_) => {
                     window.invalidate();
+                    self.mark_tab_sidebar_dirty();
                     self.update_title_post_status();
                 }
                 MuxNotification::WindowRemoved(_window_id) => {
@@ -1328,18 +1313,25 @@ impl TermWindow {
                 }
                 MuxNotification::PaneFocused(_) => {
                     // Also handled by clientpane
+                    self.mark_tab_sidebar_dirty();
                     self.update_title_post_status();
                 }
                 MuxNotification::TabResized(_) => {
                     // Also handled by wezterm-client
+                    self.mark_tab_sidebar_dirty();
                     self.update_title_post_status();
                 }
                 MuxNotification::TabTitleChanged { .. } => {
+                    self.mark_tab_sidebar_dirty();
                     self.update_title_post_status();
                 }
-                MuxNotification::PaneAdded(_)
-                | MuxNotification::WorkspaceRenamed { .. }
-                | MuxNotification::PaneRemoved(_)
+                MuxNotification::PaneAdded(_) => {
+                    self.mark_tab_sidebar_dirty();
+                }
+                MuxNotification::PaneRemoved(_) => {
+                    self.mark_tab_sidebar_dirty();
+                }
+                MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::Empty
@@ -1635,73 +1627,6 @@ impl TermWindow {
         .detach();
     }
 
-    /// Emit `wezterm.on("render-gui-pane", function(window, pane, ui))` for
-    /// every visible `GuiPane`, then flush the handler-built `LuaUi` tree onto
-    /// the pane so the egui render pass picks it up. Throttled to ~10 Hz.
-    pub fn refresh_gui_panes(&mut self) {
-        use std::time::Duration;
-
-        if self.window.is_none() {
-            return;
-        }
-        if matches!(self.last_gui_refresh, Some(t) if t.elapsed() < Duration::from_millis(100)) {
-            return;
-        }
-        self.last_gui_refresh = Some(Instant::now());
-
-        for pos in self.get_panes_to_render() {
-            if pos.pane.downcast_ref::<mux::guipane::GuiPane>().is_none() {
-                continue;
-            }
-            let window = GuiWin::new(self);
-            let pane = MuxPane(pos.pane.pane_id());
-            let ui = mux_lua::LuaUi::new();
-            let g_generation = if let Some(g) = pos.pane.downcast_ref::<mux::guipane::GuiPane>() {
-                ui.set_events(g.drain_clicked());
-                ui.set_values(g.values_snapshot());
-                ui.set_width(g.width());
-                ui.set_collapsed(g.collapsed_map());
-                ui.set_clock(self.created.elapsed().as_secs_f64());
-                g.bump_generation()
-            } else {
-                0
-            };
-            let gp = pos.pane.clone();
-            let name = "render-gui-pane".to_string();
-            // Bump generation; the flush skips if a newer refresh superseded
-            // this one, so a slow handler can't overwrite a fresher tree.
-            let generation = g_generation;
-            promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-                let name = name;
-                let window = window;
-                let pane = pane;
-                let ui = ui;
-                let gp = gp;
-                let generation = generation;
-                async move {
-                    if let Some(lua) = lua {
-                        if let Ok(args) = lua.pack_multi((window.clone(), pane.clone(), ui.clone()))
-                        {
-                            if let Err(err) =
-                                config::lua::emit_event(&lua, (name.clone(), args)).await
-                            {
-                                log::error!("while processing {} event: {:#}", name, err);
-                            }
-                        }
-                    }
-                    if let Some(g) = gp.downcast_ref::<mux::guipane::GuiPane>() {
-                        // Out-of-order flush guard: drop stale results.
-                        if g.generation() == generation {
-                            mux_lua::flush_ui_to_pane(&ui, g);
-                        }
-                    }
-                    Ok::<(), anyhow::Error>(())
-                }
-            }))
-            .detach();
-        }
-    }
-
     /// Called as part of finishing up a callout to lua.
     /// If again==false it means that there isn't a lua config
     /// to execute against, so we should just mark as done.
@@ -1834,6 +1759,14 @@ impl TermWindow {
             }
         };
         self.config = config.clone();
+        let tab_sidebar_enabled = config.enable_tab_sidebar && self.webgpu.is_some();
+        if config.enable_tab_sidebar && !tab_sidebar_enabled {
+            log::warn!("enable_tab_sidebar requires the WebGpu frontend; sidebar disabled for this window");
+        }
+        if self.tab_sidebar_enabled != tab_sidebar_enabled {
+            self.tab_sidebar_enabled = tab_sidebar_enabled;
+            self.tab_sidebar.dirty = tab_sidebar_enabled;
+        }
         self.palette.take();
 
         let mux = Mux::get();
@@ -2048,8 +1981,6 @@ impl TermWindow {
     /// been updated; let's update the bar
     pub fn update_title_post_status(&mut self) {
         self.update_title_impl();
-        // Rebuild any GuiPane dashboards from their render-gui-pane handlers.
-        self.refresh_gui_panes();
     }
 
     fn update_title_impl(&mut self) {
@@ -2082,27 +2013,34 @@ impl TermWindow {
             None => false,
         };
 
-        let new_tab_bar = TabBarState::new(
-            self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
-            if hovering_in_tab_bar {
-                Some(self.last_mouse_coords.0)
-            } else {
-                None
-            },
-            &tabs,
-            &panes,
-            self.config.resolved_palette.tab_bar.as_ref(),
-            &self.config,
-            &self.left_status,
-            &self.right_status,
-        );
-        if new_tab_bar != self.tab_bar {
-            self.tab_bar = new_tab_bar;
-            self.invalidate_fancy_tab_bar();
-            self.invalidate_modal();
-            if let Some(window) = self.window.as_ref() {
-                window.invalidate();
+        // The old tab bar owns format-tab-title.  Do not rebuild it while it
+        // is hidden: that used to run arbitrary Lua merely to paint a sidebar.
+        if self.show_tab_bar {
+            let new_tab_bar = TabBarState::new(
+                self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
+                if hovering_in_tab_bar {
+                    Some(self.last_mouse_coords.0)
+                } else {
+                    None
+                },
+                &tabs,
+                &panes,
+                self.config.resolved_palette.tab_bar.as_ref(),
+                &self.config,
+                &self.left_status,
+                &self.right_status,
+            );
+            if new_tab_bar != self.tab_bar {
+                self.tab_bar = new_tab_bar;
+                self.invalidate_fancy_tab_bar();
+                self.invalidate_modal();
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
             }
+        }
+        if self.tab_sidebar_enabled && self.tab_sidebar.dirty && !self.tab_sidebar_refresh_queued {
+            self.mark_tab_sidebar_dirty();
         }
 
         let tabs_count = window.count_tabs();
@@ -2794,6 +2732,13 @@ impl TermWindow {
                     WindowLevel::AlwaysOnTop | WindowLevel::Normal => {
                         window.set_window_level(WindowLevel::AlwaysOnBottom);
                     }
+                }
+            }
+            ToggleTabSidebarMode => {
+                if self.tab_sidebar_enabled {
+                    self.tab_sidebar.compact = !self.tab_sidebar.compact;
+                    self.mark_tab_sidebar_dirty();
+                    self.config_was_reloaded();
                 }
             }
             SetWindowLevel(level) => {
@@ -3530,6 +3475,12 @@ impl TermWindow {
     }
 
     fn pos_pane_to_pane_info(pos: &PositionedPane) -> PaneInformation {
+        let domain = Mux::try_get().and_then(|mux| mux.get_domain(pos.pane.domain_id()));
+        let controller_pane_id = domain.as_ref().and_then(|domain| {
+            domain
+                .downcast_ref::<mux::tmux::TmuxDomain>()
+                .map(|domain| domain.controller_pane_id())
+        });
         PaneInformation {
             pane_id: pos.pane.pane_id(),
             pane_index: pos.index,
@@ -3545,6 +3496,15 @@ impl TermWindow {
             title: pos.pane.get_title(),
             user_vars: pos.pane.copy_user_vars(),
             progress: pos.pane.get_progress(),
+            controller_pane_id,
+            current_working_dir: pos.pane.get_current_working_dir(CachePolicy::AllowStale),
+            foreground_process_name: pos
+                .pane
+                .get_foreground_process_name(CachePolicy::AllowStale)
+                .unwrap_or_default(),
+            domain_name: domain
+                .map(|domain| domain.domain_name().to_string())
+                .unwrap_or_default(),
         }
     }
 
@@ -3561,6 +3521,10 @@ impl TermWindow {
             .enumerate()
             .map(|(idx, tab)| {
                 let panes = self.get_pos_panes_for_tab(tab);
+                let panes = panes
+                    .iter()
+                    .map(Self::pos_pane_to_pane_info)
+                    .collect::<Vec<_>>();
 
                 TabInformation {
                     tab_index: idx,
@@ -3572,10 +3536,8 @@ impl TermWindow {
                         .unwrap_or(false),
                     window_id: self.mux_window_id,
                     tab_title: tab.get_title(),
-                    active_pane: panes
-                        .iter()
-                        .find(|p| p.is_active)
-                        .map(Self::pos_pane_to_pane_info),
+                    active_pane: panes.iter().find(|p| p.is_active).cloned(),
+                    panes,
                 }
             })
             .collect()

@@ -38,7 +38,6 @@ pub mod borders;
 pub mod corners;
 pub mod draw;
 pub mod fancy_tab_bar;
-pub mod guipane_ui;
 pub mod paint;
 pub mod pane;
 pub mod screen_line;
@@ -392,7 +391,10 @@ impl crate::TermWindow {
             VerticalWindowContentAlignment::Bottom => vertical_gap,
         };
 
-        (padding_left + left_gap, padding_top + top_gap)
+        (
+            padding_left + left_gap + self.tab_sidebar_width_pixels() as f32,
+            padding_top + top_gap,
+        )
     }
 
     fn resolve_lock_glyph(

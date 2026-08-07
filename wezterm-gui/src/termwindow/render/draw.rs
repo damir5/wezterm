@@ -1,5 +1,5 @@
 use crate::colorease::ColorEaseUniform;
-use crate::termwindow::render::guipane_ui;
+use crate::termwindow::tab_sidebar::SidebarRow;
 use crate::termwindow::webgpu::ShaderUniform;
 use crate::termwindow::RenderFrame;
 use crate::uniforms::UniformBuilder;
@@ -9,10 +9,6 @@ use ::window::glium::uniforms::{
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
 use config::FreeTypeLoadTarget;
-use mux::guipane::GuiPane;
-use mux::pane::Pane;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 impl crate::TermWindow {
     pub fn call_draw(&mut self, frame: &mut RenderFrame) -> anyhow::Result<()> {
@@ -147,26 +143,39 @@ impl crate::TermWindow {
             }
         }
 
-        // egui compositing pass for GuiPane dashboards: replay each pane's
-        // widget tree into a real egui frame and record it into the same
-        // surface view via a second LoadOp::Load render pass. Skipped when no
-        // GuiPane is visible this frame.
-        let egui_events = std::mem::take(&mut self.egui_input_events);
-        let egui_cmd_bufs: Vec<wgpu::CommandBuffer> = if !self.gui_render_list.is_empty() {
-            let format = webgpu.config.borrow().format;
-            composite_egui_panes(
+        // The sidebar has one egui context per terminal window.  It is window
+        // chrome, so its cached model is rendered once rather than once per
+        // mux pane.
+        let egui_cmd_bufs = if self.tab_sidebar_enabled {
+            let config = webgpu.config.borrow();
+            let linear_format = config.format.remove_srgb_suffix();
+            let egui_format = if config.view_formats.contains(&linear_format) {
+                linear_format
+            } else {
+                config.format
+            };
+            drop(config);
+            let egui_view = output.texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(egui_format),
+                ..Default::default()
+            });
+            let rows = self.tab_sidebar_rows.clone();
+            let sidebar_width = self.tab_sidebar_width_pixels() as u32;
+            composite_tab_sidebar(
                 &mut self.egui_ctx,
                 &mut self.egui_renderer,
-                &self.gui_render_list,
+                &rows,
+                self.tab_sidebar.scroll_rows,
+                self.tab_sidebar.compact,
+                sidebar_width,
                 self.dimensions.pixel_width as u32,
                 self.dimensions.pixel_height as u32,
                 (self.dimensions.dpi as f32 / 96.0).max(1.0),
                 &webgpu.device,
                 &webgpu.queue,
-                format,
-                &view,
+                egui_format,
+                &egui_view,
                 &mut encoder,
-                egui_events,
             )?
         } else {
             Vec::new()
@@ -306,15 +315,15 @@ impl crate::TermWindow {
     }
 }
 
-/// Drive egui for every visible `GuiPane` and record its paint jobs into the
-/// given encoder + surface view. Lazily initializes the egui context and
-/// wgpu renderer on first use. Returns auxiliary command buffers produced by
-/// `egui_wgpu::Renderer::update_buffers` that must be submitted alongside the
-/// main encoder.
-fn composite_egui_panes(
+/// Paint the cached, per-window sidebar into the same surface view as the
+/// terminal.  Input is intentionally handled by native UIItem hit testing.
+fn composite_tab_sidebar(
     egui_ctx: &mut Option<egui::Context>,
     egui_renderer: &mut Option<egui_wgpu::Renderer>,
-    render_list: &[(euclid::default::Rect<f32>, Arc<dyn Pane>)],
+    rows: &[SidebarRow],
+    scroll_rows: usize,
+    compact: bool,
+    sidebar_width: u32,
     pixel_w: u32,
     pixel_h: u32,
     pixels_per_point: f32,
@@ -323,13 +332,10 @@ fn composite_egui_panes(
     format: wgpu::TextureFormat,
     view: &wgpu::TextureView,
     encoder: &mut wgpu::CommandEncoder,
-    input_events: Vec<egui::Event>,
 ) -> anyhow::Result<Vec<wgpu::CommandBuffer>> {
     if egui_ctx.is_none() {
         *egui_ctx = Some(egui::Context::default());
         let ctx = egui_ctx.as_ref().unwrap();
-        // Register JetBrainsMono and SymbolsNerdFontMono for icon support.
-        // Only run once when context is first created.
         register_egui_fonts(ctx);
     }
     let ctx = egui_ctx.as_ref().unwrap();
@@ -345,61 +351,74 @@ fn composite_egui_panes(
         egui::pos2(0.0, 0.0),
         egui::vec2(pixel_w as f32 / pixels_per_point, pixel_h as f32 / pixels_per_point),
     );
-    let raw_input = egui::RawInput {
+    ctx.begin_pass(egui::RawInput {
         screen_rect: Some(screen_rect),
-        events: input_events,
         ..Default::default()
-    };
-    ctx.begin_frame(raw_input);
-
-    for (rect, pane) in render_list.iter() {
-        let Some(g) = pane.downcast_ref::<GuiPane>() else {
-            continue;
-        };
-        let theme = g.theme();
-        let nodes = g.nodes();
-        let mut clicked: HashSet<String> = HashSet::new();
-        // Seed widget values from the pane so an in-flight drag stays smooth
-        // between Lua refreshes (render owns the value until Lua catches up).
-        let mut values = g.values_snapshot();
-        let mut collapsed: HashMap<String, bool> = HashMap::new();
-        let pos = egui::pos2(rect.origin.x / pixels_per_point, rect.origin.y / pixels_per_point);
-        // Pane size in egui points; used both to bound the scroll area and to
-        // report `ui:width()` back to Lua.
-        let size = egui::vec2(
-            rect.size.width / pixels_per_point,
-            rect.size.height / pixels_per_point,
+    });
+    let rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(sidebar_width as f32 / pixels_per_point, screen_rect.height()),
+    );
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("tab-sidebar"),
+    ));
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 27, 33));
+    painter.line_segment(
+        [rect.right_top(), rect.right_bottom()],
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)),
+    );
+    // UIItem rectangles use physical pixels; convert the shared 24 px row
+    // contract to egui points so visual and hit-test geometry stay identical.
+    let row_height = 24.0 / pixels_per_point;
+    let font = egui::FontId::monospace(13.0);
+    for (row, item) in rows.iter().skip(scroll_rows).enumerate() {
+        let y = row as f32 * row_height;
+        if y >= rect.height() {
+            break;
+        }
+        let row_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, y),
+            egui::vec2(rect.width(), row_height),
         );
-        egui::Area::new(egui::Id::new(pane.pane_id()))
-            .order(egui::Order::Foreground)
-            .fixed_pos(pos)
-            .interactable(true)
-            .show(ctx, |ui| {
-                // Theme + clip are scoped to this pane's Ui so concurrent
-                // GuiPanes don't bleed visuals into one another, and overflow
-                // scrolls instead of spilling onto neighbouring panes.
-                guipane_ui::apply_theme(ui, &theme);
-                egui::ScrollArea::vertical()
-                    .max_width(size.x)
-                    .max_height(size.y)
-                    .show(ui, |ui| {
-                        guipane_ui::render_nodes(
-                            ui,
-                            &nodes,
-                            &theme,
-                            &mut clicked,
-                            &mut values,
-                            &mut collapsed,
-                        );
-                    });
-            });
-        g.set_events(clicked);
-        g.set_values(values);
-        g.set_width(size.x);
-        g.set_collapsed_map(collapsed);
+        let (label, right, active, urgency, status_color, is_group, indent) = match item {
+            SidebarRow::Group(group) => (
+                group.label.clone(), String::new(), group.active, group.urgency, None, true,
+                group.depth as f32 * 12.0,
+            ),
+            SidebarRow::Tab(entry) => (
+                if compact { entry.title.chars().take(2).collect() } else { format!("{} {}", entry.status_glyph, entry.title) },
+                entry.right.clone(), entry.active, entry.urgency, entry.status_color.clone(), false, 0.0,
+            ),
+        };
+        if active {
+            painter.rect_filled(row_rect.shrink2(egui::vec2(3.0, 2.0)), 4.0, egui::Color32::from_rgb(30, 120, 230));
+        }
+        let color = status_color.as_deref().and_then(parse_color).unwrap_or_else(|| {
+            if urgency == 2 { egui::Color32::from_rgb(255, 104, 110) }
+            else if urgency == 1 { egui::Color32::from_rgb(235, 185, 80) }
+            else if is_group { egui::Color32::from_gray(145) }
+            else { egui::Color32::from_rgb(220, 222, 228) }
+        });
+        painter.text(
+            row_rect.left_center() + egui::vec2(8.0 + indent, 0.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font.clone(),
+            color,
+        );
+        if !compact && !right.is_empty() {
+            painter.text(
+                row_rect.right_center() - egui::vec2(8.0, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                &right,
+                font.clone(),
+                egui::Color32::from_gray(150),
+            );
+        }
     }
 
-    let full_output = ctx.end_frame();
+    let full_output = ctx.end_pass();
     let textures_delta = full_output.textures_delta;
     let paint_jobs = ctx.tessellate(full_output.shapes, pixels_per_point);
 
@@ -419,7 +438,7 @@ fn composite_egui_panes(
 
     // Second pass over the surface view, preserving WezTerm's drawn pixels.
     {
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("egui pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
@@ -440,8 +459,18 @@ fn composite_egui_panes(
     Ok(user_cmd_bufs)
 }
 
+fn parse_color(value: &str) -> Option<egui::Color32> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 { return None; }
+    Some(egui::Color32::from_rgb(
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ))
+}
+
 /// Register JetBrainsMono and SymbolsNerdFontMono into the egui context so
-/// Nerd Font / powerline glyphs render in dashboards. Embeds the same vendored
+/// Nerd Font / powerline glyphs render in the sidebar. Embeds the same vendored
 /// assets WezTerm uses for its terminal fonts (compile-time, no runtime fs).
 /// Called once when the egui context is first created.
 fn register_egui_fonts(ctx: &egui::Context) {
@@ -478,3 +507,10 @@ fn register_egui_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+#[cfg(test)]
+mod test {
+    #[test]
+    fn sidebar_compact_width_is_smaller_than_regular_width() {
+        assert!(crate::termwindow::tab_sidebar::COMPACT_WIDTH_CELLS < 34);
+    }
+}

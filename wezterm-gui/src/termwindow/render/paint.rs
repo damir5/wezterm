@@ -171,8 +171,21 @@ impl crate::TermWindow {
 
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
-        // Rebuild the GuiPane render list each frame (consumed in call_draw).
-        self.gui_render_list.clear();
+        self.tab_sidebar_rows = if self.tab_sidebar_enabled {
+            crate::termwindow::tab_sidebar::sidebar_rows(&self.tab_sidebar)
+        } else {
+            vec![]
+        };
+        if self.tab_sidebar_enabled {
+            self.ui_items.extend(crate::termwindow::tab_sidebar::ui_items_for_rows(
+                &self.tab_sidebar_rows,
+                self.tab_sidebar.scroll_rows,
+                0,
+                24,
+                self.tab_sidebar_width_pixels(),
+                self.dimensions.pixel_height,
+            ));
+        }
 
         let panes = self.get_panes_to_render();
         let focused = self.focused.is_some();

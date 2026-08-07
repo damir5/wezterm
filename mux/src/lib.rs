@@ -37,7 +37,6 @@ pub mod activity;
 pub mod client;
 pub mod connui;
 pub mod domain;
-pub mod guipane;
 pub mod localpane;
 pub mod pane;
 pub mod renderable;

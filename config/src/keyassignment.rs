@@ -541,6 +541,7 @@ pub enum KeyAssignment {
     ToggleAlwaysOnTop,
     ToggleAlwaysOnBottom,
     SetWindowLevel(WindowLevel),
+    ToggleTabSidebarMode,
     CopyTo(ClipboardCopyDestination),
     CopyTextTo {
         text: String,
