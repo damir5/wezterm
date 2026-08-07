@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{Cursor, CSI};
+use termwiz::escape::csi::{Cursor, DecPrivateMode, DecPrivateModeCode, Mode, CSI};
 use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
 use wezterm_term::TerminalSize;
@@ -35,6 +35,35 @@ pub(crate) struct PaneItem {
     pane_left: u64,
     pane_top: u64,
     pane_active: bool,
+    mouse_standard: bool,
+    mouse_button: bool,
+    mouse_all: bool,
+    mouse_utf8: bool,
+    mouse_sgr: bool,
+}
+
+fn tmux_mouse_mode_actions(pane: &PaneItem) -> Vec<Action> {
+    let modes = [
+        (pane.mouse_standard, DecPrivateModeCode::MouseTracking),
+        (pane.mouse_button, DecPrivateModeCode::ButtonEventMouse),
+        (pane.mouse_all, DecPrivateModeCode::AnyEventMouse),
+        (pane.mouse_utf8, DecPrivateModeCode::Utf8Mouse),
+        (pane.mouse_sgr, DecPrivateModeCode::SGRMouse),
+    ];
+    let mut actions = Vec::with_capacity(modes.len() * 2);
+    for (_, mode) in &modes {
+        actions.push(Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(
+            DecPrivateMode::Code(mode.clone()),
+        ))));
+    }
+    for (enabled, mode) in modes {
+        if enabled {
+            actions.push(Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(
+                DecPrivateMode::Code(mode),
+            ))));
+        }
+    }
+    actions
 }
 
 #[derive(Debug)]
@@ -274,6 +303,11 @@ impl TmuxDomainState {
             pane_left: 0,
             pane_top: 0,
             pane_active: false,
+            mouse_standard: false,
+            mouse_button: false,
+            mouse_all: false,
+            mouse_utf8: false,
+            mouse_sgr: false,
         };
 
         let pane = self.create_pane(&p).context("failed to create pane")?;
@@ -347,6 +381,8 @@ impl TmuxDomainState {
                         None => {}
                     }
                 }
+                // tmux retains these per pane but does not replay them to new control clients.
+                local_pane.perform_actions(tmux_mouse_mode_actions(pane));
             }
 
             log::info!("new pane synced, id: {}", pane.pane_id);
@@ -408,6 +444,11 @@ impl TmuxDomainState {
                             pane_height: x.pane_height,
                             pane_left: x.pane_left,
                             pane_top: x.pane_top,
+                            mouse_standard: false,
+                            mouse_button: false,
+                            mouse_all: false,
+                            mouse_utf8: false,
+                            mouse_sgr: false,
                         };
                         let local_pane = self.create_pane(&p).context("failed to create pane")?;
                         tab.assign_pane(&local_pane);
@@ -440,6 +481,11 @@ impl TmuxDomainState {
                         pane_height: x.pane_height,
                         pane_left: x.pane_left,
                         pane_top: x.pane_top,
+                        mouse_standard: false,
+                        mouse_button: false,
+                        mouse_all: false,
+                        mouse_utf8: false,
+                        mouse_sgr: false,
                     };
                     let local_pane;
                     if !self.check_pane_attached(p.window_id, p.pane_id) {
@@ -667,7 +713,10 @@ impl TmuxCommand for ListAllPanes {
         format!(
             "list-panes -F '#{{session_id}} #{{window_id}} #{{pane_id}} \
             #{{pane_index}} #{{cursor_x}} #{{cursor_y}} #{{pane_width}} #{{pane_height}} \
-            #{{pane_left}} #{{pane_top}} #{{pane_active}}' -t @{}\n",
+            #{{pane_left}} #{{pane_top}} #{{pane_active}} \
+            #{{?mouse_standard_flag,1,0}} #{{?mouse_button_flag,1,0}} \
+            #{{?mouse_all_flag,1,0}} #{{?mouse_utf8_flag,1,0}} \
+            #{{?mouse_sgr_flag,1,0}}' -t @{}\n",
             self.window_id
         )
     }
@@ -725,6 +774,31 @@ impl TmuxCommand for ListAllPanes {
                 .next()
                 .ok_or_else(|| anyhow!("missing pane_active"))?
                 .parse::<usize>()?;
+            let mouse_standard = fields
+                .next()
+                .ok_or_else(|| anyhow!("missing mouse_standard_flag"))?
+                .parse::<usize>()?
+                == 1;
+            let mouse_button = fields
+                .next()
+                .ok_or_else(|| anyhow!("missing mouse_button_flag"))?
+                .parse::<usize>()?
+                == 1;
+            let mouse_all = fields
+                .next()
+                .ok_or_else(|| anyhow!("missing mouse_all_flag"))?
+                .parse::<usize>()?
+                == 1;
+            let mouse_utf8 = fields
+                .next()
+                .ok_or_else(|| anyhow!("missing mouse_utf8_flag"))?
+                .parse::<usize>()?
+                == 1;
+            let mouse_sgr = fields
+                .next()
+                .ok_or_else(|| anyhow!("missing mouse_sgr_flag"))?
+                .parse::<usize>()?
+                == 1;
 
             let pane_active = pane_active == 1;
 
@@ -742,6 +816,11 @@ impl TmuxCommand for ListAllPanes {
                 pane_left,
                 pane_top,
                 pane_active,
+                mouse_standard,
+                mouse_button,
+                mouse_all,
+                mouse_utf8,
+                mouse_sgr,
             });
         }
 
@@ -1194,5 +1273,50 @@ impl TmuxCommand for AttachDone {
         // Do nothing, just change the state.
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn attached_pane_restores_sgr_any_event_mouse() {
+        let mut terminal = wezterm_term::Terminal::new(
+            TerminalSize::default(),
+            Arc::new(config::TermConfig::new()),
+            "WezTerm",
+            "test",
+            Box::new(std::io::sink()),
+        );
+        let pane = PaneItem {
+            session_id: 1,
+            window_id: 2,
+            pane_id: 3,
+            _pane_index: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            pane_width: 80,
+            pane_height: 24,
+            pane_left: 0,
+            pane_top: 0,
+            pane_active: true,
+            mouse_standard: false,
+            mouse_button: false,
+            mouse_all: true,
+            mouse_utf8: false,
+            mouse_sgr: true,
+        };
+
+        terminal.perform_actions(tmux_mouse_mode_actions(&pane));
+        assert!(terminal.is_mouse_grabbed());
+
+        let mouse_disabled = PaneItem {
+            mouse_all: false,
+            mouse_sgr: false,
+            ..pane
+        };
+        terminal.perform_actions(tmux_mouse_mode_actions(&mouse_disabled));
+        assert!(!terminal.is_mouse_grabbed());
     }
 }
