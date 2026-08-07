@@ -21,7 +21,7 @@ mod tab;
 mod window;
 
 pub use domain::MuxDomain;
-pub use gui::{flush_ui_to_pane, split_dashboard, LuaUi};
+pub use gui::{flush_ui_to_pane, set_split_size, split_dashboard, LuaUi};
 pub use pane::MuxPane;
 pub use tab::MuxTab;
 pub use window::MuxWindow;
@@ -179,6 +179,10 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
     gui_mod.set(
         "split_dashboard",
         lua.create_function(|_, opts: Option<mlua::Table>| split_dashboard(opts))?,
+    )?;
+    gui_mod.set(
+        "set_split_size",
+        lua.create_function(|_, opts: mlua::Table| set_split_size(opts))?,
     )?;
 
     Ok(())

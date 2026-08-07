@@ -687,39 +687,113 @@ pub fn flush_ui_to_pane(ui: &LuaUi, pane: &GuiPane) {
     pane.set_nodes(nodes);
 }
 
-/// `wezterm.gui.split_dashboard({ title=..., size=50 })`: split a `GuiPane`
-/// into the active tab of the first window so a dashboard can actually appear.
-/// Returns the new pane. The `render-gui-pane` handler (wired in `wezterm-gui`)
-/// populates its widget tree.
+/// Which `SplitRequest` geometry an edge name means. `target_is_second` puts
+/// the new pane in the right/bottom half, so left and top are the `false` cases.
+fn split_geometry(side: &str) -> Option<(SplitDirection, bool)> {
+    match side {
+        "left" => Some((SplitDirection::Horizontal, false)),
+        "right" => Some((SplitDirection::Horizontal, true)),
+        "top" => Some((SplitDirection::Vertical, false)),
+        "bottom" => Some((SplitDirection::Vertical, true)),
+        _ => None,
+    }
+}
+
+/// `wezterm.gui.split_dashboard({ title=..., side='left', size_cols=34,
+/// top_level=true, focus=false, pane_id=... })`: split a `GuiPane` into a tab so
+/// a dashboard can actually appear. Returns the new pane. The `render-gui-pane`
+/// handler (wired in `wezterm-gui`) populates its widget tree.
+///
+/// - `side` picks the edge: left, right (the default, and the previous
+///   behaviour), top or bottom.
+/// - `size_cols` sizes it in cells; `size` still takes a percentage.
+/// - `top_level` splits across the whole tab rather than just the reference
+///   pane, which is what a full-height sidebar needs in an already-split tab.
+/// - `focus=false` leaves the caller's pane active, so spawning a sidebar does
+///   not steal the cursor.
+/// - `pane_id` names the pane whose tab to split. Without it the first window's
+///   active tab is used, which is ambiguous once a second window is open.
 pub fn split_dashboard(opts: Option<mlua::Table>) -> mlua::Result<MuxPane> {
     let mux = get_mux()?;
+
     let title: String = opts
         .as_ref()
         .and_then(|o| o.get::<_, Option<String>>("title").ok().flatten())
         .unwrap_or_else(|| "Dashboard".into());
-    let pct: u8 = opts
+
+    let side = opts
         .as_ref()
-        .and_then(|o| o.get::<_, Option<u8>>("size").ok().flatten())
-        .unwrap_or(50)
-        .min(95)
-        .max(5);
+        .and_then(|o| o.get::<_, Option<String>>("side").ok().flatten())
+        .unwrap_or_else(|| "right".into());
+    let (direction, target_is_second) = split_geometry(&side).ok_or_else(|| {
+        mlua::Error::external(format!(
+            "split_dashboard: side must be left, right, top or bottom, got {side:?}"
+        ))
+    })?;
 
-    let win_id = mux
-        .iter_windows()
-        .into_iter()
-        .next()
-        .ok_or_else(|| mlua::Error::external("no open window to split"))?;
-    let window = mux
-        .get_window(win_id)
-        .ok_or_else(|| mlua::Error::external("window vanished"))?;
-    let tab = window
-        .get_active()
-        .ok_or_else(|| mlua::Error::external("no active tab"))?;
+    let size = match opts
+        .as_ref()
+        .and_then(|o| o.get::<_, Option<usize>>("size_cols").ok().flatten())
+    {
+        Some(cells) => SplitSize::Cells(cells.max(1)),
+        None => {
+            let pct: u8 = opts
+                .as_ref()
+                .and_then(|o| o.get::<_, Option<u8>>("size").ok().flatten())
+                .unwrap_or(50)
+                .min(95)
+                .max(5);
+            SplitSize::Percent(pct)
+        }
+    };
 
-    let panes = tab.iter_panes();
-    let active_index = panes.iter().position(|p| p.is_active).unwrap_or(0);
+    let top_level = opts
+        .as_ref()
+        .and_then(|o| o.get::<_, Option<bool>>("top_level").ok().flatten())
+        .unwrap_or(false);
+    let focus = opts
+        .as_ref()
+        .and_then(|o| o.get::<_, Option<bool>>("focus").ok().flatten())
+        .unwrap_or(true);
+    let reference = opts
+        .as_ref()
+        .and_then(|o| o.get::<_, Option<usize>>("pane_id").ok().flatten());
+
+    let tab = match reference {
+        Some(pane_id) => {
+            let (_domain_id, _window_id, tab_id) = mux.resolve_pane_id(pane_id).ok_or_else(|| {
+                mlua::Error::external(format!("pane id {pane_id} not found in mux"))
+            })?;
+            mux.get_tab(tab_id)
+                .ok_or_else(|| mlua::Error::external("tab vanished"))?
+        }
+        None => {
+            let win_id = mux
+                .iter_windows()
+                .into_iter()
+                .next()
+                .ok_or_else(|| mlua::Error::external("no open window to split"))?;
+            let window = mux
+                .get_window(win_id)
+                .ok_or_else(|| mlua::Error::external("window vanished"))?;
+            // `window` is a read guard; clone the Arc out before it drops.
+            let tab = window
+                .get_active()
+                .ok_or_else(|| mlua::Error::external("no active tab"))?;
+            Arc::clone(tab)
+        }
+    };
+
+    let panes = tab.iter_panes_ignoring_zoom();
+    let reference_index = match reference {
+        Some(pane_id) => panes
+            .iter()
+            .position(|p| p.pane.pane_id() == pane_id)
+            .unwrap_or(0),
+        None => panes.iter().position(|p| p.is_active).unwrap_or(0),
+    };
     let dims = panes
-        .get(active_index)
+        .get(reference_index)
         .map(|p| p.pane.get_dimensions())
         .unwrap_or_else(|| mux::renderable::RenderableDimensions {
             cols: tab.get_size().cols,
@@ -736,16 +810,76 @@ pub fn split_dashboard(opts: Option<mlua::Table>) -> mlua::Result<MuxPane> {
     mux.add_pane(&gui)
         .map_err(|e| mlua::Error::external(format!("add_pane: {e:#}")))?;
     let request = SplitRequest {
-        direction: SplitDirection::Horizontal,
-        target_is_second: true,
-        top_level: false,
-        size: SplitSize::Percent(pct),
+        direction,
+        target_is_second,
+        top_level,
+        size,
     };
     let new_idx = tab
-        .split_and_insert(active_index, request, Arc::clone(&gui))
+        .split_and_insert(reference_index, request, Arc::clone(&gui))
         .map_err(|e| mlua::Error::external(format!("{e:#}")))?;
-    tab.set_active_idx(new_idx);
+    if focus {
+        tab.set_active_idx(new_idx);
+    }
     Ok(MuxPane(gui.pane_id()))
+}
+
+/// `wezterm.gui.set_split_size({ pane_id = ..., cells = 34 })`: resize the split
+/// bounding `pane_id` so that pane becomes `cells` wide -- or tall, for a
+/// top/bottom split. Returns true if anything moved.
+///
+/// `AdjustPaneSize` only moves the *active* pane's edge, so a sidebar could not
+/// collapse or expand without stealing focus first. This addresses the split by
+/// pane instead, which is what makes a focus-free collapse possible.
+pub fn set_split_size(opts: mlua::Table) -> mlua::Result<bool> {
+    let mux = get_mux()?;
+    let pane_id: usize = opts.get("pane_id")?;
+    let cells: usize = opts.get("cells")?;
+
+    let (_domain_id, _window_id, tab_id) = mux
+        .resolve_pane_id(pane_id)
+        .ok_or_else(|| mlua::Error::external(format!("pane id {pane_id} not found in mux")))?;
+    let tab = mux
+        .get_tab(tab_id)
+        .ok_or_else(|| mlua::Error::external("tab vanished"))?;
+
+    let panes = tab.iter_panes_ignoring_zoom();
+    let pos = panes
+        .iter()
+        .find(|p| p.pane.pane_id() == pane_id)
+        .ok_or_else(|| mlua::Error::external("pane is not present in its own tab"))?;
+
+    // A split line sits between two panes and `resize_split_by` moves the line,
+    // so which side this pane is on decides the sign of the delta.
+    let splits = tab.iter_splits();
+    let after = splits.iter().find(|s| match s.direction {
+        SplitDirection::Horizontal => s.left == pos.left + pos.width,
+        SplitDirection::Vertical => s.top == pos.top + pos.height,
+    });
+    let (split, pane_is_second) = match after {
+        Some(split) => (split, false),
+        None => {
+            let before = splits
+                .iter()
+                .find(|s| match s.direction {
+                    SplitDirection::Horizontal => pos.left > 0 && s.left + 1 == pos.left,
+                    SplitDirection::Vertical => pos.top > 0 && s.top + 1 == pos.top,
+                })
+                .ok_or_else(|| mlua::Error::external("pane has no adjacent split to resize"))?;
+            (before, true)
+        }
+    };
+
+    let current = match split.direction {
+        SplitDirection::Horizontal => pos.width,
+        SplitDirection::Vertical => pos.height,
+    };
+    let delta = cells as isize - current as isize;
+    if delta == 0 {
+        return Ok(false);
+    }
+    tab.resize_split_by(split.index, if pane_is_second { -delta } else { delta });
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1012,5 +1146,28 @@ mod test {
         assert_eq!(anim.target, 40.0);
         assert_eq!(anim.duration, Some(0.3));
         Ok(())
+    }
+
+    #[test]
+    fn side_names_map_to_split_geometry() {
+        // target_is_second puts the new pane in the right/bottom half, so left
+        // and top are the false cases. Getting this backwards silently puts the
+        // sidebar on the wrong edge.
+        assert_eq!(
+            split_geometry("left"),
+            Some((SplitDirection::Horizontal, false))
+        );
+        assert_eq!(
+            split_geometry("right"),
+            Some((SplitDirection::Horizontal, true))
+        );
+        assert_eq!(split_geometry("top"), Some((SplitDirection::Vertical, false)));
+        assert_eq!(
+            split_geometry("bottom"),
+            Some((SplitDirection::Vertical, true))
+        );
+        // An unknown side is an error, not a silent fallback to the default.
+        assert_eq!(split_geometry("sideways"), None);
+        assert_eq!(split_geometry("Left"), None);
     }
 }
