@@ -13,7 +13,7 @@
 //! `ui:value(id)`.
 
 use egui::{Color32, CornerRadius, Frame, Id, Response, RichText, Shape, Stroke, TextureHandle, Ui, Vec2};
-use mux::guipane::{Color, UiNode, UiStyle, UiTheme};
+use mux::guipane::{Color, FrameAnim, UiNode, UiStyle, UiTheme};
 use std::collections::{HashMap, HashSet};
 
 /// Convert a linear-ish RGBA (0.0..=1.0) to an egui `Color32`.
@@ -113,17 +113,18 @@ fn with_tooltip(response: Response, style: &UiStyle) -> Response {
 }
 
 /// Render a slice of nodes into `ui`, appending any activated widget ids to
-/// `clicked` and recording slider values into `values`. Container nodes
-/// recurse into their children.
+/// `clicked`, recording slider values into `values`, and collapsing-header
+/// states (id → collapsed) into `collapsed`. Container nodes recurse.
 pub fn render_nodes(
     ui: &mut Ui,
     nodes: &[UiNode],
     theme: &UiTheme,
     clicked: &mut HashSet<String>,
     values: &mut HashMap<String, f64>,
+    collapsed: &mut HashMap<String, bool>,
 ) {
     for node in nodes {
-        render_node(ui, node, theme, clicked, values);
+        render_node(ui, node, theme, clicked, values, collapsed);
     }
 }
 
@@ -133,6 +134,7 @@ fn render_node(
     theme: &UiTheme,
     clicked: &mut HashSet<String>,
     values: &mut HashMap<String, f64>,
+    collapsed: &mut HashMap<String, bool>,
 ) {
     match node {
         UiNode::Metric {
@@ -292,32 +294,67 @@ fn render_node(
                     ui.heading(title);
                     ui.add_space(2.0);
                 }
-                render_nodes(ui, children, theme, clicked, values);
+                render_nodes(ui, children, theme, clicked, values, collapsed);
             });
         }
         UiNode::CollapsingHeader {
+            id,
             title,
             default_open,
             style: _,
             children,
         } => {
-            egui::CollapsingHeader::new(title)
+            // The header id is the egui state key and the id Lua reads back via
+            // ui:collapsed(id); default to the title so state survives a reload
+            // even when Lua omits an explicit id.
+            let hid = id.clone().unwrap_or_else(|| title.clone());
+            let resp = egui::CollapsingHeader::new(title)
+                .id_salt(&hid)
                 .default_open(*default_open)
                 .show(ui, |ui| {
-                    render_nodes(ui, children, theme, clicked, values);
+                    render_nodes(ui, children, theme, clicked, values, collapsed);
                 });
+            // body_response is None iff collapsed.
+            collapsed.insert(hid, resp.body_response.is_none());
         }
-        UiNode::Frame { style, children } => {
-            frame_for(style, theme, false).show(ui, |ui| {
-                render_nodes(ui, children, theme, clicked, values);
+        UiNode::Frame {
+            clickable,
+            anim,
+            style,
+            children,
+        } => {
+            // Animate a vertical lead offset toward `target`; egui owns the
+            // eased value so it advances every frame, smooth between refreshes.
+            if let Some(anim) = anim {
+                ui.add_space(frame_anim_offset(ui.ctx(), anim));
+            }
+            let inner = frame_for(style, theme, false).show(ui, |ui| {
+                render_nodes(ui, children, theme, clicked, values, collapsed);
             });
+            // Whole-rect hit target (a borderless source-list row). Drawn after
+            // children so the frame is visible; the interact adds a click region
+            // over it without displacing child widgets.
+            if let Some(id) = clickable {
+                let rect = inner.response.rect;
+                let r = ui.interact(rect, Id::new(id.as_str()), egui::Sense::click());
+                if r.clicked() {
+                    clicked.insert(id.clone());
+                }
+            }
         }
+        UiNode::Arc {
+            value,
+            label,
+            color,
+            thickness,
+            style,
+        } => render_arc(ui, *value, label.as_deref(), *color, *thickness, theme, style),
         UiNode::Horizontal {
             style: _,
             children,
         } => {
             ui.horizontal(|ui| {
-                render_nodes(ui, children, theme, clicked, values);
+                render_nodes(ui, children, theme, clicked, values, collapsed);
             });
         }
         UiNode::Vertical {
@@ -325,7 +362,7 @@ fn render_node(
             children,
         } => {
             ui.vertical(|ui| {
-                render_nodes(ui, children, theme, clicked, values);
+                render_nodes(ui, children, theme, clicked, values, collapsed);
             });
         }
         UiNode::Columns {
@@ -338,7 +375,7 @@ fn render_node(
             ui.columns(n, |uis| {
                 for (col, cui) in uis.iter_mut().enumerate() {
                     for child in children.iter().skip(col).step_by(n) {
-                        render_node(cui, child, theme, clicked, values);
+                        render_node(cui, child, theme, clicked, values, collapsed);
                     }
                 }
             });
@@ -349,7 +386,7 @@ fn render_node(
             children,
         } => {
             ui.horizontal_wrapped(|ui| {
-                render_nodes(ui, children, theme, clicked, values);
+                render_nodes(ui, children, theme, clicked, values, collapsed);
             });
         }
     }
@@ -391,6 +428,66 @@ fn render_sparkline(
         painter.add(Shape::convex_polygon(poly, col.linear_multiply(0.25), Stroke::NONE));
     }
     painter.add(Shape::line(pts, Stroke::new(1.5, col)));
+}
+
+/// Eased vertical offset for an animated Frame, advanced every frame by egui
+/// (so motion is smooth between the ~10 Hz Lua refreshes). `target` is the
+/// offset in points.
+fn frame_anim_offset(ctx: &egui::Context, anim: &FrameAnim) -> f32 {
+    let dur = anim.duration.unwrap_or(0.2).max(0.0);
+    ctx.animate_value_with_time(Id::new(anim.id.as_str()), anim.target, dur)
+}
+
+/// Draw a donut/ring gauge: a dim track plus a colored arc for `value`
+/// (0..=1), with an optional centered label.
+/// ponytail: arc is a thick stroked polyline over a stroked track ring; no
+/// custom tessellator. Add anti-aliased fill wedges only if needed.
+fn render_arc(
+    ui: &mut Ui,
+    value: f32,
+    label: Option<&str>,
+    color: Option<Color>,
+    thickness: Option<f32>,
+    theme: &UiTheme,
+    style: &UiStyle,
+) {
+    let frac = value.clamp(0.0, 1.0);
+    let size = style.size.unwrap_or(48.0).max(8.0);
+    let (rect, _) = ui.allocate_at_least(Vec2::splat(size), egui::Sense::hover());
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.5;
+    let stroke_w = thickness.unwrap_or((radius * 0.22).max(3.0));
+    let col = color.map(c).unwrap_or(c(theme.accent));
+
+    // Dim full ring as the background track.
+    painter.add(Shape::circle_stroke(
+        center,
+        radius,
+        Stroke::new(stroke_w, c(theme.dim).linear_multiply(0.5)),
+    ));
+    // Colored arc on top, swept clockwise from 12 o'clock.
+    if frac > 0.0 {
+        let segments = (frac * 64.0).round() as usize + 1;
+        let sweep = frac * std::f32::consts::TAU;
+        let pts: Vec<egui::Pos2> = (0..segments)
+            .map(|i| {
+                let a = -std::f32::consts::FRAC_PI_2
+                    + (i as f32 / (segments - 1).max(1) as f32) * sweep;
+                egui::pos2(center.x + radius * a.cos(), center.y + radius * a.sin())
+            })
+            .collect();
+        painter.add(Shape::line(pts, Stroke::new(stroke_w, col)));
+    }
+    if let Some(label) = label {
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(radius * 0.7),
+            c(theme.foreground),
+        );
+    }
 }
 
 /// egui Context temp-data key for the per-window GuiPane image texture cache.

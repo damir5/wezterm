@@ -138,20 +138,29 @@ needs from the fork.
 | Progress `2/3` | `label` + `monospace` |
 | Summary chips | `horizontal` + `metric` |
 | Card grid | `columns` + `card` |
-| Health arc | `progress_bar` (a true arc needs a node) |
+| Health arc | `arc` node |
 | Row activation | `button` + `ui:clicked(id)` |
 | Overflow | already wrapped in `ScrollArea` |
 
-### Gaps this design needs from the fork
+### Gaps from the fork — implemented
 
-| Need | Why |
+| Need | Status / API |
 | :--- | :--- |
-| `ui:width()` | Size classes are unbuildable without the pane's pixel width in the render callback. Smallest, highest-value addition on this list. |
-| `ui:collapsed(id)` | egui owns collapse state in its own memory. Lua can't persist the layout across a config reload, or skip building a closed subtree. |
-| Frame time / clock | Breathing and spinner phase need a monotonic `t`. Either drive it from Rust or expose elapsed seconds to Lua. |
-| Full-row hit target | `button` is a button. A source-list row is a borderless full-width click region — needs a `selectable` node or `frame{clickable=true, id=…}`. |
-| Animated position | Urgency ordering needs interpolated row positions, or it snaps. egui can do it; the `UiNode` tree has nowhere to say so. |
-| Arc / donut node | For the card health ring. Optional — a stacked bar substitutes. |
+| `ui:width()` | ✅ Done. Render measures the pane width in egui points each frame and stores it on the `GuiPane`; `refresh_gui_panes` seeds it and `ui:width()` reads it. Enables size-classed layouts. |
+| `ui:collapsed(id)` | ✅ Done. `collapsing_header` takes an `id` (defaults to `title`); render records egui's open/closed state per id and `ui:collapsed(id)` reads it back, so Lua can skip a closed subtree or persist layout. |
+| Frame time / clock | ✅ Done. `ui:clock()` returns seconds since the window was created (seeded from `TermWindow::created`), a monotonic phase source for breathing / spinner / easing. |
+| Full-row hit target | ✅ Done. `frame({ id = "row" })` turns the whole frame rect into a borderless click region (egui `Sense::click`); `ui:clicked(id)` reports it. |
+| Animated position | ✅ Done (bounded). `frame({ animate = { id, target, duration } })` eases a vertical offset toward `target` via egui `animate_value_with_time`. Render owns the eased value, so motion is smooth between the ~10 Hz Lua refreshes. For full list reordering, pair with `ui:clock()` to drive targets. |
+| Arc / donut node | ✅ Done. `arc({ value, label, color, thickness })` draws a donut gauge (dim track + colored arc). |
+
+#### Caveats
+
+- **Animated position** is a per-frame eased *offset*, not a layout engine: rows
+  animate a vertical lead-space, which slides them smoothly. True reordering with
+  interpolated insertion/removal would need absolute layout and is out of scope.
+- **egui animation ids** (`frame.animate.id`) are global to the egui `Context`,
+  not namespaced per pane; reuse the same id across two panes and they share the
+  eased value. Use pane-distinct ids if that matters.
 
 ---
 *Summary of Architectural Decision:* `egui` is embedded into `wezterm-gui` via `egui-wgpu`, composited in a second render pass over the WebGpu surface. Lua drives it through a deferred `UiNode` tree built by `LuaUi` and replayed each frame, with mouse/keyboard input forwarded back into egui. Dual-instance activity tracking works out of the box using file locks and atomic JSON snapshots.

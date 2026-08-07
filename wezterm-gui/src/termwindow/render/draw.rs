@@ -362,7 +362,14 @@ fn composite_egui_panes(
         // Seed widget values from the pane so an in-flight drag stays smooth
         // between Lua refreshes (render owns the value until Lua catches up).
         let mut values = g.values_snapshot();
+        let mut collapsed: HashMap<String, bool> = HashMap::new();
         let pos = egui::pos2(rect.origin.x / pixels_per_point, rect.origin.y / pixels_per_point);
+        // Pane size in egui points; used both to bound the scroll area and to
+        // report `ui:width()` back to Lua.
+        let size = egui::vec2(
+            rect.size.width / pixels_per_point,
+            rect.size.height / pixels_per_point,
+        );
         egui::Area::new(egui::Id::new(pane.pane_id()))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
@@ -372,19 +379,24 @@ fn composite_egui_panes(
                 // GuiPanes don't bleed visuals into one another, and overflow
                 // scrolls instead of spilling onto neighbouring panes.
                 guipane_ui::apply_theme(ui, &theme);
-                let size = egui::vec2(
-                    rect.size.width / pixels_per_point,
-                    rect.size.height / pixels_per_point,
-                );
                 egui::ScrollArea::vertical()
                     .max_width(size.x)
                     .max_height(size.y)
                     .show(ui, |ui| {
-                        guipane_ui::render_nodes(ui, &nodes, &theme, &mut clicked, &mut values);
+                        guipane_ui::render_nodes(
+                            ui,
+                            &nodes,
+                            &theme,
+                            &mut clicked,
+                            &mut values,
+                            &mut collapsed,
+                        );
                     });
             });
         g.set_events(clicked);
         g.set_values(values);
+        g.set_width(size.x);
+        g.set_collapsed_map(collapsed);
     }
 
     let full_output = ctx.end_frame();

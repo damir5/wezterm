@@ -11,7 +11,7 @@
 //! without ever handing a live `&mut egui::Ui` across the mlua boundary.
 
 use super::*;
-use mux::guipane::{Color, GuiPane, UiNode, UiStyle, UiTheme};
+use mux::guipane::{Color, FrameAnim, GuiPane, UiNode, UiStyle, UiTheme};
 use mux::pane::Pane;
 use mux::tab::{SplitDirection, SplitRequest, SplitSize};
 use parking_lot::Mutex;
@@ -35,6 +35,16 @@ pub struct LuaUi {
     /// Latest widget values (sliders) from the last render pass, read back by
     /// `ui:value(id)`. Seeded from the GuiPane at the start of each fire.
     values: Arc<Mutex<HashMap<String, f64>>>,
+    /// Pane width in egui points (from the last render pass), read by
+    /// `ui:width()` so Lua can build size-classed layouts. Seeded per fire.
+    width: Arc<Mutex<f32>>,
+    /// Collapsing-header states (id → collapsed) from the last render pass,
+    /// read by `ui:collapsed(id)` so Lua can persist layout or skip a closed
+    /// subtree. Seeded per fire.
+    collapsed: Arc<Mutex<HashMap<String, bool>>>,
+    /// Seconds since the window was created, read by `ui:clock()` for
+    /// breathing / spinner phase. Seeded per fire from TermWindow::created.
+    elapsed: Arc<Mutex<f64>>,
 }
 
 impl LuaUi {
@@ -45,6 +55,9 @@ impl LuaUi {
             theme: Arc::new(Mutex::new(None)),
             events: Arc::new(Mutex::new(HashSet::new())),
             values: Arc::new(Mutex::new(HashMap::new())),
+            width: Arc::new(Mutex::new(0.0)),
+            collapsed: Arc::new(Mutex::new(HashMap::new())),
+            elapsed: Arc::new(Mutex::new(0.0)),
         }
     }
 
@@ -64,6 +77,21 @@ impl LuaUi {
     /// keyed by id. The `ui:value(id)` Lua method delegates here.
     pub fn value(&self, id: &str) -> Option<f64> {
         self.values.lock().get(id).copied()
+    }
+
+    /// Seed the pane width measured by the last render pass.
+    pub fn set_width(&self, width: f32) {
+        *self.width.lock() = width;
+    }
+
+    /// Seed collapsing-header states (id → collapsed) from the last render.
+    pub fn set_collapsed(&self, collapsed: HashMap<String, bool>) {
+        *self.collapsed.lock() = collapsed;
+    }
+
+    /// Seed seconds-since-creation for `ui:clock()` (breathing / phase).
+    pub fn set_clock(&self, elapsed: f64) {
+        *self.elapsed.lock() = elapsed;
     }
 
     fn push_leaf(&self, mut node: UiNode) {
@@ -140,6 +168,7 @@ fn style_mut(node: &mut UiNode) -> Option<&mut UiStyle> {
         | UiNode::Card { style, .. }
         | UiNode::CollapsingHeader { style, .. }
         | UiNode::Frame { style, .. }
+        | UiNode::Arc { style, .. }
         | UiNode::Horizontal { style, .. }
         | UiNode::Vertical { style, .. }
         | UiNode::Columns { style, .. }
@@ -277,6 +306,22 @@ impl UserData for LuaUi {
         //   local v = ui:value("workers") or DEFAULT
         //   ui:slider({ id = "workers", value = v, min = 1, max = 16 })
         methods.add_method("value", |_, this, id: String| Ok(this.value(&id)));
+
+        // ui:width() -> number; pane width in egui points (logical px) from the
+        // last render pass. 0 until the first paint. Lets a handler build
+        // size-classed layouts (compact vs wide) without guessing.
+        methods.add_method("width", |_, this, _: ()| Ok(*this.width.lock() as f64));
+
+        // ui:clock() -> number; seconds since the window was created. Monotonic
+        // phase source for breathing / spinner / eased motion.
+        methods.add_method("clock", |_, this, _: ()| Ok(*this.elapsed.lock()));
+
+        // ui:collapsed("section") -> bool; whether a collapsing header is
+        // currently collapsed, per egui's own memory. Defaults to false for an
+        // unknown id. Lets Lua skip building a closed subtree or persist layout.
+        methods.add_method("collapsed", |_, this, id: String| {
+            Ok(this.collapsed.lock().get(&id).copied().unwrap_or(false))
+        });
 
         // --- Leaf widgets ----------------------------------------------
 
@@ -533,12 +578,17 @@ impl UserData for LuaUi {
         methods.add_method(
             "collapsing_header",
             |_, this, (title, opts, cb): (String, Option<mlua::Table>, mlua::Function)| {
+                let id = opts
+                    .as_ref()
+                    .and_then(|o| opt::<String>(o, "id"))
+                    .or_else(|| Some(title.clone()));
                 let default_open = opts
                     .as_ref()
                     .map(|o| o.get("default_open").unwrap_or(false))
                     .unwrap_or(false);
                 let style = parse_style(opts.as_ref());
-                this.container(cb, style, |children, style| UiNode::CollapsingHeader {
+                this.container(cb, style, move |children, style| UiNode::CollapsingHeader {
+                    id,
                     title,
                     default_open,
                     style,
@@ -548,8 +598,47 @@ impl UserData for LuaUi {
         );
 
         methods.add_method("frame", |_, this, (opts, cb): (Option<mlua::Table>, mlua::Function)| {
+            let clickable = opts.as_ref().and_then(|o| opt::<String>(o, "id"));
+            let anim = opts
+                .as_ref()
+                .and_then(|o| o.get::<_, Option<mlua::Table>>("animate").ok().flatten())
+                .and_then(|t| {
+                    let id: String = t.get("id").ok()?;
+                    let target: f32 = t.get("target").unwrap_or(0.0);
+                    let duration = opt::<f32>(&t, "duration");
+                    Some(FrameAnim {
+                        id,
+                        target,
+                        duration,
+                    })
+                });
             let style = parse_style(opts.as_ref());
-            this.container(cb, style, |children, style| UiNode::Frame { style, children })
+            this.container(cb, style, move |children, style| UiNode::Frame {
+                clickable,
+                anim,
+                style,
+                children,
+            })
+        });
+
+        // ui:arc({ value=0.7, label="93%", color="#39ff14", thickness=8 })
+        // Donut/ring gauge: `value` is the 0..=1 colored fraction. `label` is
+        // drawn centered; `color` defaults to the theme accent. Thickness
+        // defaults to ~10% of the diameter.
+        methods.add_method("arc", |_, this, (opts,): (mlua::Table,)| {
+            let value: f32 = opts.get("value").unwrap_or(0.0);
+            let label: Option<String> = opts.get("label").ok().flatten();
+            let color = color_opt(&opts, "color");
+            let thickness = opt::<f32>(&opts, "thickness");
+            let style = parse_style(Some(&opts));
+            this.push_leaf(UiNode::Arc {
+                value,
+                label,
+                color,
+                thickness,
+                style,
+            });
+            Ok(())
         });
 
         methods.add_method("horizontal", |_, this, (opts, cb): (Option<mlua::Table>, mlua::Function)| {
@@ -848,6 +937,80 @@ mod test {
             "sibling after a failed container reached the root: {:?}",
             nodes.iter().map(|n| format!("{:?}", std::mem::discriminant(n))).collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn width_collapsed_clock_round_trip() -> anyhow::Result<()> {
+        // The render pass writes width, collapse state, and the clock onto the
+        // pane; a refresh seeds a fresh LuaUi, and Lua reads them back.
+        let pane = GuiPane::new("x", mux::renderable::RenderableDimensions::default());
+        pane.set_width(420.0);
+        pane.set_collapsed_map(
+            [("section".to_string(), true)].into_iter().collect(),
+        );
+
+        let ui = LuaUi::new();
+        ui.set_width(pane.width());
+        ui.set_collapsed(pane.collapsed_map());
+        // The clock is seeded from the window's creation time, not the pane.
+        ui.set_clock(3.5);
+
+        let lua = Lua::new();
+        lua.globals().set("ui", ui.clone())?;
+        lua.load(
+            r##"
+            assert(math.abs(ui:width() - 420.0) < 1e-6, "width")
+            assert(ui:collapsed("section"), "collapsed known id")
+            assert(not ui:collapsed("missing"), "unknown id not collapsed")
+            assert(math.abs(ui:clock() - 3.5) < 1e-6, "clock")
+            "##,
+        )
+        .exec()?;
+        Ok(())
+    }
+
+    #[test]
+    fn arc_clickable_anim_nodes_build() -> anyhow::Result<()> {
+        // Arc, a clickable frame (row hit target), and an animated frame all
+        // surface as the right UiNode variants with their fields preserved.
+        let lua = Lua::new();
+        let ui = LuaUi::new();
+        lua.globals().set("ui", ui.clone())?;
+        lua.load(
+            r##"
+            ui:arc({ value = 0.7, label = "93%", color = "#39ff14", thickness = 8 })
+            ui:frame({ id = "row-1" }, function(ui)
+              ui:label("agent-7")
+            end)
+            ui:frame({ animate = { id = "row-2", target = 40, duration = 0.3 } }, function(ui)
+              ui:label("agent-8")
+            end)
+            "##,
+        )
+        .exec()?;
+        let (nodes, _) = ui.take();
+
+        let arc = nodes.iter().find_map(|n| match n {
+            UiNode::Arc { value, label, .. } => Some((*value, label.clone())),
+            _ => None,
+        });
+        assert_eq!(arc, Some((0.7, Some("93%".into()))));
+
+        let row = nodes.iter().find_map(|n| match n {
+            UiNode::Frame { clickable, .. } => clickable.clone(),
+            _ => None,
+        });
+        assert_eq!(row.as_deref(), Some("row-1"));
+
+        let anim = nodes.iter().find_map(|n| match n {
+            UiNode::Frame { anim, .. } => anim.clone(),
+            _ => None,
+        });
+        let anim = anim.expect("animated frame present");
+        assert_eq!(anim.id, "row-2");
+        assert_eq!(anim.target, 40.0);
+        assert_eq!(anim.duration, Some(0.3));
         Ok(())
     }
 }
