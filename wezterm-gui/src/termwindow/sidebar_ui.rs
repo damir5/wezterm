@@ -197,17 +197,40 @@ pub struct UiLayout {
 }
 
 impl UiLayout {
+    fn node_contains(
+        node: &LayoutNode,
+        x: f32,
+        y: f32,
+        scroll_offset: f32,
+    ) -> bool {
+        let mut rect = node.rect;
+        if node.scrollable {
+            rect.y -= scroll_offset;
+        }
+        rect.contains(x, y)
+            && node
+                .clip_rect
+                .map(|clip| clip.contains(x, y))
+                .unwrap_or(true)
+    }
+
     pub fn hit_test_scrolled(&self, x: f32, y: f32, scroll_offset: f32) -> Option<&LayoutNode> {
+        self.nodes
+            .iter()
+            .rev()
+            .find(|node| Self::node_contains(node, x, y, scroll_offset))
+    }
+
+    pub fn clickable_at(&self, x: f32, y: f32, scroll_offset: f32) -> Option<&LayoutNode> {
         self.nodes.iter().rev().find(|node| {
-            let mut rect = node.rect;
-            if node.scrollable {
-                rect.y -= scroll_offset;
-            }
-            rect.contains(x, y)
-                && node
-                    .clip_rect
-                    .map(|clip| clip.contains(x, y))
-                    .unwrap_or(true)
+            node.on_click.is_some() && Self::node_contains(node, x, y, scroll_offset)
+        })
+    }
+
+    pub fn interactive_at(&self, x: f32, y: f32, scroll_offset: f32) -> Option<&LayoutNode> {
+        self.nodes.iter().rev().find(|node| {
+            (node.on_click.is_some() || node.on_hover.is_some())
+                && Self::node_contains(node, x, y, scroll_offset)
         })
     }
 }
@@ -1454,6 +1477,74 @@ return { type = 'row', width = 100, height = 40, padding = 10,
         };
         let layout = layout(&test_context(), &root, 20.0, 20.0).unwrap();
         assert_eq!(layout.hit_test_scrolled(1.0, 1.0, 0.0).unwrap().id, "child");
+    }
+
+    #[test]
+    fn click_hit_test_selects_action_parent_over_non_action_child() {
+        let root = UiNode {
+            id: "root".into(),
+            kind: "column".into(),
+            text: None,
+            image: None,
+            style: UiStyle {
+                width: Some(20.0),
+                height: Some(20.0),
+                ..Default::default()
+            },
+            children: vec![UiNode {
+                id: "action".into(),
+                kind: "box".into(),
+                text: None,
+                image: None,
+                style: UiStyle {
+                    width: Some(20.0),
+                    height: Some(20.0),
+                    ..Default::default()
+                },
+                children: vec![UiNode {
+                    id: "label".into(),
+                    kind: "text".into(),
+                    text: Some("shell".into()),
+                    image: None,
+                    style: UiStyle::default(),
+                    children: vec![],
+                    on_click: None,
+                    on_hover: None,
+                }],
+                on_click: Some(DynamicValue::Null),
+                on_hover: None,
+            }],
+            on_click: None,
+            on_hover: None,
+        };
+        let layout = layout(&test_context(), &root, 20.0, 20.0).unwrap();
+        assert_eq!(layout.clickable_at(1.0, 1.0, 0.0).unwrap().id, "action");
+    }
+
+    #[test]
+    fn interactive_hit_test_includes_hover_only_nodes() {
+        let layout = UiLayout {
+            nodes: vec![LayoutNode {
+                id: "hover".into(),
+                kind: "box".into(),
+                text: None,
+                image: None,
+                style: UiStyle::default(),
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
+                scrollable: false,
+                clip_rect: None,
+                on_click: None,
+                on_hover: Some(DynamicValue::Null),
+            }],
+            scroll_max: 0.0,
+        };
+        assert!(layout.clickable_at(1.0, 1.0, 0.0).is_none());
+        assert_eq!(layout.interactive_at(1.0, 1.0, 0.0).unwrap().id, "hover");
     }
 
     #[test]
