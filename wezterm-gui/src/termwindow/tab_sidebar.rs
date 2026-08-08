@@ -219,11 +219,48 @@ impl TermWindow {
     }
 
     fn sidebar_item_at(&self, event: &MouseEvent) -> Option<UIItemType> {
+        let pixels_per_point = (self.dimensions.dpi as f32 / 96.0).max(1.0);
+        if let Some(node) = self
+            .tab_sidebar
+            .ui_layout
+            .as_ref()
+            .and_then(|layout| {
+                layout.interactive_at(
+                    event.coords.x as f32 / pixels_per_point,
+                    event.coords.y as f32 / pixels_per_point,
+                    self.tab_sidebar.ui_scroll_offset,
+                )
+            })
+        {
+            return Some(UIItemType::SidebarNode(node.id.clone()));
+        }
         self.ui_items
             .iter()
             .rev()
             .find(|item| item.hit_test(event.coords.x, event.coords.y))
             .map(|item| item.item_type.clone())
+    }
+
+    fn sidebar_clickable_item_at(&self, event: &MouseEvent) -> Option<UIItemType> {
+        let pixels_per_point = (self.dimensions.dpi as f32 / 96.0).max(1.0);
+        self.tab_sidebar
+            .ui_layout
+            .as_ref()
+            .and_then(|layout| {
+                layout.clickable_at(
+                    event.coords.x as f32 / pixels_per_point,
+                    event.coords.y as f32 / pixels_per_point,
+                    self.tab_sidebar.ui_scroll_offset,
+                )
+            })
+            .map(|node| UIItemType::SidebarNode(node.id.clone()))
+            .or_else(|| {
+                self.ui_items
+                    .iter()
+                    .rev()
+                    .find(|item| item.hit_test(event.coords.x, event.coords.y))
+                    .map(|item| item.item_type.clone())
+            })
     }
 
     fn sidebar_hover_at(&self, event: &MouseEvent) -> Option<SidebarHover> {
@@ -320,7 +357,7 @@ impl TermWindow {
                     self.tab_sidebar.resize = Some(SidebarResize);
                     invalidate = true;
                 } else if inside {
-                    match self.sidebar_item_at(event) {
+                    match self.sidebar_clickable_item_at(event) {
                         Some(UIItemType::SidebarNode(id)) => {
                             self.activate_sidebar_node(&id);
                             invalidate = true;
