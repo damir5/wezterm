@@ -24,6 +24,23 @@ use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
 impl super::TermWindow {
+    fn activate_sidebar_tab(&mut self, tab_id: mux::tab::TabId) {
+        // Keep the read guard in this scope. activate_tab takes the write
+        // guard for the same mux window and would deadlock if both overlapped.
+        let index = {
+            let mux = Mux::get();
+            mux.get_window(self.mux_window_id)
+                .and_then(|window| window.idx_by_id(tab_id))
+        };
+
+        if let Some(index) = index {
+            let _ = self.activate_tab(index as isize);
+            self.set_tab_sidebar_active(tab_id);
+            self.mark_tab_sidebar_dirty();
+            self.emit_status_event();
+        }
+    }
+
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
         let x = event.coords.x;
         let y = event.coords.y;
@@ -79,15 +96,7 @@ impl super::TermWindow {
                 WMEK::Press(MousePress::Left) => {
                     match self.resolve_ui_item(&event).map(|item| item.item_type) {
                         Some(UIItemType::TabSidebar(tab_id)) => {
-                            if let Some(window) = Mux::get().get_window(self.mux_window_id) {
-                                let index = window.iter().position(|tab| tab.tab_id() == tab_id);
-                                if let Some(index) = index {
-                                    let _ = self.activate_tab(index as isize);
-                                    self.set_tab_sidebar_active(tab_id);
-                                    self.mark_tab_sidebar_dirty();
-                                    self.emit_status_event();
-                                }
-                            }
+                            self.activate_sidebar_tab(tab_id);
                         }
                         Some(UIItemType::TabSidebarGroup(group)) => {
                             if self.tab_sidebar.compact {
@@ -415,15 +424,7 @@ impl super::TermWindow {
             }
             UIItemType::TabSidebar(tab_id) => {
                 if matches!(event.kind, WMEK::Press(MousePress::Left)) {
-                    if let Some(window) = Mux::get().get_window(self.mux_window_id) {
-                        let index = window.iter().position(|tab| tab.tab_id() == tab_id);
-                        if let Some(index) = index {
-                            let _ = self.activate_tab(index as isize);
-                            self.set_tab_sidebar_active(tab_id);
-                            self.mark_tab_sidebar_dirty();
-                            self.emit_status_event();
-                        }
-                    }
+                    self.activate_sidebar_tab(tab_id);
                 }
             }
             UIItemType::TabSidebarGroup(group) => {
