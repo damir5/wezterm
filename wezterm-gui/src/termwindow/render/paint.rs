@@ -23,6 +23,13 @@ impl crate::TermWindow {
         self.allow_images = AllowImage::Yes;
 
         let start = Instant::now();
+        let sidebar_only_repaint = self.sidebar_only_repaint;
+        self.sidebar_only_repaint = false;
+        if !sidebar_only_repaint {
+            self.sidebar_cache_needed = false;
+            self.sidebar_animation_due.borrow_mut().take();
+            self.terminal_cache_valid = false;
+        }
 
         {
             let diff = start.duration_since(self.last_fps_check_time);
@@ -34,7 +41,8 @@ impl crate::TermWindow {
             }
         }
 
-        'pass: for pass in 0.. {
+        if !sidebar_only_repaint {
+            'pass: for pass in 0.. {
             match self.paint_pass() {
                 Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
                     Ok(allocated) => {
@@ -102,10 +110,20 @@ impl crate::TermWindow {
                     }
                 }
             }
+            }
+        } else {
+            let next_due = self
+                .tab_sidebar
+                .ui_layout
+                .as_ref()
+                .and_then(crate::termwindow::sidebar_ui::animation_frame_delay)
+                .map(|delay| Instant::now() + delay);
+            self.sidebar_cache_needed = next_due.is_some();
+            *self.sidebar_animation_due.borrow_mut() = next_due;
         }
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
-        self.call_draw(frame).ok();
+        self.call_draw(frame, sidebar_only_repaint).ok();
         self.last_frame_duration = start.elapsed();
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
@@ -143,6 +161,42 @@ impl crate::TermWindow {
                     }
                 }
             }
+
+            if let Some(next_due) = *self.sidebar_animation_due.borrow() {
+                let prior = self.sidebar_animation_scheduled.borrow_mut().take();
+                match prior {
+                    Some(prior) if prior <= next_due => {}
+                    _ => {
+                        self.sidebar_animation_scheduled
+                            .borrow_mut()
+                            .replace(next_due);
+                        let window = self.window.clone().take().unwrap();
+                        promise::spawn::spawn(async move {
+                            Timer::at(next_due).await;
+                            let win = window.clone();
+                            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                                tw.sidebar_animation_scheduled.borrow_mut().take();
+                                let due = tw.sidebar_animation_due.borrow_mut().take();
+                                let due_now = due
+                                    .map(|due| due <= Instant::now())
+                                    .unwrap_or(false);
+                                if due_now {
+                                    let generic_due = tw
+                                        .has_animation
+                                        .borrow()
+                                        .map(|due| due <= Instant::now())
+                                        .unwrap_or(false);
+                                    tw.sidebar_only_repaint = tw.webgpu.is_some()
+                                        && !generic_due
+                                        && tw.tab_sidebar.ui_animation_started.is_none();
+                                    win.invalidate();
+                                }
+                            })));
+                        })
+                        .detach();
+                    }
+                }
+            }
         }
     }
 
@@ -171,47 +225,92 @@ impl crate::TermWindow {
 
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
-        self.tab_sidebar_rows = if self.tab_sidebar_enabled {
-            crate::termwindow::tab_sidebar::sidebar_rows(&self.tab_sidebar)
-        } else {
-            vec![]
-        };
         if self.tab_sidebar_enabled {
             let pixels_per_point = (self.dimensions.dpi as f32 / 96.0).max(1.0);
             if let Some(root) = self.tab_sidebar.ui_tree.clone() {
-                let size = (self.tab_sidebar_width_pixels(), self.dimensions.pixel_height);
-                if self.tab_sidebar.ui_layout_size != Some(size) {
-                    self.tab_sidebar.ui_layout = match crate::termwindow::sidebar_ui::layout(
+                let size = (
+                    self.tab_sidebar_width_pixels(),
+                    self.dimensions.pixel_height,
+                );
+                if self.tab_sidebar.ui_layout_size != Some(size)
+                    || self.tab_sidebar.ui_target_layout.is_none()
+                {
+                    let target = match crate::termwindow::sidebar_ui::layout(
                         &root,
                         size.0 as f32 / pixels_per_point,
                         size.1 as f32 / pixels_per_point,
                     ) {
-                        Ok(layout) => Some(layout),
+                        Ok(layout) => layout,
                         Err(err) => {
                             log::warn!("render-sidebar layout: {err:#}");
-                            None
+                            return Ok(());
                         }
                     };
+                    if self.tab_sidebar.ui_target_layout.as_ref() != Some(&target) {
+                        if self.tab_sidebar.ui_layout.is_none() {
+                            self.tab_sidebar.ui_layout = Some(target.clone());
+                        } else {
+                            self.tab_sidebar.ui_animation_started = Some(Instant::now());
+                        }
+                        self.tab_sidebar.ui_target_layout = Some(target);
+                    }
                     self.tab_sidebar.ui_layout_size = Some(size);
                 }
-                if let Some(layout) = self.tab_sidebar.ui_layout.as_ref() {
-                    self.ui_items.extend(crate::termwindow::sidebar_ui::ui_items_for_layout(
-                        layout,
-                        pixels_per_point,
-                        size.0,
-                        size.1,
-                    ));
+                if let Some(target) = self.tab_sidebar.ui_target_layout.as_ref() {
+                    if self.tab_sidebar.is_resizing() {
+                        self.tab_sidebar.ui_animation_started = None;
+                        self.tab_sidebar.ui_layout = Some(target.clone());
+                    } else {
+                        let progress = self
+                            .tab_sidebar
+                            .ui_animation_started
+                            .map(|started| (Instant::now() - started).as_secs_f32() / 0.18)
+                            .unwrap_or(1.0)
+                            .clamp(0.0, 1.0);
+                        if progress < 1.0 {
+                            self.tab_sidebar.ui_layout =
+                                Some(crate::termwindow::sidebar_ui::interpolate(
+                                    self.tab_sidebar.ui_layout.as_ref(),
+                                    target,
+                                    progress * progress * (3.0 - 2.0 * progress),
+                                ));
+                            let due = Instant::now() + Duration::from_millis(16);
+                            let mut animation = self.has_animation.borrow_mut();
+                            if animation.map(|current| due < current).unwrap_or(true) {
+                                *animation = Some(due);
+                            }
+                        } else {
+                            self.tab_sidebar.ui_animation_started = None;
+                            self.tab_sidebar.ui_layout = Some(target.clone());
+                        }
+                    }
+                    self.tab_sidebar.ui_scroll_max = target.scroll_max;
+                    self.tab_sidebar.ui_scroll_offset = self
+                        .tab_sidebar
+                        .ui_scroll_offset
+                        .min(self.tab_sidebar.ui_scroll_max);
+                    let layout = self.tab_sidebar.ui_layout.as_ref().unwrap();
+                    if self.tab_sidebar.ui_animation_started.is_none() {
+                        if let Some(delay) =
+                            crate::termwindow::sidebar_ui::animation_frame_delay(layout)
+                        {
+                            let due = Instant::now() + delay;
+                            self.sidebar_cache_needed = true;
+                            let mut animation = self.sidebar_animation_due.borrow_mut();
+                            if animation.map(|current| due < current).unwrap_or(true) {
+                                *animation = Some(due);
+                            }
+                        }
+                    }
+                    self.ui_items
+                        .extend(crate::termwindow::sidebar_ui::ui_items_for_layout(
+                            layout,
+                            self.tab_sidebar.ui_scroll_offset,
+                            pixels_per_point,
+                            size.0,
+                            size.1,
+                        ));
                 }
-            } else {
-                let top = if self.tab_sidebar.compact { 0 } else { crate::termwindow::tab_sidebar::SUMMARY_HEIGHT_PX };
-                self.ui_items.extend(crate::termwindow::tab_sidebar::ui_items_for_rows(
-                    &self.tab_sidebar_rows,
-                    self.tab_sidebar.scroll_rows,
-                    top,
-                    crate::termwindow::tab_sidebar::ROW_HEIGHT_PX,
-                    self.tab_sidebar_width_pixels(),
-                    self.dimensions.pixel_height,
-                ));
             }
         }
 

@@ -35,7 +35,6 @@ impl super::TermWindow {
 
         if let Some(index) = index {
             let _ = self.activate_tab(index as isize);
-            self.set_tab_sidebar_active(tab_id);
             self.mark_tab_sidebar_dirty();
             self.emit_status_event();
         }
@@ -56,7 +55,7 @@ impl super::TermWindow {
             UIItemType::TabBar(_) => {
                 self.update_title_post_status();
             }
-            UIItemType::TabSidebar(_) | UIItemType::TabSidebarGroup(_) | UIItemType::SidebarNode(_)
+            UIItemType::SidebarNode(_)
             | UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
@@ -68,7 +67,7 @@ impl super::TermWindow {
     fn enter_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
             UIItemType::TabBar(_) => {}
-            UIItemType::TabSidebar(_) | UIItemType::TabSidebarGroup(_) | UIItemType::SidebarNode(_)
+            UIItemType::SidebarNode(_)
             | UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
@@ -271,7 +270,6 @@ impl super::TermWindow {
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
         self.current_mouse_event = None;
         self.tab_sidebar.hovered = None;
-        self.tab_sidebar.drag = None;
         self.update_title();
         context.set_cursor(Some(MouseCursor::Arrow));
         context.invalidate();
@@ -392,22 +390,6 @@ impl super::TermWindow {
         match item.item_type {
             UIItemType::TabBar(item) => {
                 self.mouse_event_tab_bar(item, event, context);
-            }
-            UIItemType::TabSidebar(tab_id) => {
-                if matches!(event.kind, WMEK::Press(MousePress::Left)) {
-                    self.activate_sidebar_tab(tab_id);
-                }
-            }
-            UIItemType::TabSidebarGroup(group) => {
-                if matches!(event.kind, WMEK::Press(MousePress::Left)) {
-                    if self.tab_sidebar.compact {
-                        self.expand_tab_sidebar_group(&group);
-                        self.config_was_reloaded();
-                    } else if !self.tab_sidebar.collapsed.insert(group.clone()) {
-                        self.tab_sidebar.collapsed.remove(&group);
-                    }
-                    context.invalidate();
-                }
             }
             UIItemType::SidebarNode(_) => {}
             UIItemType::AboveScrollThumb => {

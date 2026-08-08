@@ -1,20 +1,22 @@
-use super::{TabInformation, TermWindow, UIItem, UIItemType};
 use super::sidebar_ui::{self, UiLayout, UiNode};
+use super::{TabInformation, TermWindow, UIItemType};
 use config::ConfigHandle;
 use mlua::Value;
 use mux::pane::PaneId;
 use mux::tab::TabId;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use wezterm_dynamic::Value as DynamicValue;
 use window::WindowOps;
 use window::{MouseCursor, MouseEvent, MouseEventKind, MousePress};
-use wezterm_dynamic::Value as DynamicValue;
 
 pub const COMPACT_WIDTH_CELLS: usize = 6;
 pub const ROW_HEIGHT_PX: usize = 40;
-pub const SUMMARY_HEIGHT_PX: usize = 34;
 pub const MAX_SIDEBAR_WIDTH_CELLS: usize = 60;
 pub const RESIZE_EDGE_PX: usize = 5;
+pub const COMPACT_MAX_WIDTH_PT: f32 = 120.0;
+pub const REGULAR_MIN_WIDTH_PT: f32 = 240.0;
+pub const REGULAR_MAX_WIDTH_PT: f32 = 520.0;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SidebarGroup {
@@ -46,24 +48,7 @@ pub struct SidebarEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SidebarHover {
-    Group(String),
-    Tab(TabId),
     Node(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct SidebarDropTarget {
-    pub(super) tab_id: TabId,
-    pub(super) before: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct SidebarDrag {
-    pub(super) tab_id: TabId,
-    pub(super) start_x: isize,
-    pub(super) start_y: isize,
-    pub(super) active: bool,
-    pub(super) target: Option<SidebarDropTarget>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,37 +56,62 @@ pub(super) struct SidebarResize;
 
 #[derive(Default)]
 pub struct TabSidebar {
-    pub entries: Vec<SidebarEntry>,
     pub ui_tree: Option<UiNode>,
     pub ui_layout: Option<UiLayout>,
+    pub ui_target_layout: Option<UiLayout>,
     pub ui_layout_size: Option<(usize, usize)>,
+    pub ui_animation_started: Option<Instant>,
+    pub ui_scroll_offset: f32,
+    pub ui_scroll_max: f32,
     pub dirty: bool,
-    pub compact: bool,
     pub width_cells_override: Option<usize>,
-    pub scroll_rows: usize,
-    pub collapsed: std::collections::HashSet<String>,
     pub(super) hovered: Option<SidebarHover>,
-    pub(super) drag: Option<SidebarDrag>,
     pub(super) resize: Option<SidebarResize>,
     pub(super) refresh_generation: u64,
 }
 
 impl TabSidebar {
-    pub fn width_cells(&self, config: &ConfigHandle) -> usize {
-        if self.compact {
-            COMPACT_WIDTH_CELLS
-        } else {
+    pub fn width_cells(&self, config: &ConfigHandle, cell_width: f32, dpi: u32) -> usize {
+        responsive_width_cells(
             self.width_cells_override
-                .unwrap_or(config.tab_sidebar_width)
-                .clamp(COMPACT_WIDTH_CELLS + 1, MAX_SIDEBAR_WIDTH_CELLS)
-        }
+                .unwrap_or(config.tab_sidebar_width),
+            cell_width,
+            dpi,
+        )
+    }
+
+    pub fn is_compact(&self, config: &ConfigHandle, cell_width: f32, dpi: u32) -> bool {
+        let width = self.width_cells(config, cell_width, dpi) as f32 * cell_width;
+        width * 96.0 / dpi.max(1) as f32 <= COMPACT_MAX_WIDTH_PT
+    }
+
+    pub fn is_resizing(&self) -> bool {
+        self.resize.is_some()
     }
 }
 
+pub fn responsive_width_cells(requested: usize, cell_width: f32, dpi: u32) -> usize {
+    let requested = requested.max(COMPACT_WIDTH_CELLS);
+    let points = requested as f32 * cell_width * 96.0 / dpi.max(1) as f32;
+    if points <= COMPACT_MAX_WIDTH_PT {
+        return requested;
+    }
+    let points = points.clamp(REGULAR_MIN_WIDTH_PT, REGULAR_MAX_WIDTH_PT);
+    (points * dpi.max(1) as f32 / 96.0 / cell_width.max(1.0))
+        .round()
+        .clamp(
+            (COMPACT_WIDTH_CELLS + 1) as f32,
+            MAX_SIDEBAR_WIDTH_CELLS as f32,
+        ) as usize
+}
 impl TermWindow {
     pub fn tab_sidebar_width_pixels(&self) -> usize {
         if self.tab_sidebar_enabled {
-            self.tab_sidebar.width_cells(&self.config) * self.render_metrics.cell_size.width as usize
+            self.tab_sidebar.width_cells(
+                &self.config,
+                self.render_metrics.cell_size.width as f32,
+                self.dimensions.dpi as u32,
+            ) * self.render_metrics.cell_size.width as usize
         } else {
             0
         }
@@ -132,30 +142,28 @@ impl TermWindow {
         }
 
         let started = std::time::Instant::now();
-        let mut entries = native_entries(tabs);
         let mut ui_tree = None;
-        let refresh_after = match callback_entries(tabs) {
+        let refresh_after = match callback_entries(
+            tabs,
+            self.tab_sidebar.is_compact(
+                &self.config,
+                self.render_metrics.cell_size.width as f32,
+                self.dimensions.dpi as u32,
+            ),
+            self.tab_sidebar_width_pixels(),
+            self.dimensions.pixel_height,
+            self.dimensions.dpi as u32,
+        ) {
             Ok(callback) => {
                 ui_tree = callback.ui_tree;
-                let valid_tabs = entries.iter().map(|entry| entry.tab_id).collect::<std::collections::HashSet<_>>();
+                let valid_tabs = tabs
+                    .iter()
+                    .map(|tab| tab.tab_id)
+                    .collect::<std::collections::HashSet<_>>();
                 if let Err(err) = validate_callback_entries(&valid_tabs, &callback.entries) {
                     log::warn!("format-tab-sidebar: ignoring all callback output: {err:#}");
                     None
                 } else {
-                    let metadata = callback.entries;
-                for entry in &mut entries {
-                    if let Some(metadata) = metadata.get(&entry.tab_id) {
-                        entry.title = metadata.title.clone();
-                        entry.right = metadata.right.clone();
-                        entry.harness_glyph = metadata.harness_glyph.clone();
-                        entry.status_glyph = metadata.status_glyph.clone();
-                        entry.status_color = metadata.status_color.clone();
-                        entry.status_key = metadata.status_key.clone();
-                        entry.progress = metadata.progress.clone();
-                        entry.urgency = metadata.urgency;
-                        entry.groups = metadata.groups.clone();
-                    }
-                }
                     callback.refresh_after
                 }
             }
@@ -165,9 +173,8 @@ impl TermWindow {
             }
         };
 
-        self.tab_sidebar.entries = entries;
         self.tab_sidebar.ui_tree = ui_tree;
-        self.tab_sidebar.ui_layout = None;
+        self.tab_sidebar.ui_target_layout = None;
         self.tab_sidebar.ui_layout_size = None;
         self.sidebar_images.clear();
         self.tab_sidebar.dirty = false;
@@ -199,38 +206,16 @@ impl TermWindow {
         .detach();
     }
 
-    pub fn set_tab_sidebar_active(&mut self, tab_id: TabId) {
-        for entry in &mut self.tab_sidebar.entries {
-            entry.active = entry.tab_id == tab_id;
-        }
-        self.tab_sidebar_rows = sidebar_rows(&self.tab_sidebar);
-    }
-
-    pub fn expand_tab_sidebar_group(&mut self, group: &str) {
-        self.tab_sidebar.compact = false;
-        self.tab_sidebar.collapsed.remove(group);
-        self.tab_sidebar.scroll_rows = sidebar_rows(&self.tab_sidebar)
-            .iter()
-            .position(|row| matches!(row, SidebarRow::Group(item) if item.key == group))
-            .unwrap_or(0);
-    }
-
     pub fn tab_sidebar_scroll(&mut self, rows: isize) -> bool {
         if !self.tab_sidebar_enabled || rows == 0 {
             return false;
         }
-        let max = max_scroll_rows(
-            sidebar_rows(&self.tab_sidebar).len(),
-            self.dimensions.pixel_height,
-            ROW_HEIGHT_PX,
-        );
-        let previous = self.tab_sidebar.scroll_rows;
-        self.tab_sidebar.scroll_rows = if rows < 0 {
-            self.tab_sidebar.scroll_rows.saturating_sub(rows.unsigned_abs())
-        } else {
-            self.tab_sidebar.scroll_rows.saturating_add(rows as usize).min(max)
-        };
-        self.tab_sidebar.scroll_rows != previous
+        let pixels_per_point = (self.dimensions.dpi as f32 / 96.0).max(1.0);
+        let step = ROW_HEIGHT_PX as f32 / pixels_per_point;
+        let previous = self.tab_sidebar.ui_scroll_offset;
+        self.tab_sidebar.ui_scroll_offset =
+            (previous + rows as f32 * step).clamp(0.0, self.tab_sidebar.ui_scroll_max);
+        self.tab_sidebar.ui_scroll_offset != previous
     }
 
     fn sidebar_item_at(&self, event: &MouseEvent) -> Option<UIItemType> {
@@ -243,8 +228,6 @@ impl TermWindow {
 
     fn sidebar_hover_at(&self, event: &MouseEvent) -> Option<SidebarHover> {
         match self.sidebar_item_at(event) {
-            Some(UIItemType::TabSidebar(tab_id)) => Some(SidebarHover::Tab(tab_id)),
-            Some(UIItemType::TabSidebarGroup(group)) => Some(SidebarHover::Group(group)),
             Some(UIItemType::SidebarNode(id)) => Some(SidebarHover::Node(id)),
             _ => None,
         }
@@ -256,7 +239,13 @@ impl TermWindow {
             .tab_sidebar
             .ui_layout
             .as_ref()
-            .and_then(|layout| layout.hit_test(x as f32 / pixels_per_point, y as f32 / pixels_per_point))
+            .and_then(|layout| {
+                layout.hit_test_scrolled(
+                    x as f32 / pixels_per_point,
+                    y as f32 / pixels_per_point,
+                    self.tab_sidebar.ui_scroll_offset,
+                )
+            })
             .filter(|node| node.on_click.is_some() || node.on_hover.is_some())
             .map(|node| SidebarHover::Node(node.id.clone()));
         if layout_hover.is_some() {
@@ -269,8 +258,6 @@ impl TermWindow {
             .rev()
             .find(|item| item.hit_test(x, y))
             .and_then(|item| match &item.item_type {
-                UIItemType::TabSidebar(tab_id) => Some(SidebarHover::Tab(*tab_id)),
-                UIItemType::TabSidebarGroup(group) => Some(SidebarHover::Group(group.clone())),
                 UIItemType::SidebarNode(id) => Some(SidebarHover::Node(id.clone())),
                 _ => None,
             });
@@ -285,7 +272,8 @@ impl TermWindow {
             .and_then(|node| node.on_click.clone());
         let Some(action) = action else { return };
         if let DynamicValue::Object(object) = &action {
-            if matches!(object.get_by_str("action"), Some(DynamicValue::String(action)) if action == "activate-tab") {
+            if matches!(object.get_by_str("action"), Some(DynamicValue::String(action)) if action == "activate-tab")
+            {
                 if let Some(tab_id) = object
                     .get_by_str("tab_id")
                     .and_then(DynamicValue::coerce_unsigned)
@@ -298,89 +286,6 @@ impl TermWindow {
         self.emit_sidebar_action(action);
     }
 
-    fn sidebar_drop_target(
-        &self,
-        source_id: TabId,
-        event: &MouseEvent,
-    ) -> Option<SidebarDropTarget> {
-        let item = self
-            .ui_items
-            .iter()
-            .rev()
-            .find(|item| item.hit_test(event.coords.x, event.coords.y))?;
-        let UIItemType::TabSidebar(target_id) = item.item_type else {
-            return None;
-        };
-        if source_id == target_id {
-            return None;
-        }
-        let source = self
-            .tab_sidebar
-            .entries
-            .iter()
-            .find(|entry| entry.tab_id == source_id)?;
-        let target = self
-            .tab_sidebar
-            .entries
-            .iter()
-            .find(|entry| entry.tab_id == target_id)?;
-        if !same_drop_scope(source, target) {
-            return None;
-        }
-        Some(SidebarDropTarget {
-            tab_id: target_id,
-            before: event.coords.y < (item.y + item.height / 2) as isize,
-        })
-    }
-
-    fn reorder_sidebar_tab(&mut self, source: TabId, target: SidebarDropTarget) -> bool {
-        let Some(source_entry) = self
-            .tab_sidebar
-            .entries
-            .iter()
-            .find(|entry| entry.tab_id == source)
-            .cloned()
-        else {
-            return false;
-        };
-        let Some(target_entry) = self
-            .tab_sidebar
-            .entries
-            .iter()
-            .find(|entry| entry.tab_id == target.tab_id)
-            .cloned()
-        else {
-            return false;
-        };
-        if !same_drop_scope(&source_entry, &target_entry) {
-            return false;
-        }
-
-        let mux = mux::Mux::get();
-        if let Some(controller) = source_entry.controller_pane_id {
-            let queued = mux.iter_domains().into_iter().any(|domain| {
-                domain
-                    .downcast_ref::<mux::tmux::TmuxDomain>()
-                    .filter(|domain| domain.controller_pane_id() == controller)
-                    .map(|domain| domain.reorder_tab(source, target.tab_id, target.before))
-                    .unwrap_or(false)
-            });
-            if !queued {
-                return false;
-            }
-        }
-
-        let moved = mux
-            .get_window_mut(self.mux_window_id)
-            .map(|mut window| window.move_tab_by_id(source, target.tab_id, target.before))
-            .unwrap_or(false);
-        if moved {
-            self.mark_tab_sidebar_dirty();
-            self.emit_status_event();
-        }
-        moved
-    }
-
     pub fn handle_tab_sidebar_mouse_event(
         &mut self,
         event: &MouseEvent,
@@ -391,11 +296,14 @@ impl TermWindow {
         }
         let width = self.tab_sidebar_width_pixels();
         let inside = event.coords.x >= 0 && (event.coords.x as usize) < width;
-        let on_edge = !self.tab_sidebar.compact
-            && event.coords.x >= 0
+        let on_edge = !self.tab_sidebar.is_compact(
+            &self.config,
+            self.render_metrics.cell_size.width as f32,
+            self.dimensions.dpi as u32,
+        ) && event.coords.x >= 0
             && (event.coords.x as usize).saturating_add(RESIZE_EDGE_PX) >= width
             && (event.coords.x as usize) <= width + RESIZE_EDGE_PX;
-        if !inside && self.tab_sidebar.drag.is_none() && self.tab_sidebar.resize.is_none() {
+        if !inside && self.tab_sidebar.resize.is_none() {
             if self.tab_sidebar.hovered.take().is_some() {
                 context.invalidate();
             }
@@ -413,25 +321,6 @@ impl TermWindow {
                     invalidate = true;
                 } else if inside {
                     match self.sidebar_item_at(event) {
-                        Some(UIItemType::TabSidebar(tab_id)) => {
-                            self.tab_sidebar.drag = Some(SidebarDrag {
-                                tab_id,
-                                start_x: event.coords.x,
-                                start_y: event.coords.y,
-                                active: false,
-                                target: None,
-                            });
-                            invalidate = true;
-                        }
-                        Some(UIItemType::TabSidebarGroup(group)) => {
-                            if self.tab_sidebar.compact {
-                                self.expand_tab_sidebar_group(&group);
-                                self.config_was_reloaded();
-                            } else if !self.tab_sidebar.collapsed.insert(group.clone()) {
-                                self.tab_sidebar.collapsed.remove(&group);
-                            }
-                            invalidate = true;
-                        }
                         Some(UIItemType::SidebarNode(id)) => {
                             self.activate_sidebar_node(&id);
                             invalidate = true;
@@ -446,29 +335,22 @@ impl TermWindow {
                     let new_cells = (event.coords.x as usize / cell_width)
                         .clamp(COMPACT_WIDTH_CELLS + 1, MAX_SIDEBAR_WIDTH_CELLS);
                     if Some(new_cells) != self.tab_sidebar.width_cells_override {
+                        let was_compact = self.tab_sidebar.is_compact(
+                            &self.config,
+                            self.render_metrics.cell_size.width as f32,
+                            self.dimensions.dpi as u32,
+                        );
                         self.tab_sidebar.width_cells_override = Some(new_cells);
-                        self.config_was_reloaded();
+                        let is_compact = self.tab_sidebar.is_compact(
+                            &self.config,
+                            self.render_metrics.cell_size.width as f32,
+                            self.dimensions.dpi as u32,
+                        );
+                        if was_compact != is_compact {
+                            self.mark_tab_sidebar_dirty();
+                        }
                     }
                     invalidate = true;
-                } else if let Some(mut drag) = self.tab_sidebar.drag.take() {
-                    let dx = event.coords.x - drag.start_x;
-                    let dy = event.coords.y - drag.start_y;
-                    drag.active |= dx * dx + dy * dy >= 36;
-                    if drag.active {
-                        if inside && event.coords.y < ROW_HEIGHT_PX as isize {
-                            invalidate |= self.tab_sidebar_scroll(-1);
-                        } else if inside
-                            && event.coords.y
-                                > self.dimensions.pixel_height.saturating_sub(ROW_HEIGHT_PX)
-                                    as isize
-                        {
-                            invalidate |= self.tab_sidebar_scroll(1);
-                        }
-                        let target = self.sidebar_drop_target(drag.tab_id, event);
-                        invalidate |= drag.target != target;
-                        drag.target = target;
-                    }
-                    self.tab_sidebar.drag = Some(drag);
                 }
                 let hovered = if inside {
                     self.sidebar_hover_at(event)
@@ -496,15 +378,6 @@ impl TermWindow {
             MouseEventKind::Release(MousePress::Left) => {
                 if self.tab_sidebar.resize.take().is_some() {
                     invalidate = true;
-                } else if let Some(drag) = self.tab_sidebar.drag.take() {
-                    if drag.active {
-                        if let Some(target) = drag.target {
-                            self.reorder_sidebar_tab(drag.tab_id, target);
-                        }
-                    } else {
-                        self.activate_sidebar_tab(drag.tab_id);
-                    }
-                    invalidate = true;
                 }
             }
             _ => {}
@@ -512,7 +385,7 @@ impl TermWindow {
 
         let cursor = if self.tab_sidebar.resize.is_some() || on_edge {
             MouseCursor::SizeLeftRight
-        } else if self.tab_sidebar.drag.is_some() || matches!(self.tab_sidebar.hovered, Some(_)) {
+        } else if matches!(self.tab_sidebar.hovered, Some(_)) {
             MouseCursor::Hand
         } else {
             MouseCursor::Arrow
@@ -523,157 +396,6 @@ impl TermWindow {
         }
         true
     }
-}
-
-#[derive(Clone, Debug)]
-pub enum SidebarRow {
-    Group(SidebarGroup),
-    Tab(SidebarEntry),
-}
-
-pub fn ui_items_for_rows(
-    rows: &[SidebarRow],
-    scroll_rows: usize,
-    top: usize,
-    row_height: usize,
-    width: usize,
-    height: usize,
-) -> Vec<UIItem> {
-    rows.iter()
-        .skip(scroll_rows)
-        .enumerate()
-        .take(height.div_ceil(row_height))
-        .map(|(row, item)| UIItem {
-            x: 0,
-            y: top + row * row_height,
-            width,
-            height: row_height,
-            item_type: match item {
-                SidebarRow::Tab(entry) => UIItemType::TabSidebar(entry.tab_id),
-                SidebarRow::Group(group) => UIItemType::TabSidebarGroup(group.key.clone()),
-            },
-        })
-        .collect()
-}
-
-pub fn sidebar_rows(sidebar: &TabSidebar) -> Vec<SidebarRow> {
-    let group_state = sidebar.entries.iter().flat_map(|entry| {
-        let status = entry.status_key.clone();
-        entry_groups(entry).into_iter().map(move |group| {
-            (group.key, entry.active, entry.urgency, status.clone())
-        })
-    }).fold(HashMap::new(), |mut states, (key, active, urgency, status)| {
-        let state = states.entry(key).or_insert((false, 0, HashMap::new()));
-        state.0 |= active;
-        state.1 = state.1.max(urgency);
-        if !status.is_empty() {
-            *state.2.entry(status).or_insert(0) += 1;
-        }
-        states
-    });
-    if sidebar.compact {
-        let mut groups = Vec::new();
-        for entry in &sidebar.entries {
-            let mut group = entry_groups(entry).into_iter().next().unwrap();
-            if !groups.iter().any(|existing: &SidebarGroup| existing.key == group.key) {
-                let (active, urgency, counts) = group_state[&group.key].clone();
-                group.active = active;
-                group.urgency = urgency;
-                group.counts = counts;
-                groups.push(group);
-            }
-        }
-        return groups
-            .iter()
-            .map(|group| SidebarRow::Group(group.clone()))
-            .collect();
-    }
-    let mut rows = Vec::new();
-    let mut previous_groups: Vec<SidebarGroup> = Vec::new();
-    for entry in &sidebar.entries {
-        let groups = entry_groups(entry);
-        let common = previous_groups.iter().zip(&groups)
-            .take_while(|(previous, group)| previous.key == group.key)
-            .count();
-        let mut hidden = groups.iter().take(common).any(|group| sidebar.collapsed.contains(&group.key));
-        for group in groups.iter().skip(common) {
-            if !hidden {
-                let mut group = group.clone();
-                let (active, urgency, counts) = group_state[&group.key].clone();
-                group.active = active;
-                group.urgency = urgency;
-                group.counts = counts;
-                rows.push(SidebarRow::Group(group));
-            }
-            hidden |= sidebar.collapsed.contains(&group.key);
-        }
-        if !hidden {
-            rows.push(SidebarRow::Tab(entry.clone()));
-        }
-        previous_groups = groups;
-    }
-    rows
-}
-
-fn entry_groups(entry: &SidebarEntry) -> Vec<SidebarGroup> {
-    let groups = if entry.groups.is_empty() {
-        vec![SidebarGroup {
-            key: "local".into(),
-            label: "THIS MAC".into(),
-            ..Default::default()
-        }]
-    } else {
-        entry.groups.clone()
-    };
-    let mut path = String::new();
-    groups.into_iter().enumerate().map(|(depth, mut group)| {
-        if !path.is_empty() {
-            path.push('\u{1f}');
-        }
-        path.push_str(&group.key);
-        group.key = path.clone();
-        group.depth = depth;
-        group
-    }).collect()
-}
-
-fn same_drop_scope(source: &SidebarEntry, target: &SidebarEntry) -> bool {
-    source.controller_pane_id == target.controller_pane_id
-        && same_group_path(&source.groups, &target.groups)
-}
-
-fn same_group_path(source: &[SidebarGroup], target: &[SidebarGroup]) -> bool {
-    match (source.is_empty(), target.is_empty()) {
-        (true, true) => true,
-        (true, false) => target.len() == 1 && target[0].key == "@local",
-        (false, true) => source.len() == 1 && source[0].key == "@local",
-        (false, false) => {
-            source.len() == target.len()
-                && source
-                    .iter()
-                    .zip(target)
-                    .all(|(source, target)| source.key == target.key)
-        }
-    }
-}
-
-fn native_entries(tabs: &[TabInformation]) -> Vec<SidebarEntry> {
-    tabs.iter()
-        .map(|tab| SidebarEntry {
-            tab_id: tab.tab_id,
-            controller_pane_id: tab.panes.iter().find_map(|pane| pane.controller_pane_id),
-            title: if tab.tab_title.is_empty() {
-                tab.active_pane
-                    .as_ref()
-                    .map(|pane| pane.title.clone())
-                    .unwrap_or_default()
-            } else {
-                tab.tab_title.clone()
-            },
-            active: tab.is_active,
-            ..Default::default()
-        })
-        .collect()
 }
 
 struct CallbackResult {
@@ -692,25 +414,34 @@ fn validate_callback_entries(
     Ok(())
 }
 
-fn max_scroll_rows(row_count: usize, height: usize, row_height: usize) -> usize {
-    row_count.saturating_sub(height.div_ceil(row_height))
-}
-
-fn callback_entries(tabs: &[TabInformation]) -> anyhow::Result<CallbackResult> {
+fn callback_entries(
+    tabs: &[TabInformation],
+    compact: bool,
+    width: usize,
+    height: usize,
+    dpi: u32,
+) -> anyhow::Result<CallbackResult> {
     config::run_immediate_with_lua_config(|lua| {
         let Some(lua) = lua else {
-            return Ok(CallbackResult { entries: HashMap::new(), ui_tree: None, refresh_after: None });
+            return Ok(CallbackResult {
+                entries: HashMap::new(),
+                ui_tree: None,
+                refresh_after: None,
+            });
         };
+        let context = lua.create_table()?;
+        context.set("mode", if compact { "compact" } else { "regular" })?;
+        context.set("width", width as f32 * 96.0 / dpi.max(1) as f32)?;
+        context.set("height", height as f32 * 96.0 / dpi.max(1) as f32)?;
+        context.set("dpi", dpi)?;
         let format_tabs = lua.create_sequence_from(tabs.iter().cloned())?;
-        let value = config::lua::emit_sync_callback(
-            &lua,
-            ("format-tab-sidebar".to_string(), format_tabs),
-        )?;
+        let value =
+            config::lua::emit_sync_callback(&lua, ("format-tab-sidebar".to_string(), format_tabs))?;
         let mut callback = decode_callback(&lua, value)?;
         let tree_tabs = lua.create_sequence_from(tabs.iter().cloned())?;
         let tree = config::lua::emit_sync_callback(
             &lua,
-            ("render-sidebar".to_string(), tree_tabs),
+            ("render-sidebar".to_string(), (tree_tabs, context)),
         )?;
         callback.ui_tree = sidebar_ui::decode(tree, &lua)?;
         Ok(callback)
@@ -719,18 +450,24 @@ fn callback_entries(tabs: &[TabInformation]) -> anyhow::Result<CallbackResult> {
 
 fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResult> {
     let Value::Table(result) = value else {
-        return Ok(CallbackResult { entries: HashMap::new(), ui_tree: None, refresh_after: None });
+        return Ok(CallbackResult {
+            entries: HashMap::new(),
+            ui_tree: None,
+            refresh_after: None,
+        });
     };
     let refresh_after = match result.get::<_, Value>("refresh_after_ms")? {
         Value::Nil => None,
         Value::Integer(ms) if ms >= 0 => Some(Duration::from_millis((ms as u64).max(100))),
-        Value::Number(ms) if ms.is_finite() && ms >= 0.0 => Some(Duration::from_millis((ms as u64).max(100))),
+        Value::Number(ms) if ms.is_finite() && ms >= 0.0 => {
+            Some(Duration::from_millis((ms as u64).max(100)))
+        }
         _ => anyhow::bail!("format-tab-sidebar refresh_after_ms must be a non-negative number"),
     };
     let entries = match result.get::<_, Value>("entries")? {
         Value::Nil => result,
         Value::Table(entries) => entries,
-        _ => anyhow::bail!("format-tab-sidebar must return {{ entries = {{...}} }}")
+        _ => anyhow::bail!("format-tab-sidebar must return {{ entries = {{...}} }}"),
     };
     let mut decoded = HashMap::new();
     for value in entries.sequence_values::<Value>() {
@@ -740,13 +477,19 @@ fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResu
         let tab_id = entry.get::<_, TabId>("tab_id")?;
         let title = entry.get::<_, Option<String>>("title")?.unwrap_or_default();
         let right = entry.get::<_, Option<String>>("right")?.unwrap_or_default();
-        let harness_glyph = entry.get::<_, Option<String>>("harness")?.unwrap_or_default();
-        let progress = entry.get::<_, Option<String>>("progress")?.unwrap_or_default();
+        let harness_glyph = entry
+            .get::<_, Option<String>>("harness")?
+            .unwrap_or_default();
+        let progress = entry
+            .get::<_, Option<String>>("progress")?
+            .unwrap_or_default();
         let urgency = entry.get::<_, Option<u8>>("urgency")?.unwrap_or(0).min(2);
         let (status_key, status_glyph, status_color) = match entry.get::<_, Value>("status")? {
             Value::Table(status) => (
                 status.get::<_, Option<String>>("key")?.unwrap_or_default(),
-                status.get::<_, Option<String>>("glyph")?.unwrap_or_default(),
+                status
+                    .get::<_, Option<String>>("glyph")?
+                    .unwrap_or_default(),
                 status.get::<_, Option<String>>("color")?,
             ),
             Value::Nil => (String::new(), String::new(), None),
@@ -776,7 +519,11 @@ fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResu
             anyhow::bail!("format-tab-sidebar returned duplicate tab_id {tab_id}");
         }
     }
-    Ok(CallbackResult { entries: decoded, ui_tree: None, refresh_after })
+    Ok(CallbackResult {
+        entries: decoded,
+        ui_tree: None,
+        refresh_after,
+    })
 }
 
 fn decode_groups(_lua: &mlua::Lua, value: Value) -> anyhow::Result<Vec<SidebarGroup>> {
@@ -801,9 +548,13 @@ fn decode_groups(_lua: &mlua::Lua, value: Value) -> anyhow::Result<Vec<SidebarGr
             Value::Table(group) => {
                 let key = group.get::<_, String>("key")?;
                 Ok(SidebarGroup {
-                    label: group.get::<_, Option<String>>("label")?.unwrap_or_else(|| key.clone()),
+                    label: group
+                        .get::<_, Option<String>>("label")?
+                        .unwrap_or_else(|| key.clone()),
                     host: group.get::<_, Option<String>>("host")?.unwrap_or_default(),
-                    worktree: group.get::<_, Option<String>>("worktree")?.unwrap_or_default(),
+                    worktree: group
+                        .get::<_, Option<String>>("worktree")?
+                        .unwrap_or_default(),
                     key,
                     ..Default::default()
                 })
@@ -816,22 +567,6 @@ fn decode_groups(_lua: &mlua::Lua, value: Value) -> anyhow::Result<Vec<SidebarGr
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn entry(tab_id: TabId, groups: &[&str]) -> SidebarEntry {
-        SidebarEntry {
-            tab_id,
-            title: format!("tab-{tab_id}"),
-            groups: groups
-                .iter()
-                .map(|label| SidebarGroup {
-                    key: (*label).into(),
-                    label: (*label).into(),
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
 
     #[test]
     fn callback_decode_falls_back_and_rejects_duplicates() {
@@ -866,81 +601,9 @@ mod tests {
     }
 
     #[test]
-    fn rows_keep_nested_groups_and_hide_collapsed_descendants() {
-        let mut sidebar = TabSidebar {
-            entries: vec![
-                entry(1, &["remote", "project-a"]),
-                entry(2, &["remote", "project-b"]),
-            ],
-            ..Default::default()
-        };
-        let labels = sidebar_rows(&sidebar)
-            .into_iter()
-            .map(|row| match row {
-                SidebarRow::Group(group) => group.label,
-                SidebarRow::Tab(tab) => tab.title,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(labels, ["remote", "project-a", "tab-1", "project-b", "tab-2"]);
-
-        sidebar.collapsed.insert("remote\u{1f}project-a".into());
-        let labels = sidebar_rows(&sidebar)
-            .into_iter()
-            .map(|row| match row {
-                SidebarRow::Group(group) => group.label,
-                SidebarRow::Tab(tab) => tab.title,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(labels, ["remote", "project-a", "project-b", "tab-2"]);
-    }
-
-    #[test]
-    fn compact_rows_roll_up_state_and_ui_rows_match_shared_height() {
-        let mut first = entry(1, &["remote", "project-a"]);
-        first.active = true;
-        let mut second = entry(2, &["remote", "project-b"]);
-        second.urgency = 2;
-        let sidebar = TabSidebar {
-            entries: vec![first, second],
-            compact: true,
-            ..Default::default()
-        };
-        let rows = sidebar_rows(&sidebar);
-        assert_eq!(rows.len(), 1);
-        let SidebarRow::Group(group) = &rows[0] else {
-            panic!("expected group")
-        };
-        assert!(group.active);
-        assert_eq!(group.urgency, 2);
-
-        let items = ui_items_for_rows(&rows, 0, 0, ROW_HEIGHT_PX, 120, ROW_HEIGHT_PX);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].y, 0);
-        assert_eq!(items[0].height, ROW_HEIGHT_PX);
-        assert_eq!(max_scroll_rows(5, ROW_HEIGHT_PX, ROW_HEIGHT_PX), 4);
-    }
-
-    #[test]
-    fn drop_scope_requires_the_same_leaf_group_and_controller() {
-        let mut source = entry(1, &["remote", "project-a"]);
-        source.controller_pane_id = Some(10);
-        let mut target = entry(2, &["remote", "project-a"]);
-        target.controller_pane_id = Some(10);
-        assert!(same_drop_scope(&source, &target));
-
-        target.controller_pane_id = Some(11);
-        assert!(!same_drop_scope(&source, &target));
-
-        target.controller_pane_id = Some(10);
-        target.groups[1].key = "project-b".to_string();
-        assert!(!same_drop_scope(&source, &target));
-
-        target.groups[1].key = "project-a".to_string();
-        target.groups[0].key = "other-remote".to_string();
-        assert!(!same_drop_scope(&source, &target));
-
-        let implicit_local = entry(3, &[]);
-        let explicit_local = entry(4, &["@local"]);
-        assert!(same_drop_scope(&implicit_local, &explicit_local));
+    fn responsive_width_uses_compact_and_regular_breakpoints() {
+        assert_eq!(responsive_width_cells(6, 10.0, 96), 6);
+        assert_eq!(responsive_width_cells(13, 10.0, 96), 24);
+        assert_eq!(responsive_width_cells(60, 10.0, 96), 52);
     }
 }
