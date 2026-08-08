@@ -88,6 +88,7 @@ termwiz.workspace = true
 textwrap.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
+taffy.workspace = true
 umask.workspace = true
 unicode-normalization.workspace = true
 unicode-segmentation.workspace = true

@@ -9,6 +9,7 @@ use mux::pane::PaneId;
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
 use mux_lua::MuxPane;
+use std::convert::TryFrom;
 use termwiz_funcs::lines_to_escapes;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_toast_notification::ToastNotification;
@@ -61,6 +62,55 @@ impl UserData for GuiWin {
                 this.window
                     .notify(TermWindowNotif::SetInnerSize { width, height });
                 Ok(())
+            },
+        );
+        methods.add_async_method(
+            "screenshot_sidebar",
+            |_, this, (path, options): (String, Option<mlua::Table>)| async move {
+                if path.is_empty() {
+                    return Err(mlua::Error::external("screenshot_sidebar path is empty"));
+                }
+                let mut hover = None;
+                let mut offsets_ms = vec![0];
+                if let Some(options) = options {
+                    if let Some(position) = options.get::<_, Option<mlua::Table>>("hover")? {
+                        let x = position.get::<_, i64>("x").or_else(|_| position.get(1))?;
+                        let y = position.get::<_, i64>("y").or_else(|_| position.get(2))?;
+                        hover = Some((
+                            isize::try_from(x)
+                                .map_err(|_| mlua::Error::external("hover x is out of range"))?,
+                            isize::try_from(y)
+                                .map_err(|_| mlua::Error::external("hover y is out of range"))?,
+                        ));
+                    }
+                    offsets_ms = options
+                        .get::<_, Option<Vec<u64>>>("at_ms")?
+                        .or(options.get::<_, Option<Vec<u64>>>("times_ms")?)
+                        .unwrap_or(offsets_ms);
+                }
+                if offsets_ms.is_empty() || offsets_ms.len() > 32 {
+                    return Err(mlua::Error::external(
+                        "screenshot_sidebar needs 1 to 32 times",
+                    ));
+                }
+                if offsets_ms.iter().any(|offset| *offset > 60_000)
+                    || offsets_ms.windows(2).any(|window| window[0] > window[1])
+                {
+                    return Err(mlua::Error::external(
+                        "screenshot_sidebar times must be ordered and within 60 seconds",
+                    ));
+                }
+                let (tx, rx) = smol::channel::bounded(1);
+                this.window.notify(TermWindowNotif::ScreenshotSidebar {
+                    path: path.into(),
+                    hover,
+                    offsets_ms,
+                    tx,
+                });
+                rx.recv()
+                    .await
+                    .map_err(mlua::Error::external)?
+                    .map_err(mlua::Error::external)
             },
         );
         methods.add_method("set_position", |_, this, (x, y): (isize, isize)| {

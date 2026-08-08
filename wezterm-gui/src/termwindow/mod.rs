@@ -56,6 +56,7 @@ use smol::Timer;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
 use std::ops::Add;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -82,6 +83,7 @@ pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
+mod sidebar_ui;
 mod tab_sidebar;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
@@ -150,6 +152,22 @@ pub enum TermWindowNotif {
         width: usize,
         height: usize,
     },
+    ScreenshotSidebar {
+        path: PathBuf,
+        hover: Option<(isize, isize)>,
+        offsets_ms: Vec<u64>,
+        tx: smol::channel::Sender<anyhow::Result<Vec<String>>>,
+    },
+}
+
+pub(crate) struct SidebarScreenshotRequest {
+    pub(crate) path: PathBuf,
+    pub(crate) hover: Option<(isize, isize)>,
+    pub(crate) offsets_ms: Vec<u64>,
+    pub(crate) next: usize,
+    pub(crate) started: Instant,
+    pub(crate) outputs: Vec<String>,
+    pub(crate) tx: smol::channel::Sender<anyhow::Result<Vec<String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +175,7 @@ pub enum UIItemType {
     TabBar(TabBarItem),
     TabSidebar(TabId),
     TabSidebarGroup(String),
+    SidebarNode(String),
     CloseTab(usize),
     AboveScrollThumb,
     ScrollThumb,
@@ -453,6 +472,8 @@ pub struct TermWindow {
     /// Window-owned sidebar renderer, lazy-initialized in the WebGpu draw path.
     egui_ctx: Option<egui::Context>,
     egui_renderer: Option<egui_wgpu::Renderer>,
+    sidebar_images: HashMap<String, egui::TextureHandle>,
+    sidebar_screenshot: Option<SidebarScreenshotRequest>,
 }
 
 impl TermWindow {
@@ -693,6 +714,8 @@ impl TermWindow {
             webgpu: None,
             egui_ctx: None,
             egui_renderer: None,
+            sidebar_images: HashMap::new(),
+            sidebar_screenshot: None,
             window: None,
             window_background,
             config: config.clone(),
@@ -1376,6 +1399,32 @@ impl TermWindow {
             TermWindowNotif::SetInnerSize { width, height } => {
                 self.set_inner_size(window, width, height);
             }
+            TermWindowNotif::ScreenshotSidebar {
+                path,
+                hover,
+                offsets_ms,
+                tx,
+            } => {
+                if self.webgpu.is_none() {
+                    tx.try_send(Err(anyhow!("sidebar screenshots require the WebGpu frontend")))
+                        .ok();
+                } else if self.sidebar_screenshot.is_some() {
+                    tx.try_send(Err(anyhow!("another sidebar screenshot is in progress")))
+                        .ok();
+                } else {
+                    self.sidebar_screenshot = Some(SidebarScreenshotRequest {
+                        path,
+                        hover,
+                        offsets_ms,
+                        next: 0,
+                        started: Instant::now(),
+                        outputs: Vec::new(),
+                        tx,
+                    });
+                    self.schedule_sidebar_screenshot();
+                    window.invalidate();
+                }
+            }
         }
 
         Ok(())
@@ -1384,6 +1433,24 @@ impl TermWindow {
     fn set_inner_size(&mut self, window: &Window, width: usize, height: usize) {
         self.resizes_pending += 1;
         window.set_inner_size(width, height);
+    }
+
+    pub(super) fn schedule_sidebar_screenshot(&self) {
+        let Some(request) = self.sidebar_screenshot.as_ref() else {
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let target = request
+            .started
+            .checked_add(Duration::from_millis(request.offsets_ms[request.next]))
+            .unwrap_or_else(Instant::now);
+        promise::spawn::spawn(async move {
+            smol::Timer::at(target).await;
+            window.invalidate();
+        })
+        .detach();
     }
 
     /// Take care to remove our panes from the mux, otherwise
@@ -1625,6 +1692,24 @@ impl TermWindow {
 
         promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
             do_event(lua, name, window, pane)
+        }))
+        .detach();
+    }
+
+    pub(crate) fn emit_sidebar_action(&self, action: wezterm_dynamic::Value) {
+        let window = GuiWin::new(self);
+        let Some(pane) = self.get_active_pane_or_overlay() else {
+            return;
+        };
+        let pane = MuxPane(pane.pane_id());
+        promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| async move {
+            let Some(lua) = lua else { return Ok(()) };
+            let payload = luahelper::dynamic_to_lua_value(&lua, action)?;
+            let args = lua.pack_multi((window, pane, payload))?;
+            if let Err(err) = config::lua::emit_event(&lua, ("sidebar-action".to_string(), args)).await {
+                log::error!("while processing sidebar-action event: {err:#}");
+            }
+            Ok(())
         }))
         .detach();
     }

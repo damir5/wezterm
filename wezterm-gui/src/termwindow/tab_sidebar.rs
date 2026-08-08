@@ -1,4 +1,5 @@
 use super::{TabInformation, TermWindow, UIItem, UIItemType};
+use super::sidebar_ui::{self, UiLayout, UiNode};
 use config::ConfigHandle;
 use mlua::Value;
 use mux::pane::PaneId;
@@ -7,17 +8,24 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use window::WindowOps;
 use window::{MouseCursor, MouseEvent, MouseEventKind, MousePress};
+use wezterm_dynamic::Value as DynamicValue;
 
 pub const COMPACT_WIDTH_CELLS: usize = 6;
 pub const ROW_HEIGHT_PX: usize = 40;
+pub const SUMMARY_HEIGHT_PX: usize = 34;
+pub const MAX_SIDEBAR_WIDTH_CELLS: usize = 60;
+pub const RESIZE_EDGE_PX: usize = 5;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SidebarGroup {
     pub key: String,
     pub label: String,
+    pub host: String,
+    pub worktree: String,
     pub depth: usize,
     pub active: bool,
     pub urgency: u8,
+    pub counts: HashMap<String, usize>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -26,8 +34,11 @@ pub struct SidebarEntry {
     pub controller_pane_id: Option<PaneId>,
     pub title: String,
     pub right: String,
+    pub harness_glyph: String,
     pub status_glyph: String,
     pub status_color: Option<String>,
+    pub status_key: String,
+    pub progress: String,
     pub urgency: u8,
     pub groups: Vec<SidebarGroup>,
     pub active: bool,
@@ -37,6 +48,7 @@ pub struct SidebarEntry {
 pub(super) enum SidebarHover {
     Group(String),
     Tab(TabId),
+    Node(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,15 +66,23 @@ pub(super) struct SidebarDrag {
     pub(super) target: Option<SidebarDropTarget>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct SidebarResize;
+
 #[derive(Default)]
 pub struct TabSidebar {
     pub entries: Vec<SidebarEntry>,
+    pub ui_tree: Option<UiNode>,
+    pub ui_layout: Option<UiLayout>,
+    pub ui_layout_size: Option<(usize, usize)>,
     pub dirty: bool,
     pub compact: bool,
+    pub width_cells_override: Option<usize>,
     pub scroll_rows: usize,
     pub collapsed: std::collections::HashSet<String>,
     pub(super) hovered: Option<SidebarHover>,
     pub(super) drag: Option<SidebarDrag>,
+    pub(super) resize: Option<SidebarResize>,
     pub(super) refresh_generation: u64,
 }
 
@@ -71,7 +91,9 @@ impl TabSidebar {
         if self.compact {
             COMPACT_WIDTH_CELLS
         } else {
-            config.tab_sidebar_width.max(COMPACT_WIDTH_CELLS + 1)
+            self.width_cells_override
+                .unwrap_or(config.tab_sidebar_width)
+                .clamp(COMPACT_WIDTH_CELLS + 1, MAX_SIDEBAR_WIDTH_CELLS)
         }
     }
 }
@@ -111,8 +133,10 @@ impl TermWindow {
 
         let started = std::time::Instant::now();
         let mut entries = native_entries(tabs);
+        let mut ui_tree = None;
         let refresh_after = match callback_entries(tabs) {
             Ok(callback) => {
+                ui_tree = callback.ui_tree;
                 let valid_tabs = entries.iter().map(|entry| entry.tab_id).collect::<std::collections::HashSet<_>>();
                 if let Err(err) = validate_callback_entries(&valid_tabs, &callback.entries) {
                     log::warn!("format-tab-sidebar: ignoring all callback output: {err:#}");
@@ -123,8 +147,11 @@ impl TermWindow {
                     if let Some(metadata) = metadata.get(&entry.tab_id) {
                         entry.title = metadata.title.clone();
                         entry.right = metadata.right.clone();
+                        entry.harness_glyph = metadata.harness_glyph.clone();
                         entry.status_glyph = metadata.status_glyph.clone();
                         entry.status_color = metadata.status_color.clone();
+                        entry.status_key = metadata.status_key.clone();
+                        entry.progress = metadata.progress.clone();
                         entry.urgency = metadata.urgency;
                         entry.groups = metadata.groups.clone();
                     }
@@ -139,6 +166,10 @@ impl TermWindow {
         };
 
         self.tab_sidebar.entries = entries;
+        self.tab_sidebar.ui_tree = ui_tree;
+        self.tab_sidebar.ui_layout = None;
+        self.tab_sidebar.ui_layout_size = None;
+        self.sidebar_images.clear();
         self.tab_sidebar.dirty = false;
         self.tab_sidebar.refresh_generation = self.tab_sidebar.refresh_generation.wrapping_add(1);
         if let Some(refresh_after) = refresh_after {
@@ -214,8 +245,57 @@ impl TermWindow {
         match self.sidebar_item_at(event) {
             Some(UIItemType::TabSidebar(tab_id)) => Some(SidebarHover::Tab(tab_id)),
             Some(UIItemType::TabSidebarGroup(group)) => Some(SidebarHover::Group(group)),
+            Some(UIItemType::SidebarNode(id)) => Some(SidebarHover::Node(id)),
             _ => None,
         }
+    }
+
+    pub(super) fn set_sidebar_hover_at(&mut self, x: isize, y: isize) {
+        let pixels_per_point = (self.dimensions.dpi as f32 / 96.0).max(1.0);
+        let layout_hover = self
+            .tab_sidebar
+            .ui_layout
+            .as_ref()
+            .and_then(|layout| layout.hit_test(x as f32 / pixels_per_point, y as f32 / pixels_per_point))
+            .filter(|node| node.on_click.is_some() || node.on_hover.is_some())
+            .map(|node| SidebarHover::Node(node.id.clone()));
+        if layout_hover.is_some() {
+            self.tab_sidebar.hovered = layout_hover;
+            return;
+        }
+        self.tab_sidebar.hovered = self
+            .ui_items
+            .iter()
+            .rev()
+            .find(|item| item.hit_test(x, y))
+            .and_then(|item| match &item.item_type {
+                UIItemType::TabSidebar(tab_id) => Some(SidebarHover::Tab(*tab_id)),
+                UIItemType::TabSidebarGroup(group) => Some(SidebarHover::Group(group.clone())),
+                UIItemType::SidebarNode(id) => Some(SidebarHover::Node(id.clone())),
+                _ => None,
+            });
+    }
+
+    fn activate_sidebar_node(&mut self, id: &str) {
+        let action = self
+            .tab_sidebar
+            .ui_layout
+            .as_ref()
+            .and_then(|layout| layout.nodes.iter().find(|node| node.id == id))
+            .and_then(|node| node.on_click.clone());
+        let Some(action) = action else { return };
+        if let DynamicValue::Object(object) = &action {
+            if matches!(object.get_by_str("action"), Some(DynamicValue::String(action)) if action == "activate-tab") {
+                if let Some(tab_id) = object
+                    .get_by_str("tab_id")
+                    .and_then(DynamicValue::coerce_unsigned)
+                {
+                    self.activate_sidebar_tab(tab_id as TabId);
+                    return;
+                }
+            }
+        }
+        self.emit_sidebar_action(action);
     }
 
     fn sidebar_drop_target(
@@ -309,9 +389,13 @@ impl TermWindow {
         if !self.tab_sidebar_enabled {
             return false;
         }
-        let inside =
-            event.coords.x >= 0 && (event.coords.x as usize) < self.tab_sidebar_width_pixels();
-        if !inside && self.tab_sidebar.drag.is_none() {
+        let width = self.tab_sidebar_width_pixels();
+        let inside = event.coords.x >= 0 && (event.coords.x as usize) < width;
+        let on_edge = !self.tab_sidebar.compact
+            && event.coords.x >= 0
+            && (event.coords.x as usize).saturating_add(RESIZE_EDGE_PX) >= width
+            && (event.coords.x as usize) <= width + RESIZE_EDGE_PX;
+        if !inside && self.tab_sidebar.drag.is_none() && self.tab_sidebar.resize.is_none() {
             if self.tab_sidebar.hovered.take().is_some() {
                 context.invalidate();
             }
@@ -323,32 +407,50 @@ impl TermWindow {
             MouseEventKind::VertWheel(delta) if inside => {
                 invalidate |= self.tab_sidebar_scroll((-delta).signum() as isize);
             }
-            MouseEventKind::Press(MousePress::Left) if inside => {
-                match self.sidebar_item_at(event) {
-                    Some(UIItemType::TabSidebar(tab_id)) => {
-                        self.tab_sidebar.drag = Some(SidebarDrag {
-                            tab_id,
-                            start_x: event.coords.x,
-                            start_y: event.coords.y,
-                            active: false,
-                            target: None,
-                        });
-                        invalidate = true;
-                    }
-                    Some(UIItemType::TabSidebarGroup(group)) => {
-                        if self.tab_sidebar.compact {
-                            self.expand_tab_sidebar_group(&group);
-                            self.config_was_reloaded();
-                        } else if !self.tab_sidebar.collapsed.insert(group.clone()) {
-                            self.tab_sidebar.collapsed.remove(&group);
+            MouseEventKind::Press(MousePress::Left) => {
+                if on_edge {
+                    self.tab_sidebar.resize = Some(SidebarResize);
+                    invalidate = true;
+                } else if inside {
+                    match self.sidebar_item_at(event) {
+                        Some(UIItemType::TabSidebar(tab_id)) => {
+                            self.tab_sidebar.drag = Some(SidebarDrag {
+                                tab_id,
+                                start_x: event.coords.x,
+                                start_y: event.coords.y,
+                                active: false,
+                                target: None,
+                            });
+                            invalidate = true;
                         }
-                        invalidate = true;
+                        Some(UIItemType::TabSidebarGroup(group)) => {
+                            if self.tab_sidebar.compact {
+                                self.expand_tab_sidebar_group(&group);
+                                self.config_was_reloaded();
+                            } else if !self.tab_sidebar.collapsed.insert(group.clone()) {
+                                self.tab_sidebar.collapsed.remove(&group);
+                            }
+                            invalidate = true;
+                        }
+                        Some(UIItemType::SidebarNode(id)) => {
+                            self.activate_sidebar_node(&id);
+                            invalidate = true;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             MouseEventKind::Move => {
-                if let Some(mut drag) = self.tab_sidebar.drag.take() {
+                if let Some(_resize) = self.tab_sidebar.resize.as_ref() {
+                    let cell_width = self.render_metrics.cell_size.width.max(1) as usize;
+                    let new_cells = (event.coords.x as usize / cell_width)
+                        .clamp(COMPACT_WIDTH_CELLS + 1, MAX_SIDEBAR_WIDTH_CELLS);
+                    if Some(new_cells) != self.tab_sidebar.width_cells_override {
+                        self.tab_sidebar.width_cells_override = Some(new_cells);
+                        self.config_was_reloaded();
+                    }
+                    invalidate = true;
+                } else if let Some(mut drag) = self.tab_sidebar.drag.take() {
                     let dx = event.coords.x - drag.start_x;
                     let dy = event.coords.y - drag.start_y;
                     drag.active |= dx * dx + dy * dy >= 36;
@@ -373,11 +475,28 @@ impl TermWindow {
                 } else {
                     None
                 };
-                invalidate |= self.tab_sidebar.hovered != hovered;
+                let hover_action = match hovered.as_ref() {
+                    Some(SidebarHover::Node(id)) => self
+                        .tab_sidebar
+                        .ui_layout
+                        .as_ref()
+                        .and_then(|layout| layout.nodes.iter().find(|node| node.id == *id))
+                        .and_then(|node| node.on_hover.clone()),
+                    _ => None,
+                };
+                let hover_changed = self.tab_sidebar.hovered != hovered;
+                invalidate |= hover_changed;
                 self.tab_sidebar.hovered = hovered;
+                if hover_changed {
+                    if let Some(action) = hover_action {
+                        self.emit_sidebar_action(action);
+                    }
+                }
             }
             MouseEventKind::Release(MousePress::Left) => {
-                if let Some(drag) = self.tab_sidebar.drag.take() {
+                if self.tab_sidebar.resize.take().is_some() {
+                    invalidate = true;
+                } else if let Some(drag) = self.tab_sidebar.drag.take() {
                     if drag.active {
                         if let Some(target) = drag.target {
                             self.reorder_sidebar_tab(drag.tab_id, target);
@@ -391,13 +510,14 @@ impl TermWindow {
             _ => {}
         }
 
-        let interactive =
-            self.tab_sidebar.drag.is_some() || matches!(self.tab_sidebar.hovered, Some(_));
-        context.set_cursor(Some(if interactive {
+        let cursor = if self.tab_sidebar.resize.is_some() || on_edge {
+            MouseCursor::SizeLeftRight
+        } else if self.tab_sidebar.drag.is_some() || matches!(self.tab_sidebar.hovered, Some(_)) {
             MouseCursor::Hand
         } else {
             MouseCursor::Arrow
-        }));
+        };
+        context.set_cursor(Some(cursor));
         if invalidate {
             context.invalidate();
         }
@@ -438,11 +558,17 @@ pub fn ui_items_for_rows(
 
 pub fn sidebar_rows(sidebar: &TabSidebar) -> Vec<SidebarRow> {
     let group_state = sidebar.entries.iter().flat_map(|entry| {
-        entry_groups(entry).into_iter().map(move |group| (group.key, entry.active, entry.urgency))
-    }).fold(HashMap::new(), |mut states, (key, active, urgency)| {
-        let state = states.entry(key).or_insert((false, 0));
+        let status = entry.status_key.clone();
+        entry_groups(entry).into_iter().map(move |group| {
+            (group.key, entry.active, entry.urgency, status.clone())
+        })
+    }).fold(HashMap::new(), |mut states, (key, active, urgency, status)| {
+        let state = states.entry(key).or_insert((false, 0, HashMap::new()));
         state.0 |= active;
         state.1 = state.1.max(urgency);
+        if !status.is_empty() {
+            *state.2.entry(status).or_insert(0) += 1;
+        }
         states
     });
     if sidebar.compact {
@@ -450,9 +576,10 @@ pub fn sidebar_rows(sidebar: &TabSidebar) -> Vec<SidebarRow> {
         for entry in &sidebar.entries {
             let mut group = entry_groups(entry).into_iter().next().unwrap();
             if !groups.iter().any(|existing: &SidebarGroup| existing.key == group.key) {
-                let (active, urgency) = group_state[&group.key];
+                let (active, urgency, counts) = group_state[&group.key].clone();
                 group.active = active;
                 group.urgency = urgency;
+                group.counts = counts;
                 groups.push(group);
             }
         }
@@ -472,9 +599,10 @@ pub fn sidebar_rows(sidebar: &TabSidebar) -> Vec<SidebarRow> {
         for group in groups.iter().skip(common) {
             if !hidden {
                 let mut group = group.clone();
-                let (active, urgency) = group_state[&group.key];
+                let (active, urgency, counts) = group_state[&group.key].clone();
                 group.active = active;
                 group.urgency = urgency;
+                group.counts = counts;
                 rows.push(SidebarRow::Group(group));
             }
             hidden |= sidebar.collapsed.contains(&group.key);
@@ -550,6 +678,7 @@ fn native_entries(tabs: &[TabInformation]) -> Vec<SidebarEntry> {
 
 struct CallbackResult {
     entries: HashMap<TabId, SidebarEntry>,
+    ui_tree: Option<UiNode>,
     refresh_after: Option<Duration>,
 }
 
@@ -570,20 +699,27 @@ fn max_scroll_rows(row_count: usize, height: usize, row_height: usize) -> usize 
 fn callback_entries(tabs: &[TabInformation]) -> anyhow::Result<CallbackResult> {
     config::run_immediate_with_lua_config(|lua| {
         let Some(lua) = lua else {
-            return Ok(CallbackResult { entries: HashMap::new(), refresh_after: None });
+            return Ok(CallbackResult { entries: HashMap::new(), ui_tree: None, refresh_after: None });
         };
-        let tabs = lua.create_sequence_from(tabs.iter().cloned())?;
+        let format_tabs = lua.create_sequence_from(tabs.iter().cloned())?;
         let value = config::lua::emit_sync_callback(
             &lua,
-            ("format-tab-sidebar".to_string(), tabs),
+            ("format-tab-sidebar".to_string(), format_tabs),
         )?;
-        decode_callback(&lua, value)
+        let mut callback = decode_callback(&lua, value)?;
+        let tree_tabs = lua.create_sequence_from(tabs.iter().cloned())?;
+        let tree = config::lua::emit_sync_callback(
+            &lua,
+            ("render-sidebar".to_string(), tree_tabs),
+        )?;
+        callback.ui_tree = sidebar_ui::decode(tree, &lua)?;
+        Ok(callback)
     })
 }
 
 fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResult> {
     let Value::Table(result) = value else {
-        return Ok(CallbackResult { entries: HashMap::new(), refresh_after: None });
+        return Ok(CallbackResult { entries: HashMap::new(), ui_tree: None, refresh_after: None });
     };
     let refresh_after = match result.get::<_, Value>("refresh_after_ms")? {
         Value::Nil => None,
@@ -604,13 +740,16 @@ fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResu
         let tab_id = entry.get::<_, TabId>("tab_id")?;
         let title = entry.get::<_, Option<String>>("title")?.unwrap_or_default();
         let right = entry.get::<_, Option<String>>("right")?.unwrap_or_default();
+        let harness_glyph = entry.get::<_, Option<String>>("harness")?.unwrap_or_default();
+        let progress = entry.get::<_, Option<String>>("progress")?.unwrap_or_default();
         let urgency = entry.get::<_, Option<u8>>("urgency")?.unwrap_or(0).min(2);
-        let (status_glyph, status_color) = match entry.get::<_, Value>("status")? {
+        let (status_key, status_glyph, status_color) = match entry.get::<_, Value>("status")? {
             Value::Table(status) => (
+                status.get::<_, Option<String>>("key")?.unwrap_or_default(),
                 status.get::<_, Option<String>>("glyph")?.unwrap_or_default(),
                 status.get::<_, Option<String>>("color")?,
             ),
-            Value::Nil => (String::new(), None),
+            Value::Nil => (String::new(), String::new(), None),
             _ => anyhow::bail!("format-tab-sidebar status must be a table"),
         };
         let groups = decode_groups(lua, entry.get::<_, Value>("group_path")?)?;
@@ -622,8 +761,11 @@ fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResu
                     controller_pane_id: None,
                     title,
                     right,
+                    harness_glyph,
                     status_glyph,
                     status_color,
+                    status_key,
+                    progress,
                     urgency,
                     groups,
                     active: false,
@@ -634,7 +776,7 @@ fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResu
             anyhow::bail!("format-tab-sidebar returned duplicate tab_id {tab_id}");
         }
     }
-    Ok(CallbackResult { entries: decoded, refresh_after })
+    Ok(CallbackResult { entries: decoded, ui_tree: None, refresh_after })
 }
 
 fn decode_groups(_lua: &mlua::Lua, value: Value) -> anyhow::Result<Vec<SidebarGroup>> {
@@ -660,6 +802,8 @@ fn decode_groups(_lua: &mlua::Lua, value: Value) -> anyhow::Result<Vec<SidebarGr
                 let key = group.get::<_, String>("key")?;
                 Ok(SidebarGroup {
                     label: group.get::<_, Option<String>>("label")?.unwrap_or_else(|| key.clone()),
+                    host: group.get::<_, Option<String>>("host")?.unwrap_or_default(),
+                    worktree: group.get::<_, Option<String>>("worktree")?.unwrap_or_default(),
                     key,
                     ..Default::default()
                 })

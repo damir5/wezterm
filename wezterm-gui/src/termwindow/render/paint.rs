@@ -177,14 +177,42 @@ impl crate::TermWindow {
             vec![]
         };
         if self.tab_sidebar_enabled {
-            self.ui_items.extend(crate::termwindow::tab_sidebar::ui_items_for_rows(
-                &self.tab_sidebar_rows,
-                self.tab_sidebar.scroll_rows,
-                0,
-                crate::termwindow::tab_sidebar::ROW_HEIGHT_PX,
-                self.tab_sidebar_width_pixels(),
-                self.dimensions.pixel_height,
-            ));
+            let pixels_per_point = (self.dimensions.dpi as f32 / 96.0).max(1.0);
+            if let Some(root) = self.tab_sidebar.ui_tree.clone() {
+                let size = (self.tab_sidebar_width_pixels(), self.dimensions.pixel_height);
+                if self.tab_sidebar.ui_layout_size != Some(size) {
+                    self.tab_sidebar.ui_layout = match crate::termwindow::sidebar_ui::layout(
+                        &root,
+                        size.0 as f32 / pixels_per_point,
+                        size.1 as f32 / pixels_per_point,
+                    ) {
+                        Ok(layout) => Some(layout),
+                        Err(err) => {
+                            log::warn!("render-sidebar layout: {err:#}");
+                            None
+                        }
+                    };
+                    self.tab_sidebar.ui_layout_size = Some(size);
+                }
+                if let Some(layout) = self.tab_sidebar.ui_layout.as_ref() {
+                    self.ui_items.extend(crate::termwindow::sidebar_ui::ui_items_for_layout(
+                        layout,
+                        pixels_per_point,
+                        size.0,
+                        size.1,
+                    ));
+                }
+            } else {
+                let top = if self.tab_sidebar.compact { 0 } else { crate::termwindow::tab_sidebar::SUMMARY_HEIGHT_PX };
+                self.ui_items.extend(crate::termwindow::tab_sidebar::ui_items_for_rows(
+                    &self.tab_sidebar_rows,
+                    self.tab_sidebar.scroll_rows,
+                    top,
+                    crate::termwindow::tab_sidebar::ROW_HEIGHT_PX,
+                    self.tab_sidebar_width_pixels(),
+                    self.dimensions.pixel_height,
+                ));
+            }
         }
 
         let panes = self.get_panes_to_render();
