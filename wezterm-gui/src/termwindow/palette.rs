@@ -41,6 +41,10 @@ pub struct CommandPalette {
     commands: Vec<ExpandedCommand>,
 }
 
+fn palette_x_adjust(terminal_pixel_width: f32, desired_pixel_width: f32) -> f32 {
+    (terminal_pixel_width - desired_pixel_width) / 2.
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Recent {
     brief: String,
@@ -510,7 +514,7 @@ impl CommandPalette {
             }))
             .min_width(Some(Dimension::Pixels(desired_pixel_width)));
 
-        let x_adjust = ((avail_pixel_width - padding_left) - desired_pixel_width) / 2.;
+        let x_adjust = palette_x_adjust(avail_pixel_width, desired_pixel_width);
 
         let computed = term_window.compute_element(
             &LayoutContext {
@@ -704,5 +708,15 @@ impl Modal for CommandPalette {
 
     fn reconfigure(&self, _term_window: &mut TermWindow) {
         self.element.borrow_mut().take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::palette_x_adjust;
+
+    #[test]
+    fn palette_centers_in_terminal_area_independent_of_sidebar_origin() {
+        assert_eq!(palette_x_adjust(960., 320.), 320.);
     }
 }
