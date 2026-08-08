@@ -4,6 +4,7 @@ use config::ConfigHandle;
 use mlua::Value;
 use mux::pane::PaneId;
 use mux::tab::TabId;
+use mux::Mux;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use wezterm_dynamic::Value as DynamicValue;
@@ -17,6 +18,32 @@ pub const RESIZE_EDGE_PX: usize = 5;
 pub const COMPACT_MAX_WIDTH_PT: f32 = 120.0;
 pub const REGULAR_MIN_WIDTH_PT: f32 = 240.0;
 pub const REGULAR_MAX_WIDTH_PT: f32 = 520.0;
+
+fn activate_tab_id(action: &DynamicValue) -> Option<TabId> {
+    let DynamicValue::Object(object) = action else {
+        return None;
+    };
+    matches!(object.get_by_str("action"), Some(DynamicValue::String(action)) if action == "activate-tab")
+        .then(|| object.get_by_str("tab_id").and_then(DynamicValue::coerce_unsigned))
+        .flatten()
+        .map(|tab_id| tab_id as TabId)
+}
+
+fn relative_sidebar_tab_id(
+    tab_ids: &[TabId],
+    active_tab_id: TabId,
+    delta: isize,
+    wrap: bool,
+) -> Option<TabId> {
+    let active = tab_ids.iter().position(|&tab_id| tab_id == active_tab_id)? as isize;
+    let last = tab_ids.len().checked_sub(1)? as isize;
+    let index = if wrap {
+        (active + delta).rem_euclid(last + 1)
+    } else {
+        (active + delta).clamp(0, last)
+    };
+    tab_ids.get(index as usize).copied()
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SidebarGroup {
@@ -105,6 +132,22 @@ pub fn responsive_width_cells(requested: usize, cell_width: f32, dpi: u32) -> us
         ) as usize
 }
 impl TermWindow {
+    pub fn sidebar_relative_tab_id(&self, delta: isize, wrap: bool) -> Option<TabId> {
+        let layout = self.tab_sidebar.ui_layout.as_ref()?;
+        let active_tab_id = Mux::get()
+            .get_window(self.mux_window_id)
+            .and_then(|window| window.get_active().map(|tab| tab.tab_id()))?;
+        let mut tab_ids = Vec::new();
+        for node in &layout.nodes {
+            if let Some(tab_id) = node.on_click.as_ref().and_then(activate_tab_id) {
+                if !tab_ids.contains(&tab_id) {
+                    tab_ids.push(tab_id);
+                }
+            }
+        }
+        relative_sidebar_tab_id(&tab_ids, active_tab_id, delta, wrap)
+    }
+
     pub fn tab_sidebar_width_pixels(&self) -> usize {
         if self.tab_sidebar_enabled {
             self.tab_sidebar.width_cells(
@@ -308,17 +351,9 @@ impl TermWindow {
             .and_then(|layout| layout.nodes.iter().find(|node| node.id == id))
             .and_then(|node| node.on_click.clone());
         let Some(action) = action else { return };
-        if let DynamicValue::Object(object) = &action {
-            if matches!(object.get_by_str("action"), Some(DynamicValue::String(action)) if action == "activate-tab")
-            {
-                if let Some(tab_id) = object
-                    .get_by_str("tab_id")
-                    .and_then(DynamicValue::coerce_unsigned)
-                {
-                    self.activate_sidebar_tab(tab_id as TabId);
-                    return;
-                }
-            }
+        if let Some(tab_id) = activate_tab_id(&action) {
+            self.activate_sidebar_tab(tab_id);
+            return;
         }
         self.emit_sidebar_action(action);
     }
@@ -642,5 +677,14 @@ mod tests {
         assert_eq!(responsive_width_cells(6, 10.0, 96), 6);
         assert_eq!(responsive_width_cells(13, 10.0, 96), 24);
         assert_eq!(responsive_width_cells(60, 10.0, 96), 52);
+    }
+
+    #[test]
+    fn relative_tab_navigation_follows_sidebar_row_order() {
+        let tabs = [30, 10, 20];
+        assert_eq!(relative_sidebar_tab_id(&tabs, 30, 1, true), Some(10));
+        assert_eq!(relative_sidebar_tab_id(&tabs, 10, -1, true), Some(30));
+        assert_eq!(relative_sidebar_tab_id(&tabs, 30, -1, true), Some(20));
+        assert_eq!(relative_sidebar_tab_id(&tabs, 30, -1, false), Some(30));
     }
 }

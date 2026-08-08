@@ -2364,6 +2364,10 @@ impl TermWindow {
     }
 
     fn activate_tab_relative(&mut self, delta: isize, wrap: bool) -> anyhow::Result<()> {
+        if let Some(tab_id) = self.sidebar_relative_tab_id(delta, wrap) {
+            self.activate_sidebar_tab(tab_id);
+            return Ok(());
+        }
         let mux = Mux::get();
         let window = mux
             .get_window(self.mux_window_id)
