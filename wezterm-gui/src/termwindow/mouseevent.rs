@@ -352,6 +352,7 @@ impl super::TermWindow {
             self.min_scroll_bar_height() as usize,
         );
         self.set_viewport(pane.pane_id(), Some(row), dims);
+        self.request_terminal_repaint();
         context.invalidate();
         self.dragging.replace((item, start_event));
     }
@@ -608,6 +609,7 @@ impl super::TermWindow {
                 ),
                 dims,
             );
+            self.request_terminal_repaint();
             context.invalidate();
         }
         context.set_cursor(Some(CursorIcon::Default));
@@ -633,6 +635,7 @@ impl super::TermWindow {
                 ),
                 dims,
             );
+            self.request_terminal_repaint();
             context.invalidate();
         }
         context.set_cursor(Some(CursorIcon::Default));
@@ -717,6 +720,7 @@ impl super::TermWindow {
                                     .map(|tab| tab.set_active_idx(pos.index));
 
                                 pane = Arc::clone(&pos.pane);
+                                self.request_terminal_repaint();
                                 context.invalidate();
                             }
                         }
@@ -725,6 +729,7 @@ impl super::TermWindow {
                             // Let wheel events route to the hovered pane,
                             // even if it doesn't have focus
                             pane = Arc::clone(&pos.pane);
+                            self.request_terminal_repaint();
                             context.invalidate();
                         }
                     }

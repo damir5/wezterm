@@ -1,5 +1,5 @@
 use crate::colorease::ColorEaseUniform;
-use crate::termwindow::sidebar_ui::{self, UiLayout};
+use crate::termwindow::sidebar_ui::{self, PaintMode, UiLayout};
 use crate::termwindow::tab_sidebar::SidebarHover;
 use crate::termwindow::webgpu::ShaderUniform;
 use crate::termwindow::RenderFrame;
@@ -155,6 +155,7 @@ impl crate::TermWindow {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
+        let mut terminal_cleared = false;
         if !use_cached_terminal {
             let render_state = self.render_state.as_ref().unwrap();
             let tex = render_state.glyph_cache.borrow().atlas.texture();
@@ -196,7 +197,6 @@ impl crate::TermWindow {
                     label: Some("nearest bind group"),
                 },
             );
-            let mut cleared = false;
             let foreground_text_hsb = self.config.foreground_text_hsb;
             let foreground_text_hsb = [
                 foreground_text_hsb.hue,
@@ -227,7 +227,7 @@ impl crate::TermWindow {
                             view: terminal_target,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: if cleared {
+                                load: if terminal_cleared {
                                     wgpu::LoadOp::Load
                                 } else {
                                     wgpu::LoadOp::Clear(wgpu::Color {
@@ -244,7 +244,7 @@ impl crate::TermWindow {
                         occlusion_query_set: None,
                         timestamp_writes: None,
                     });
-                    cleared = true;
+                    terminal_cleared = true;
 
                     uniforms = webgpu.create_uniform(ShaderUniform {
                         foreground_text_hsb,
@@ -269,15 +269,25 @@ impl crate::TermWindow {
             }
         }
 
-        if cache_frame {
-            self.terminal_cache_valid = true;
-            self.blit_terminal_cache(&webgpu, &mut encoder, &view);
+        if !use_cached_terminal && !terminal_cleared {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Empty terminal clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: terminal_target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
         }
 
-        // The sidebar has one egui context per terminal window.  It is window
-        // chrome, so its cached model is rendered once rather than once per
-        // mux pane.
-        let egui_cmd_bufs = if self.tab_sidebar_enabled {
+        let mut egui_cmd_bufs = Vec::new();
+        if cache_frame && !sidebar_only && self.tab_sidebar_enabled {
             let config = webgpu.config.borrow();
             let linear_format = config.format.remove_srgb_suffix();
             let egui_format = if config.view_formats.contains(&linear_format) {
@@ -286,14 +296,18 @@ impl crate::TermWindow {
                 config.format
             };
             drop(config);
-            let egui_view = output.texture.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(egui_format),
-                ..Default::default()
-            });
+            let egui_view = self
+                .terminal_cache
+                .as_ref()
+                .unwrap()
+                .create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(egui_format),
+                    ..Default::default()
+                });
             let ui_layout = self.tab_sidebar.ui_layout.as_ref();
             let hovered = self.tab_sidebar.hovered.clone();
             let sidebar_width = self.tab_sidebar_width_pixels() as u32;
-            composite_tab_sidebar(
+            egui_cmd_bufs.extend(composite_tab_sidebar(
                 &mut self.egui_ctx,
                 &mut self.egui_renderer,
                 hovered.as_ref(),
@@ -310,10 +324,72 @@ impl crate::TermWindow {
                 &egui_view,
                 &mut encoder,
                 &mut self.sidebar_images,
-            )?
-        } else {
-            Vec::new()
-        };
+                PaintMode::Static,
+                true,
+            )?);
+        }
+
+        if cache_frame {
+            self.terminal_cache_valid = true;
+            self.blit_terminal_cache(&webgpu, &mut encoder, &view);
+        }
+
+        // The sidebar has one egui context per terminal window.  It is window
+        // chrome, so its cached model is rendered once rather than once per
+        // mux pane.
+        if self.tab_sidebar_enabled {
+            let config = webgpu.config.borrow();
+            let linear_format = config.format.remove_srgb_suffix();
+            let egui_format = if config.view_formats.contains(&linear_format) {
+                linear_format
+            } else {
+                config.format
+            };
+            drop(config);
+            let egui_view = output.texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(egui_format),
+                ..Default::default()
+            });
+            let ui_layout = self.tab_sidebar.ui_layout.as_ref();
+            let hovered = self.tab_sidebar.hovered.clone();
+            let sidebar_width = self.tab_sidebar_width_pixels() as u32;
+            egui_cmd_bufs.extend(composite_tab_sidebar(
+                if cache_frame {
+                    &mut self.egui_animation_ctx
+                } else {
+                    &mut self.egui_ctx
+                },
+                if cache_frame {
+                    &mut self.egui_animation_renderer
+                } else {
+                    &mut self.egui_renderer
+                },
+                hovered.as_ref(),
+                ui_layout,
+                self.tab_sidebar.ui_scroll_offset,
+                Some(self.created.elapsed().as_secs_f64()),
+                sidebar_width,
+                self.dimensions.pixel_width as u32,
+                self.dimensions.pixel_height as u32,
+                (self.dimensions.dpi as f32 / 96.0).max(1.0),
+                &webgpu.device,
+                &webgpu.queue,
+                egui_format,
+                &egui_view,
+                &mut encoder,
+                if cache_frame {
+                    &mut self.sidebar_animation_images
+                } else {
+                    &mut self.sidebar_images
+                },
+                if cache_frame {
+                    PaintMode::Animated
+                } else {
+                    PaintMode::All
+                },
+                !cache_frame,
+            )?);
+        }
 
         let capture_buffer = pending_capture.as_ref().and_then(|spec| {
             let can_copy = webgpu
@@ -628,6 +704,8 @@ fn composite_tab_sidebar(
     view: &wgpu::TextureView,
     encoder: &mut wgpu::CommandEncoder,
     images: &mut HashMap<String, egui::TextureHandle>,
+    mode: PaintMode,
+    draw_backdrop: bool,
 ) -> anyhow::Result<Vec<wgpu::CommandBuffer>> {
     let ctx = sidebar_ui::context(egui_ctx);
     let ctx = &ctx;
@@ -664,11 +742,13 @@ fn composite_tab_sidebar(
     let bg = egui::Color32::from_rgb(34, 37, 44);
     let sep = egui::Color32::from_rgb(47, 51, 60);
 
-    painter.rect_filled(rect, 0.0, bg);
-    painter.line_segment(
-        [rect.right_top(), rect.right_bottom()],
-        egui::Stroke::new(1.0_f32, sep),
-    );
+    if draw_backdrop {
+        painter.rect_filled(rect, 0.0, bg);
+        painter.line_segment(
+            [rect.right_top(), rect.right_bottom()],
+            egui::Stroke::new(1.0_f32, sep),
+        );
+    }
 
     if let Some(layout) = ui_layout {
         let hovered = match hovered {
@@ -683,6 +763,7 @@ fn composite_tab_sidebar(
             images,
             scroll_offset,
             animation_time.unwrap_or(0.0),
+            mode,
         );
     }
 

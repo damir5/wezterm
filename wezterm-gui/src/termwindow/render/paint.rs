@@ -23,9 +23,10 @@ impl crate::TermWindow {
         self.allow_images = AllowImage::Yes;
 
         let start = Instant::now();
-        let sidebar_only_repaint = self.sidebar_only_repaint;
+        let sidebar_only_repaint = self.sidebar_only_repaint && !self.terminal_repaint_pending;
         self.sidebar_only_repaint = false;
         if !sidebar_only_repaint {
+            self.terminal_repaint_pending = false;
             self.sidebar_cache_needed = false;
             self.sidebar_animation_due.borrow_mut().take();
             self.terminal_cache_valid = false;
@@ -188,6 +189,7 @@ impl crate::TermWindow {
                                         .unwrap_or(false);
                                     tw.sidebar_only_repaint = tw.webgpu.is_some()
                                         && !generic_due
+                                        && !tw.terminal_repaint_pending
                                         && tw.tab_sidebar.ui_animation_started.is_none();
                                     win.invalidate();
                                 }

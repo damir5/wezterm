@@ -46,6 +46,17 @@ pub enum UiAnimation {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaintMode {
+    All,
+    Static,
+    Animated,
+}
+
+fn should_paint(mode: PaintMode, animated: bool) -> bool {
+    matches!(mode, PaintMode::All) || animated == matches!(mode, PaintMode::Animated)
+}
+
 /// Cross-axis alignment. Mirrors the subset of flexbox the sidebar needs; the
 /// taffy default is Stretch, which is why every badge used to fill its row.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -490,6 +501,10 @@ fn decode_node(lua: &mlua::Lua, table: Table, path: &str) -> anyhow::Result<UiNo
             .collect::<anyhow::Result<Vec<_>>>()?,
         _ => bail!("sidebar UI node {path} children must be a sequence"),
     };
+    let style = style(&table, &kind)?;
+    if style.animation.is_some() && !children.is_empty() {
+        bail!("animated sidebar UI node {path} must not have children")
+    }
     Ok(UiNode {
         id,
         kind: kind.clone(),
@@ -498,7 +513,7 @@ fn decode_node(lua: &mlua::Lua, table: Table, path: &str) -> anyhow::Result<UiNo
             .get::<_, Option<String>>("src")?
             .or(table.get::<_, Option<String>>("path")?)
             .or(table.get::<_, Option<String>>("name")?),
-        style: style(&table, &kind)?,
+        style,
         children,
         on_click: event(&table, "on_click")?,
         on_hover: event(&table, "on_hover")?,
@@ -1029,8 +1044,13 @@ pub fn paint(
     images: &mut HashMap<String, egui::TextureHandle>,
     scroll_offset: f32,
     time: f64,
+    mode: PaintMode,
 ) {
     for node in &layout.nodes {
+        let animated = node.style.animation.is_some();
+        if !should_paint(mode, animated) {
+            continue;
+        }
         let mut node_rect = node.rect;
         if node.scrollable {
             node_rect.y -= scroll_offset;
@@ -1458,5 +1478,29 @@ return { type = 'scroll', width = 100, height = 40, children = {
         assert!(delay > Duration::from_millis(100));
         assert!(delay < Duration::from_millis(200));
         assert!(layout.hit_test_scrolled(10.0, 45.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn paint_modes_partition_static_and_animated_nodes() {
+        for animated in [false, true] {
+            assert!(should_paint(PaintMode::All, animated));
+            assert_ne!(
+                should_paint(PaintMode::Static, animated),
+                should_paint(PaintMode::Animated, animated)
+            );
+        }
+    }
+
+    #[test]
+    fn animated_nodes_must_be_leaves() {
+        let lua = mlua::Lua::new();
+        let node = lua
+            .load(
+                "return { animation = { type = 'pulse', period = 1 }, children = {{ type = 'text', text = 'x' }} }",
+            )
+            .eval::<Value>()
+            .unwrap();
+        let err = decode(node, &lua).unwrap_err();
+        assert!(err.to_string().contains("must not have children"));
     }
 }

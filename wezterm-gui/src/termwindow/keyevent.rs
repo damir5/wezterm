@@ -312,6 +312,7 @@ impl super::TermWindow {
                 };
 
                 if handled {
+                    self.request_terminal_repaint();
                     context.invalidate();
 
                     if leader_active {
@@ -415,6 +416,7 @@ impl super::TermWindow {
                             context.set_cursor(None);
                         }
                         if !keycode.is_modifier() {
+                            self.request_terminal_repaint();
                             context.invalidate();
                         }
 
@@ -716,6 +718,7 @@ impl super::TermWindow {
                         context.set_cursor(None);
                     }
                     if !key.is_modifier() {
+                        self.request_terminal_repaint();
                         context.invalidate();
                     }
                 }
@@ -739,6 +742,7 @@ impl super::TermWindow {
                     log::error!("failed to send composed text to pane: {err:#}");
                 }
                 self.maybe_scroll_to_bottom_for_input(&pane);
+                self.request_terminal_repaint();
                 context.invalidate();
             }
             Key::None => {}

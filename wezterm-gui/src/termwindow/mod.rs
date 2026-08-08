@@ -451,6 +451,7 @@ pub struct TermWindow {
     sidebar_animation_due: RefCell<Option<Instant>>,
     sidebar_animation_scheduled: RefCell<Option<Instant>>,
     sidebar_only_repaint: bool,
+    terminal_repaint_pending: bool,
     sidebar_cache_needed: bool,
     /// We use this to attempt to do something reasonable
     /// if we run out of texture space
@@ -473,7 +474,10 @@ pub struct TermWindow {
     /// Window-owned sidebar renderer, lazy-initialized in the WebGpu draw path.
     egui_ctx: Option<egui::Context>,
     egui_renderer: Option<egui_wgpu::Renderer>,
+    egui_animation_ctx: Option<egui::Context>,
+    egui_animation_renderer: Option<egui_wgpu::Renderer>,
     sidebar_images: HashMap<String, egui::TextureHandle>,
+    sidebar_animation_images: HashMap<String, egui::TextureHandle>,
     terminal_cache: Option<wgpu::Texture>,
     terminal_cache_size: Option<(u32, u32, wgpu::TextureFormat)>,
     terminal_cache_bind_group: Option<wgpu::BindGroup>,
@@ -721,7 +725,10 @@ impl TermWindow {
             webgpu: None,
             egui_ctx: None,
             egui_renderer: None,
+            egui_animation_ctx: None,
+            egui_animation_renderer: None,
             sidebar_images: HashMap::new(),
+            sidebar_animation_images: HashMap::new(),
             terminal_cache: None,
             terminal_cache_size: None,
             terminal_cache_bind_group: None,
@@ -827,6 +834,7 @@ impl TermWindow {
             sidebar_animation_due: RefCell::new(None),
             sidebar_animation_scheduled: RefCell::new(None),
             sidebar_only_repaint: false,
+            terminal_repaint_pending: false,
             sidebar_cache_needed: false,
             scheduled_animation: RefCell::new(None),
             allow_images: AllowImage::Yes,
@@ -1538,11 +1546,16 @@ impl TermWindow {
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
         if self.is_pane_visible(pane_id) {
-            self.sidebar_only_repaint = false;
+            self.request_terminal_repaint();
             if let Some(ref win) = self.window {
                 win.invalidate();
             }
         }
+    }
+
+    fn request_terminal_repaint(&mut self) {
+        self.sidebar_only_repaint = false;
+        self.terminal_repaint_pending = true;
     }
 
     fn mux_pane_output_event_callback(
