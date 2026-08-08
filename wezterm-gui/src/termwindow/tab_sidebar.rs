@@ -1,10 +1,12 @@
 use super::{TabInformation, TermWindow, UIItem, UIItemType};
 use config::ConfigHandle;
 use mlua::Value;
-use window::WindowOps;
+use mux::pane::PaneId;
 use mux::tab::TabId;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use window::WindowOps;
+use window::{MouseCursor, MouseEvent, MouseEventKind, MousePress};
 
 pub const COMPACT_WIDTH_CELLS: usize = 6;
 pub const ROW_HEIGHT_PX: usize = 40;
@@ -21,6 +23,7 @@ pub struct SidebarGroup {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SidebarEntry {
     pub tab_id: TabId,
+    pub controller_pane_id: Option<PaneId>,
     pub title: String,
     pub right: String,
     pub status_glyph: String,
@@ -30,6 +33,27 @@ pub struct SidebarEntry {
     pub active: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum SidebarHover {
+    Group(String),
+    Tab(TabId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SidebarDropTarget {
+    pub(super) tab_id: TabId,
+    pub(super) before: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct SidebarDrag {
+    pub(super) tab_id: TabId,
+    pub(super) start_x: isize,
+    pub(super) start_y: isize,
+    pub(super) active: bool,
+    pub(super) target: Option<SidebarDropTarget>,
+}
+
 #[derive(Default)]
 pub struct TabSidebar {
     pub entries: Vec<SidebarEntry>,
@@ -37,6 +61,8 @@ pub struct TabSidebar {
     pub compact: bool,
     pub scroll_rows: usize,
     pub collapsed: std::collections::HashSet<String>,
+    pub(super) hovered: Option<SidebarHover>,
+    pub(super) drag: Option<SidebarDrag>,
     pub(super) refresh_generation: u64,
 }
 
@@ -167,11 +193,214 @@ impl TermWindow {
             self.dimensions.pixel_height,
             ROW_HEIGHT_PX,
         );
+        let previous = self.tab_sidebar.scroll_rows;
         self.tab_sidebar.scroll_rows = if rows < 0 {
             self.tab_sidebar.scroll_rows.saturating_sub(rows.unsigned_abs())
         } else {
             self.tab_sidebar.scroll_rows.saturating_add(rows as usize).min(max)
         };
+        self.tab_sidebar.scroll_rows != previous
+    }
+
+    fn sidebar_item_at(&self, event: &MouseEvent) -> Option<UIItemType> {
+        self.ui_items
+            .iter()
+            .rev()
+            .find(|item| item.hit_test(event.coords.x, event.coords.y))
+            .map(|item| item.item_type.clone())
+    }
+
+    fn sidebar_hover_at(&self, event: &MouseEvent) -> Option<SidebarHover> {
+        match self.sidebar_item_at(event) {
+            Some(UIItemType::TabSidebar(tab_id)) => Some(SidebarHover::Tab(tab_id)),
+            Some(UIItemType::TabSidebarGroup(group)) => Some(SidebarHover::Group(group)),
+            _ => None,
+        }
+    }
+
+    fn sidebar_drop_target(
+        &self,
+        source_id: TabId,
+        event: &MouseEvent,
+    ) -> Option<SidebarDropTarget> {
+        let item = self
+            .ui_items
+            .iter()
+            .rev()
+            .find(|item| item.hit_test(event.coords.x, event.coords.y))?;
+        let UIItemType::TabSidebar(target_id) = item.item_type else {
+            return None;
+        };
+        if source_id == target_id {
+            return None;
+        }
+        let source = self
+            .tab_sidebar
+            .entries
+            .iter()
+            .find(|entry| entry.tab_id == source_id)?;
+        let target = self
+            .tab_sidebar
+            .entries
+            .iter()
+            .find(|entry| entry.tab_id == target_id)?;
+        if !same_drop_scope(source, target) {
+            return None;
+        }
+        Some(SidebarDropTarget {
+            tab_id: target_id,
+            before: event.coords.y < (item.y + item.height / 2) as isize,
+        })
+    }
+
+    fn reorder_sidebar_tab(&mut self, source: TabId, target: SidebarDropTarget) -> bool {
+        let Some(source_entry) = self
+            .tab_sidebar
+            .entries
+            .iter()
+            .find(|entry| entry.tab_id == source)
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(target_entry) = self
+            .tab_sidebar
+            .entries
+            .iter()
+            .find(|entry| entry.tab_id == target.tab_id)
+            .cloned()
+        else {
+            return false;
+        };
+        if !same_drop_scope(&source_entry, &target_entry) {
+            return false;
+        }
+
+        let mux = mux::Mux::get();
+        if let Some(controller) = source_entry.controller_pane_id {
+            let queued = mux.iter_domains().into_iter().any(|domain| {
+                domain
+                    .downcast_ref::<mux::tmux::TmuxDomain>()
+                    .filter(|domain| domain.controller_pane_id() == controller)
+                    .map(|domain| domain.reorder_tab(source, target.tab_id, target.before))
+                    .unwrap_or(false)
+            });
+            if !queued {
+                return false;
+            }
+        }
+
+        let moved = mux
+            .get_window_mut(self.mux_window_id)
+            .map(|mut window| window.move_tab_by_id(source, target.tab_id, target.before))
+            .unwrap_or(false);
+        if moved {
+            self.mark_tab_sidebar_dirty();
+            self.emit_status_event();
+        }
+        moved
+    }
+
+    pub fn handle_tab_sidebar_mouse_event(
+        &mut self,
+        event: &MouseEvent,
+        context: &dyn WindowOps,
+    ) -> bool {
+        if !self.tab_sidebar_enabled {
+            return false;
+        }
+        let inside =
+            event.coords.x >= 0 && (event.coords.x as usize) < self.tab_sidebar_width_pixels();
+        if !inside && self.tab_sidebar.drag.is_none() {
+            if self.tab_sidebar.hovered.take().is_some() {
+                context.invalidate();
+            }
+            return false;
+        }
+
+        let mut invalidate = false;
+        match event.kind {
+            MouseEventKind::VertWheel(delta) if inside => {
+                invalidate |= self.tab_sidebar_scroll((-delta).signum() as isize);
+            }
+            MouseEventKind::Press(MousePress::Left) if inside => {
+                match self.sidebar_item_at(event) {
+                    Some(UIItemType::TabSidebar(tab_id)) => {
+                        self.tab_sidebar.drag = Some(SidebarDrag {
+                            tab_id,
+                            start_x: event.coords.x,
+                            start_y: event.coords.y,
+                            active: false,
+                            target: None,
+                        });
+                        invalidate = true;
+                    }
+                    Some(UIItemType::TabSidebarGroup(group)) => {
+                        if self.tab_sidebar.compact {
+                            self.expand_tab_sidebar_group(&group);
+                            self.config_was_reloaded();
+                        } else if !self.tab_sidebar.collapsed.insert(group.clone()) {
+                            self.tab_sidebar.collapsed.remove(&group);
+                        }
+                        invalidate = true;
+                    }
+                    _ => {}
+                }
+            }
+            MouseEventKind::Move => {
+                if let Some(mut drag) = self.tab_sidebar.drag.take() {
+                    let dx = event.coords.x - drag.start_x;
+                    let dy = event.coords.y - drag.start_y;
+                    drag.active |= dx * dx + dy * dy >= 36;
+                    if drag.active {
+                        if inside && event.coords.y < ROW_HEIGHT_PX as isize {
+                            invalidate |= self.tab_sidebar_scroll(-1);
+                        } else if inside
+                            && event.coords.y
+                                > self.dimensions.pixel_height.saturating_sub(ROW_HEIGHT_PX)
+                                    as isize
+                        {
+                            invalidate |= self.tab_sidebar_scroll(1);
+                        }
+                        let target = self.sidebar_drop_target(drag.tab_id, event);
+                        invalidate |= drag.target != target;
+                        drag.target = target;
+                    }
+                    self.tab_sidebar.drag = Some(drag);
+                }
+                let hovered = if inside {
+                    self.sidebar_hover_at(event)
+                } else {
+                    None
+                };
+                invalidate |= self.tab_sidebar.hovered != hovered;
+                self.tab_sidebar.hovered = hovered;
+            }
+            MouseEventKind::Release(MousePress::Left) => {
+                if let Some(drag) = self.tab_sidebar.drag.take() {
+                    if drag.active {
+                        if let Some(target) = drag.target {
+                            self.reorder_sidebar_tab(drag.tab_id, target);
+                        }
+                    } else {
+                        self.activate_sidebar_tab(drag.tab_id);
+                    }
+                    invalidate = true;
+                }
+            }
+            _ => {}
+        }
+
+        let interactive =
+            self.tab_sidebar.drag.is_some() || matches!(self.tab_sidebar.hovered, Some(_));
+        context.set_cursor(Some(if interactive {
+            MouseCursor::Hand
+        } else {
+            MouseCursor::Arrow
+        }));
+        if invalidate {
+            context.invalidate();
+        }
         true
     }
 }
@@ -280,10 +509,31 @@ fn entry_groups(entry: &SidebarEntry) -> Vec<SidebarGroup> {
     }).collect()
 }
 
+fn same_drop_scope(source: &SidebarEntry, target: &SidebarEntry) -> bool {
+    source.controller_pane_id == target.controller_pane_id
+        && same_group_path(&source.groups, &target.groups)
+}
+
+fn same_group_path(source: &[SidebarGroup], target: &[SidebarGroup]) -> bool {
+    match (source.is_empty(), target.is_empty()) {
+        (true, true) => true,
+        (true, false) => target.len() == 1 && target[0].key == "@local",
+        (false, true) => source.len() == 1 && source[0].key == "@local",
+        (false, false) => {
+            source.len() == target.len()
+                && source
+                    .iter()
+                    .zip(target)
+                    .all(|(source, target)| source.key == target.key)
+        }
+    }
+}
+
 fn native_entries(tabs: &[TabInformation]) -> Vec<SidebarEntry> {
     tabs.iter()
         .map(|tab| SidebarEntry {
             tab_id: tab.tab_id,
+            controller_pane_id: tab.panes.iter().find_map(|pane| pane.controller_pane_id),
             title: if tab.tab_title.is_empty() {
                 tab.active_pane
                     .as_ref()
@@ -369,6 +619,7 @@ fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResu
                 tab_id,
                 SidebarEntry {
                     tab_id,
+                    controller_pane_id: None,
                     title,
                     right,
                     status_glyph,
@@ -523,5 +774,29 @@ mod tests {
         assert_eq!(items[0].y, 0);
         assert_eq!(items[0].height, ROW_HEIGHT_PX);
         assert_eq!(max_scroll_rows(5, ROW_HEIGHT_PX, ROW_HEIGHT_PX), 4);
+    }
+
+    #[test]
+    fn drop_scope_requires_the_same_leaf_group_and_controller() {
+        let mut source = entry(1, &["remote", "project-a"]);
+        source.controller_pane_id = Some(10);
+        let mut target = entry(2, &["remote", "project-a"]);
+        target.controller_pane_id = Some(10);
+        assert!(same_drop_scope(&source, &target));
+
+        target.controller_pane_id = Some(11);
+        assert!(!same_drop_scope(&source, &target));
+
+        target.controller_pane_id = Some(10);
+        target.groups[1].key = "project-b".to_string();
+        assert!(!same_drop_scope(&source, &target));
+
+        target.groups[1].key = "project-a".to_string();
+        target.groups[0].key = "other-remote".to_string();
+        assert!(!same_drop_scope(&source, &target));
+
+        let implicit_local = entry(3, &[]);
+        let explicit_local = entry(4, &["@local"]);
+        assert!(same_drop_scope(&implicit_local, &explicit_local));
     }
 }
