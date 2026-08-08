@@ -1538,6 +1538,7 @@ impl TermWindow {
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
         if self.is_pane_visible(pane_id) {
+            self.sidebar_only_repaint = false;
             if let Some(ref win) = self.window {
                 win.invalidate();
             }
@@ -1716,12 +1717,21 @@ impl TermWindow {
             return;
         };
         let pane = MuxPane(pane.pane_id());
+        let os_window = self.window.clone();
         promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| async move {
             let Some(lua) = lua else { return Ok(()) };
             let payload = luahelper::dynamic_to_lua_value(&lua, action)?;
             let args = lua.pack_multi((window, pane, payload))?;
             if let Err(err) = config::lua::emit_event(&lua, ("sidebar-action".to_string(), args)).await {
                 log::error!("while processing sidebar-action event: {err:#}");
+            }
+            // The handler most likely changed state the tree is built from
+            // (collapse, filter), so rebuild now instead of waiting for the
+            // next refresh tick.
+            if let Some(os_window) = os_window {
+                os_window.notify(TermWindowNotif::Apply(Box::new(|term| {
+                    term.mark_tab_sidebar_dirty();
+                })));
             }
             Ok(())
         }))

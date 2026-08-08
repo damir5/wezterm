@@ -235,7 +235,9 @@ impl crate::TermWindow {
                 if self.tab_sidebar.ui_layout_size != Some(size)
                     || self.tab_sidebar.ui_target_layout.is_none()
                 {
+                    let ctx = crate::termwindow::sidebar_ui::context(&mut self.egui_ctx);
                     let target = match crate::termwindow::sidebar_ui::layout(
+                        &ctx,
                         &root,
                         size.0 as f32 / pixels_per_point,
                         size.1 as f32 / pixels_per_point,

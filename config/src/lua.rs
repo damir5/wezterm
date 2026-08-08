@@ -123,6 +123,17 @@ return {
   summary = function(value) return copy('summary', value) end,
   group = function(value) return copy('group', value) end,
   subgroup = function(value) return copy('subgroup', value) end,
+  shape = function(kind, style)
+    local node
+    if type(kind) == 'table' then
+      node = copy('shape', kind)
+    else
+      node = copy('shape', style)
+      node.shape = kind
+    end
+    node.children = {}
+    return node
+  end,
   text = text,
   image = image,
   icon = icon,

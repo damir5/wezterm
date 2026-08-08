@@ -28,8 +28,55 @@ pub enum Background {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiAnimation {
-    Spin { frames: Vec<String>, fps: f32 },
-    Pulse { period: f32, min: f32, max: f32 },
+    Spin {
+        frames: Vec<String>,
+        fps: f32,
+    },
+    /// Opacity (and optionally height) breathing, used for the urgency capsule
+    /// and the u2 row ring.
+    Pulse {
+        period: f32,
+        min: f32,
+        max: f32,
+        scale_min: Option<f32>,
+    },
+    /// Continuous rotation, used by the running spinner. Vector only.
+    Rotate {
+        period: f32,
+    },
+}
+
+/// Cross-axis alignment. Mirrors the subset of flexbox the sidebar needs; the
+/// taffy default is Stretch, which is why every badge used to fill its row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Align {
+    Stretch,
+    Start,
+    Center,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// Vector marks. Deliberately not font glyphs: the activity and harness marks
+/// are shape language, and a rotating arc cannot be expressed as a codepoint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShapeKind {
+    Ring,
+    Arc,
+    Bars,
+    Cross,
+    Dot,
+    Triangle,
+    Hexagon,
+    Asterisk,
+    Chevron,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -53,8 +100,26 @@ pub struct UiStyle {
     pub color: Option<[u8; 4]>,
     pub font_size: Option<f32>,
     pub font_family: Option<String>,
+    pub font_weight: Option<f32>,
+    pub letter_spacing: f32,
+    pub text_align: TextAlign,
     pub animation: Option<UiAnimation>,
     pub row: bool,
+    pub gap: f32,
+    pub align_items: Option<Align>,
+    pub align_self: Option<Align>,
+    pub absolute: bool,
+    pub inset_left: Option<f32>,
+    pub inset_right: Option<f32>,
+    pub inset_top: Option<f32>,
+    pub inset_bottom: Option<f32>,
+    pub shape: Option<ShapeKind>,
+    pub stroke_width: Option<f32>,
+    pub track_color: Option<[u8; 4]>,
+    pub fill: bool,
+    pub rotation: f32,
+    pub glow: bool,
+    pub wrap: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -250,6 +315,55 @@ fn event(table: &Table, name: &str) -> anyhow::Result<Option<DynamicValue>> {
     }
 }
 
+fn align(table: &Table, name: &str) -> anyhow::Result<Option<Align>> {
+    Ok(match table.get::<_, Option<String>>(name)?.as_deref() {
+        None => None,
+        Some("stretch") => Some(Align::Stretch),
+        Some("start") | Some("flex-start") => Some(Align::Start),
+        Some("center") => Some(Align::Center),
+        Some("end") | Some("flex-end") => Some(Align::End),
+        Some(other) => bail!("{name} must be stretch, start, center or end, not {other:?}"),
+    })
+}
+
+fn text_align(table: &Table) -> anyhow::Result<TextAlign> {
+    Ok(match table.get::<_, Option<String>>("text_align")?.as_deref() {
+        None | Some("left") => TextAlign::Left,
+        Some("center") => TextAlign::Center,
+        Some("right") => TextAlign::Right,
+        Some(other) => bail!("text_align must be left, center or right, not {other:?}"),
+    })
+}
+
+fn shape_kind(table: &Table) -> anyhow::Result<Option<ShapeKind>> {
+    Ok(match table.get::<_, Option<String>>("shape")?.as_deref() {
+        None => None,
+        Some("ring") => Some(ShapeKind::Ring),
+        Some("arc") => Some(ShapeKind::Arc),
+        Some("bars") => Some(ShapeKind::Bars),
+        Some("cross") => Some(ShapeKind::Cross),
+        Some("dot") => Some(ShapeKind::Dot),
+        Some("triangle") => Some(ShapeKind::Triangle),
+        Some("hexagon") => Some(ShapeKind::Hexagon),
+        Some("asterisk") => Some(ShapeKind::Asterisk),
+        Some("chevron") => Some(ShapeKind::Chevron),
+        Some(other) => bail!("unknown shape {other:?}"),
+    })
+}
+
+fn font_weight(table: &Table) -> anyhow::Result<Option<f32>> {
+    match table.get::<_, Value>("font_weight")? {
+        Value::Nil => Ok(None),
+        Value::String(value) => Ok(Some(match value.to_str()?.as_ref() {
+            "regular" | "normal" => 400.0,
+            "medium" => 500.0,
+            "semibold" | "bold" => 700.0,
+            other => bail!("font_weight must be a number or regular/medium/bold, not {other:?}"),
+        })),
+        value => Ok(Some(number(value, "font_weight")?)),
+    }
+}
+
 fn animation(table: &Table) -> anyhow::Result<Option<UiAnimation>> {
     let Value::Table(value) = table.get::<_, Value>("animation")? else {
         return Ok(None);
@@ -281,8 +395,17 @@ fn animation(table: &Table) -> anyhow::Result<Option<UiAnimation>> {
                 .get::<_, Option<f32>>("max")?
                 .unwrap_or(1.0)
                 .clamp(0.0, 1.0),
+            scale_min: value
+                .get::<_, Option<f32>>("scale_min")?
+                .map(|scale| scale.clamp(0.05, 1.0)),
         })),
-        _ => bail!("animation.type must be spin or pulse"),
+        "rotate" => Ok(Some(UiAnimation::Rotate {
+            period: value
+                .get::<_, Option<f32>>("period")?
+                .unwrap_or(1.15)
+                .max(0.05),
+        })),
+        _ => bail!("animation.type must be spin, pulse or rotate"),
     }
 }
 
@@ -314,7 +437,25 @@ fn style(table: &Table, kind: &str) -> anyhow::Result<UiStyle> {
     style.color = optional_color(table, "color")?;
     style.font_size = optional_number(table, "font_size")?;
     style.font_family = table.get::<_, Option<String>>("font_family")?;
+    style.font_weight = font_weight(table)?;
+    style.letter_spacing = optional_number(table, "letter_spacing")?.unwrap_or(0.0);
+    style.text_align = text_align(table)?;
     style.animation = animation(table)?;
+    style.gap = optional_number(table, "gap")?.unwrap_or(0.0).max(0.0);
+    style.align_items = align(table, "align_items")?;
+    style.align_self = align(table, "align_self")?;
+    style.absolute = table.get::<_, Option<String>>("position")?.as_deref() == Some("absolute");
+    style.inset_left = optional_number(table, "left")?;
+    style.inset_right = optional_number(table, "right")?;
+    style.inset_top = optional_number(table, "top")?;
+    style.inset_bottom = optional_number(table, "bottom")?;
+    style.shape = shape_kind(table)?;
+    style.stroke_width = optional_number(table, "stroke_width")?;
+    style.track_color = optional_color(table, "track_color")?;
+    style.fill = table.get::<_, Option<bool>>("fill")?.unwrap_or(false);
+    style.rotation = optional_number(table, "rotation")?.unwrap_or(0.0);
+    style.glow = table.get::<_, Option<bool>>("glow")?.unwrap_or(false);
+    style.wrap = table.get::<_, Option<String>>("flex_wrap")?.as_deref() == Some("wrap");
     style.row = table
         .get::<_, Option<String>>("flex_direction")?
         .map(|direction| direction == "row")
@@ -327,8 +468,8 @@ fn decode_node(lua: &mlua::Lua, table: Table, path: &str) -> anyhow::Result<UiNo
         .get::<_, Option<String>>("type")?
         .unwrap_or_else(|| "box".into());
     match kind.as_str() {
-        "box" | "row" | "column" | "scroll" | "text" | "image" | "icon" | "summary" | "group"
-        | "subgroup" => {}
+        "box" | "row" | "column" | "scroll" | "text" | "image" | "icon" | "shape" | "summary"
+        | "group" | "subgroup" => {}
         _ => bail!("unknown sidebar UI node type {kind:?}"),
     }
     let id = table
@@ -384,10 +525,58 @@ fn dimension(value: Option<f32>) -> Dimension {
     value.map(Dimension::from_length).unwrap_or(Dimension::AUTO)
 }
 
+fn taffy_align(align: Option<Align>) -> Option<AlignItems> {
+    align.map(|align| match align {
+        Align::Stretch => AlignItems::Stretch,
+        Align::Start => AlignItems::FlexStart,
+        Align::Center => AlignItems::Center,
+        Align::End => AlignItems::FlexEnd,
+    })
+}
+
 fn taffy_style(node: &UiNode) -> Style {
     let style = &node.style;
     Style {
         display: Display::Flex,
+        position: if style.absolute {
+            Position::Absolute
+        } else {
+            Position::Relative
+        },
+        inset: TaffyRect {
+            left: style
+                .inset_left
+                .map(LengthPercentageAuto::from_length)
+                .unwrap_or(LengthPercentageAuto::AUTO),
+            right: style
+                .inset_right
+                .map(LengthPercentageAuto::from_length)
+                .unwrap_or(LengthPercentageAuto::AUTO),
+            top: style
+                .inset_top
+                .map(LengthPercentageAuto::from_length)
+                .unwrap_or(LengthPercentageAuto::AUTO),
+            bottom: style
+                .inset_bottom
+                .map(LengthPercentageAuto::from_length)
+                .unwrap_or(LengthPercentageAuto::AUTO),
+        },
+        gap: Size {
+            width: LengthPercentage::from_length(if style.row { style.gap } else { 0.0 }),
+            // A wrapping row needs the same gap between its lines.
+            height: LengthPercentage::from_length(if style.row && !style.wrap {
+                0.0
+            } else {
+                style.gap
+            }),
+        },
+        flex_wrap: if style.wrap {
+            FlexWrap::Wrap
+        } else {
+            FlexWrap::NoWrap
+        },
+        align_items: taffy_align(style.align_items),
+        align_self: taffy_align(style.align_self),
         flex_direction: if style.row {
             FlexDirection::Row
         } else {
@@ -432,24 +621,61 @@ fn taffy_style(node: &UiNode) -> Style {
     }
 }
 
-fn measure(node: &UiNode) -> Measure {
-    let size = node.style.font_size.unwrap_or(13.0);
-    let width = match node.kind.as_str() {
-        "image" | "icon" => node.style.width.unwrap_or(size * 1.25),
-        "text" => node
-            .text
-            .as_deref()
-            .map(|text| text.chars().count() as f32 * size * 0.6)
-            .unwrap_or(0.0),
-        _ => 0.0,
+/// Lay a node's text out with the real font, so widths, right alignment and
+/// elision agree with what gets painted.
+fn galley(
+    ctx: &egui::Context,
+    style: &UiStyle,
+    text: &str,
+    max_width: f32,
+    color: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_string(),
+        egui::TextFormat {
+            font_id: font_id(style, style.font_size.unwrap_or(13.0)),
+            extra_letter_spacing: style.letter_spacing,
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
     };
-    Measure {
-        width,
-        height: node.style.height.unwrap_or(size * 1.35),
-    }
+    ctx.fonts(|fonts| fonts.layout_job(job))
+}
+
+fn measure(ctx: &egui::Context, node: &UiNode) -> Measure {
+    let size = node.style.font_size.unwrap_or(13.0);
+    let text = node.text.as_deref().filter(|text| !text.is_empty());
+    let measured = match node.kind.as_str() {
+        "image" | "icon" | "shape" => Measure {
+            width: node.style.width.unwrap_or(size),
+            height: node.style.height.unwrap_or(size),
+        },
+        "text" => {
+            let galley = text
+                .map(|text| galley(ctx, &node.style, text, f32::INFINITY, egui::Color32::WHITE));
+            Measure {
+                width: galley.as_ref().map(|galley| galley.size().x).unwrap_or(0.0)
+                    + node.style.padding.left
+                    + node.style.padding.right,
+                height: node.style.height.unwrap_or(size * 1.35),
+            }
+        }
+        _ => Measure {
+            width: 0.0,
+            height: node.style.height.unwrap_or(size * 1.35),
+        },
+    };
+    measured
 }
 
 fn add_to_tree(
+    ctx: &egui::Context,
     node: &UiNode,
     taffy: &mut TaffyTree<Measure>,
     nodes: &mut HashMap<NodeId, UiNode>,
@@ -457,10 +683,10 @@ fn add_to_tree(
     let children = node
         .children
         .iter()
-        .map(|child| add_to_tree(child, taffy, nodes))
+        .map(|child| add_to_tree(ctx, child, taffy, nodes))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let id = if children.is_empty() {
-        taffy.new_leaf_with_context(taffy_style(node), measure(node))?
+        taffy.new_leaf_with_context(taffy_style(node), measure(ctx, node))?
     } else {
         taffy.new_with_children(taffy_style(node), &children)?
     };
@@ -525,23 +751,45 @@ fn walk(
     Ok(())
 }
 
-pub fn layout(root: &UiNode, width: f32, height: f32) -> anyhow::Result<UiLayout> {
+pub fn layout(
+    ctx: &egui::Context,
+    root: &UiNode,
+    width: f32,
+    height: f32,
+) -> anyhow::Result<UiLayout> {
     let mut taffy = TaffyTree::<Measure>::new();
     let mut nodes = HashMap::new();
-    let root_id = add_to_tree(root, &mut taffy, &mut nodes)?;
+    let root_id = add_to_tree(ctx, root, &mut taffy, &mut nodes)?;
+    // The sidebar is a fixed viewport, not a shrink-to-fit box. Without this the
+    // root sizes to max-content and every row is laid out wider than the panel.
+    let mut root_style = taffy.style(root_id)?.clone();
+    root_style.size = Size {
+        width: Dimension::length(width),
+        height: Dimension::length(height),
+    };
+    taffy.set_style(root_id, root_style)?;
     taffy.compute_layout_with_measure(
         root_id,
         Size {
             width: AvailableSpace::Definite(width),
             height: AvailableSpace::Definite(height),
         },
-        |known, _available, _node_id, context, _style| {
+        |known, available, _node_id, context, _style| {
             let measured = context.as_deref().copied().unwrap_or(Measure {
                 width: 0.0,
                 height: 0.0,
             });
+            // Text ellipsizes rather than forcing its row wider, so its
+            // min-content width is zero: the CSS the mockup relies on is
+            // `min-width:0` plus `text-overflow:ellipsis`. Anything that needs
+            // a floor asks for it with min_width.
+            let width = known.width.unwrap_or(match available.width {
+                AvailableSpace::Definite(space) => measured.width.min(space),
+                AvailableSpace::MinContent => 0.0,
+                AvailableSpace::MaxContent => measured.width,
+            });
             Size {
-                width: known.width.unwrap_or(measured.width),
+                width,
                 height: known.height.unwrap_or(measured.height),
             }
         },
@@ -597,7 +845,9 @@ pub fn animation_frame_delay(layout: &UiLayout) -> Option<Duration> {
                 .animation
                 .as_ref()
                 .map(|animation| match animation {
-                    UiAnimation::Pulse { .. } => Duration::from_millis(16),
+                    UiAnimation::Pulse { .. } | UiAnimation::Rotate { .. } => {
+                        Duration::from_millis(16)
+                    }
                     UiAnimation::Spin { fps, frames } if !frames.is_empty() => {
                         Duration::from_secs_f32(1.0 / *fps)
                     }
@@ -645,6 +895,132 @@ pub fn ui_items_for_layout(
         .collect()
 }
 
+/// Draw one vector mark centred in `rect`. `turn` is a full-turn fraction, so a
+/// rotating spinner is just `time / period`.
+fn paint_shape(
+    painter: &egui::Painter,
+    kind: ShapeKind,
+    rect: egui::Rect,
+    color: egui::Color32,
+    track: Option<egui::Color32>,
+    stroke_width: f32,
+    turn: f32,
+    fill: bool,
+) {
+    let size = rect.width().min(rect.height());
+    if size <= 0.0 {
+        return;
+    }
+    let center = rect.center();
+    let width = if stroke_width > 0.0 {
+        stroke_width
+    } else {
+        (size * 0.14).max(1.0)
+    };
+    let stroke = egui::Stroke::new(width, color);
+    let radius = size * 0.5 - width * 0.5;
+    let angle = turn * std::f32::consts::TAU;
+    let point = |distance: f32, at: f32| {
+        let at = at + angle;
+        center + egui::vec2(at.cos() * distance, at.sin() * distance)
+    };
+    let polygon = |sides: usize, start: f32| {
+        (0..sides)
+            .map(|index| {
+                point(
+                    radius,
+                    start + index as f32 / sides as f32 * std::f32::consts::TAU,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    match kind {
+        ShapeKind::Ring => {
+            painter.circle_stroke(center, radius, stroke);
+        }
+        ShapeKind::Arc => {
+            if let Some(track) = track {
+                painter.circle_stroke(center, radius, egui::Stroke::new(width, track));
+            }
+            // A quarter turn of bright arc over the dim track reads as
+            // indeterminate progress at 12px in a way a full ring cannot.
+            let steps = 12;
+            let points = (0..=steps)
+                .map(|index| {
+                    point(
+                        radius,
+                        index as f32 / steps as f32 * std::f32::consts::FRAC_PI_2
+                            - std::f32::consts::FRAC_PI_2,
+                    )
+                })
+                .collect::<Vec<_>>();
+            painter.add(egui::Shape::line(
+                points,
+                egui::Stroke::new(width, color),
+            ));
+        }
+        ShapeKind::Bars => {
+            let bar = egui::vec2(size * 0.2, size * 0.64);
+            let offset = size * 0.18;
+            for side in [-offset, offset] {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(center + egui::vec2(side, 0.0), bar),
+                    bar.x * 0.5,
+                    color,
+                );
+            }
+        }
+        ShapeKind::Cross => {
+            let arm = size * 0.31;
+            for base in [std::f32::consts::FRAC_PI_4, -std::f32::consts::FRAC_PI_4] {
+                painter.add(egui::Shape::line_segment(
+                    [point(arm, base), point(arm, base + std::f32::consts::PI)],
+                    stroke,
+                ));
+            }
+        }
+        ShapeKind::Dot => {
+            let radius = size * 0.26;
+            if fill {
+                painter.circle_filled(center, radius, color);
+            } else {
+                painter.circle_stroke(center, radius, stroke);
+            }
+        }
+        ShapeKind::Triangle | ShapeKind::Hexagon => {
+            let sides = if kind == ShapeKind::Triangle { 3 } else { 6 };
+            let points = polygon(sides, -std::f32::consts::FRAC_PI_2);
+            painter.add(if fill {
+                egui::Shape::convex_polygon(points, color, egui::Stroke::NONE)
+            } else {
+                egui::Shape::closed_line(points, stroke)
+            });
+        }
+        ShapeKind::Asterisk => {
+            let arm = size * 0.42;
+            for index in 0..3 {
+                let base = index as f32 / 3.0 * std::f32::consts::PI;
+                painter.add(egui::Shape::line_segment(
+                    [point(arm, base), point(arm, base + std::f32::consts::PI)],
+                    stroke,
+                ));
+            }
+        }
+        ShapeKind::Chevron => {
+            let arm = size * 0.34;
+            let tip = point(arm, 0.0);
+            painter.add(egui::Shape::line(
+                vec![
+                    point(arm, -std::f32::consts::FRAC_PI_2 - 0.6),
+                    tip,
+                    point(arm, std::f32::consts::FRAC_PI_2 + 0.6),
+                ],
+                stroke,
+            ));
+        }
+    }
+}
+
 pub fn paint(
     painter: &egui::Painter,
     ctx: &egui::Context,
@@ -666,26 +1042,52 @@ pub fn paint(
         let Some(visible) = visible else {
             continue;
         };
-        let rect = egui::Rect::from_min_size(
+        let mut rect = egui::Rect::from_min_size(
             egui::pos2(visible.x, visible.y),
             egui::vec2(visible.width, visible.height),
         );
+        let clip_to = node
+            .clip_rect
+            .map(|clip| {
+                egui::Rect::from_min_size(
+                    egui::pos2(clip.x, clip.y),
+                    egui::vec2(clip.width, clip.height),
+                )
+            })
+            .unwrap_or(egui::Rect::EVERYTHING);
         let background = if hovered == Some(node.id.as_str()) {
             node.style.hover_background.or(node.style.background)
         } else {
             node.style.background
         };
+        let mut phase = 0.0_f32;
         let pulse = node
             .style
             .animation
             .as_ref()
             .and_then(|animation| match animation {
-                UiAnimation::Pulse { period, min, max } => {
-                    let phase = (time as f32 % period) / period;
-                    let eased = (phase * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+                UiAnimation::Pulse {
+                    period,
+                    min,
+                    max,
+                    scale_min,
+                } => {
+                    let progress = (time as f32 % period) / period;
+                    let eased = (progress * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+                    phase = eased;
+                    if let Some(scale_min) = scale_min {
+                        // The urgency capsule breathes in height as well as
+                        // opacity, matching the mockup's scaleY.
+                        let scale = scale_min + (1.0 - scale_min) * eased;
+                        let height = rect.height() * scale;
+                        rect = egui::Rect::from_center_size(
+                            rect.center(),
+                            egui::vec2(rect.width(), height),
+                        );
+                    }
                     Some(min + (max - min) * eased)
                 }
-                UiAnimation::Spin { .. } => None,
+                UiAnimation::Spin { .. } | UiAnimation::Rotate { .. } => None,
             });
         if let Some(background) = background {
             match background {
@@ -759,13 +1161,54 @@ pub fn paint(
             }
         }
         if let Some(color) = node.style.border_color {
-            let stroke = egui::Stroke::new(node.style.border_width.left.max(1.0), color32(color));
+            let color = pulse
+                .map(|amount| color32(color).gamma_multiply(amount))
+                .unwrap_or_else(|| color32(color));
+            let stroke = egui::Stroke::new(node.style.border_width.left.max(1.0), color);
             painter.rect_stroke(
                 rect,
                 node.style.border_radius,
                 stroke,
                 egui::StrokeKind::Inside,
             );
+            if node.style.glow {
+                // Three fading strokes stand in for a blurred outer shadow; a
+                // real blur would cost a render target for two pixels of light.
+                for step in 1..=3 {
+                    let grow = step as f32 * 1.6;
+                    painter.rect_stroke(
+                        rect.expand(grow),
+                        node.style.border_radius + grow,
+                        egui::Stroke::new(
+                            1.0_f32,
+                            color.gamma_multiply(0.30 * phase / step as f32),
+                        ),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
+        }
+
+        if node.kind == "shape" {
+            if let Some(shape) = node.style.shape {
+                let turn = match &node.style.animation {
+                    Some(UiAnimation::Rotate { period }) => (time as f32 % period) / period,
+                    _ => 0.0,
+                } + node.style.rotation / 360.0;
+                let color = color32(node.style.color.unwrap_or([235, 235, 240, 255]))
+                    .gamma_multiply(pulse.unwrap_or(1.0));
+                paint_shape(
+                    &painter.with_clip_rect(clip_to),
+                    shape,
+                    rect,
+                    color,
+                    node.style.track_color.map(color32),
+                    node.style.stroke_width.unwrap_or(0.0),
+                    turn,
+                    node.style.fill,
+                );
+            }
+            continue;
         }
 
         if node.kind == "image" {
@@ -812,14 +1255,21 @@ pub fn paint(
             (_, text) => text,
         };
         if let Some(text) = text.filter(|text| !text.is_empty()) {
-            let font_size = node.style.font_size.unwrap_or(13.0);
             let color = color32(node.style.color.unwrap_or([235, 235, 240, 255]))
                 .gamma_multiply(pulse.unwrap_or(1.0));
-            painter.text(
-                rect.left_center() + egui::vec2(node.style.padding.left, 0.0),
-                egui::Align2::LEFT_CENTER,
-                text,
-                font_id(&node.style, font_size),
+            let inner = egui::Rect::from_min_max(
+                rect.left_top() + egui::vec2(node.style.padding.left, 0.0),
+                rect.right_bottom() - egui::vec2(node.style.padding.right, 0.0),
+            );
+            let galley = galley(ctx, &node.style, text, inner.width().max(0.0), color);
+            let x = match node.style.text_align {
+                TextAlign::Left => inner.left(),
+                TextAlign::Center => inner.center().x - galley.size().x * 0.5,
+                TextAlign::Right => inner.right() - galley.size().x,
+            };
+            painter.with_clip_rect(clip_to.intersect(rect)).galley(
+                egui::pos2(x, inner.center().y - galley.size().y * 0.5),
+                galley,
                 color,
             );
         }
@@ -830,18 +1280,105 @@ fn color32(color: [u8; 4]) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3])
 }
 
+/// Map family plus numeric weight onto the families registered in
+/// `register_egui_fonts`. Weight is a separate face, not a synthetic bold.
 fn font_id(style: &UiStyle, size: f32) -> egui::FontId {
+    let weight = style.font_weight.unwrap_or(400.0);
     let family = match style.font_family.as_deref() {
-        Some("monospace") => egui::FontFamily::Monospace,
-        Some("proportional") | None => egui::FontFamily::Proportional,
+        Some("monospace") => {
+            if weight >= 600.0 {
+                egui::FontFamily::Name("mono-bold".into())
+            } else {
+                egui::FontFamily::Monospace
+            }
+        }
+        Some("proportional") | None => {
+            if weight >= 600.0 {
+                egui::FontFamily::Name("bold".into())
+            } else if weight >= 500.0 {
+                egui::FontFamily::Name("medium".into())
+            } else {
+                egui::FontFamily::Proportional
+            }
+        }
         Some(name) => egui::FontFamily::Name(name.to_owned().into()),
     };
     egui::FontId::new(size, family)
 }
 
+/// Register the sidebar's font families. Proportional is a UI sans in three
+/// weights; monospace is only for hosts, worktrees and progress counters.
+pub fn register_fonts(ctx: &egui::Context) {
+    use std::sync::Arc;
+
+    let mut fonts = egui::FontDefinitions::default();
+    let mut add = |name: &str, bytes: &'static [u8]| {
+        fonts.font_data.insert(
+            name.to_string(),
+            Arc::new(egui::FontData::from_static(bytes)),
+        );
+    };
+    add(
+        "Roboto",
+        include_bytes!("../../../assets/fonts/Roboto-Regular.ttf"),
+    );
+    add(
+        "Roboto-Medium",
+        include_bytes!("../../../assets/fonts/Roboto-Medium.ttf"),
+    );
+    add(
+        "Roboto-Bold",
+        include_bytes!("../../../assets/fonts/Roboto-Bold.ttf"),
+    );
+    add(
+        "JetBrainsMono",
+        include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf"),
+    );
+    add(
+        "JetBrainsMono-Bold",
+        include_bytes!("../../../assets/fonts/JetBrainsMono-Bold.ttf"),
+    );
+
+    for (family, faces) in [
+        (egui::FontFamily::Proportional, vec!["Roboto"]),
+        (egui::FontFamily::Name("medium".into()), vec!["Roboto-Medium"]),
+        (egui::FontFamily::Name("bold".into()), vec!["Roboto-Bold"]),
+        (egui::FontFamily::Monospace, vec!["JetBrainsMono"]),
+        (
+            egui::FontFamily::Name("mono-bold".into()),
+            vec!["JetBrainsMono-Bold"],
+        ),
+    ] {
+        let entry = fonts.families.entry(family).or_insert_with(Vec::new);
+        for (index, face) in faces.into_iter().enumerate() {
+            entry.insert(index, face.to_string());
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+/// The layout pass needs the same fonts the paint pass uses, so both share one
+/// context created on first use.
+pub fn context(slot: &mut Option<egui::Context>) -> egui::Context {
+    if slot.is_none() {
+        let ctx = egui::Context::default();
+        register_fonts(&ctx);
+        // Fonts are only realised by a pass, and the layout pass runs before
+        // the first paint pass, so prime it here.
+        let _ = ctx.run(Default::default(), |_| {});
+        *slot = Some(ctx);
+    }
+    slot.as_ref().unwrap().clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_context() -> egui::Context {
+        context(&mut None)
+    }
 
     #[test]
     fn flex_layout_respects_padding_and_direction() {
@@ -860,7 +1397,7 @@ return { type = 'row', width = 100, height = 40, padding = 10,
             .eval::<Value>()
             .unwrap();
         let root = decode(root, &lua).unwrap().unwrap();
-        let layout = layout(&root, 100.0, 40.0).unwrap();
+        let layout = layout(&test_context(), &root, 100.0, 40.0).unwrap();
         assert_eq!(layout.nodes[1].rect.x, 10.0);
         assert_eq!(layout.nodes[2].rect.x, 30.0);
         assert_eq!(layout.nodes[1].rect.y, 10.0);
@@ -895,7 +1432,7 @@ return { type = 'row', width = 100, height = 40, padding = 10,
             on_click: None,
             on_hover: None,
         };
-        let layout = layout(&root, 20.0, 20.0).unwrap();
+        let layout = layout(&test_context(), &root, 20.0, 20.0).unwrap();
         assert_eq!(layout.hit_test_scrolled(1.0, 1.0, 0.0).unwrap().id, "child");
     }
 
@@ -915,7 +1452,7 @@ return { type = 'scroll', width = 100, height = 40, children = {
             .eval::<Value>()
             .unwrap();
         let root = decode(root, &lua).unwrap().unwrap();
-        let layout = layout(&root, 100.0, 40.0).unwrap();
+        let layout = layout(&test_context(), &root, 100.0, 40.0).unwrap();
         assert!(layout.scroll_max > 0.0);
         let delay = animation_frame_delay(&layout).unwrap();
         assert!(delay > Duration::from_millis(100));
