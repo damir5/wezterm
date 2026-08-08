@@ -72,6 +72,74 @@ pub fn get_or_create_sub_module<'lua>(
     }
 }
 
+fn register_ui_module(lua: &Lua) -> anyhow::Result<()> {
+    let ui = get_or_create_sub_module(lua, "ui")?;
+    let constructors: Table = lua
+        .load(
+            r#"
+local function copy(kind, value)
+  local node = { type = kind }
+  if value == nil then
+    node.children = {}
+  elseif type(value) == 'table' then
+    local has_children = value.children ~= nil
+    for key, child in pairs(value) do node[key] = child end
+    if not has_children then node.children = value end
+  else
+    node.text = value
+  end
+  return node
+end
+
+local function text(value, style)
+  if type(value) == 'table' then return copy('text', value) end
+  local node = copy('text', style)
+  node.children = {}
+  node.text = value
+  return node
+end
+
+local function image(value, style)
+  if type(value) == 'table' then return copy('image', value) end
+  local node = copy('image', style)
+  node.children = {}
+  node.src = value
+  return node
+end
+
+local function icon(value, style)
+  if type(value) == 'table' then return copy('icon', value) end
+  local node = copy('icon', style)
+  node.children = {}
+  node.name = value
+  return node
+end
+
+return {
+  box = function(value) return copy('box', value) end,
+  row = function(value) return copy('row', value) end,
+  column = function(value) return copy('column', value) end,
+  scroll = function(value) return copy('scroll', value) end,
+  summary = function(value) return copy('summary', value) end,
+  group = function(value) return copy('group', value) end,
+  subgroup = function(value) return copy('subgroup', value) end,
+  text = text,
+  image = image,
+  icon = icon,
+}
+"#,
+        )
+        .eval()?;
+    for pair in constructors.pairs::<String, Value>() {
+        let (name, constructor) = pair?;
+        ui.set(name, constructor)?;
+    }
+    let package: Table = lua.globals().get("package")?;
+    let loaded: Table = package.get("loaded")?;
+    loaded.set("wezterm.ui", ui.clone())?;
+    Ok(())
+}
+
 fn config_builder_set_strict_mode<'lua>(
     _lua: &'lua Lua,
     (myself, strict): (Table, bool),
@@ -326,6 +394,7 @@ end
         wezterm_mod.set("target_triple", crate::wezterm_target_triple())?;
         wezterm_mod.set("version", crate::wezterm_version())?;
         wezterm_mod.set("home_dir", crate::HOME_DIR.to_str())?;
+        register_ui_module(&lua)?;
         wezterm_mod.set(
             "running_under_wsl",
             lua.create_function(|_, ()| Ok(crate::running_under_wsl()))?,
@@ -890,6 +959,26 @@ pub fn add_to_config_reload_watch_list<'lua>(
 mod test {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn ui_module_builds_retained_nodes() -> anyhow::Result<()> {
+        let lua = make_lua_context(Path::new("testing"))?;
+        let shape: Value = lua
+            .load(
+                r#"
+local ui = require 'wezterm.ui'
+return ui.column({ padding = 4, ui.text('hello'), ui.row({ ui.icon('dot') }) })
+"#,
+            )
+            .eval()?;
+        let Value::Table(shape) = shape else {
+            anyhow::bail!("ui node is not a table")
+        };
+        assert_eq!(shape.get::<_, String>("type")?, "column");
+        assert_eq!(shape.get::<_, i64>("padding")?, 4);
+        assert_eq!(shape.get::<_, Table>("children")?.raw_len(), 2);
+        Ok(())
+    }
 
     #[test]
     fn can_register_and_emit_multiple_events() -> anyhow::Result<()> {

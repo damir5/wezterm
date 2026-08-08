@@ -56,7 +56,7 @@ impl super::TermWindow {
             UIItemType::TabBar(_) => {
                 self.update_title_post_status();
             }
-            UIItemType::TabSidebar(_) | UIItemType::TabSidebarGroup(_)
+            UIItemType::TabSidebar(_) | UIItemType::TabSidebarGroup(_) | UIItemType::SidebarNode(_)
             | UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
@@ -68,7 +68,7 @@ impl super::TermWindow {
     fn enter_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
             UIItemType::TabBar(_) => {}
-            UIItemType::TabSidebar(_) | UIItemType::TabSidebarGroup(_)
+            UIItemType::TabSidebar(_) | UIItemType::TabSidebarGroup(_) | UIItemType::SidebarNode(_)
             | UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
@@ -409,6 +409,7 @@ impl super::TermWindow {
                     context.invalidate();
                 }
             }
+            UIItemType::SidebarNode(_) => {}
             UIItemType::AboveScrollThumb => {
                 self.mouse_event_above_scroll_thumb(item, pane, event, context);
             }
