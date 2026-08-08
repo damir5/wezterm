@@ -629,12 +629,8 @@ fn composite_tab_sidebar(
     encoder: &mut wgpu::CommandEncoder,
     images: &mut HashMap<String, egui::TextureHandle>,
 ) -> anyhow::Result<Vec<wgpu::CommandBuffer>> {
-    if egui_ctx.is_none() {
-        *egui_ctx = Some(egui::Context::default());
-        let ctx = egui_ctx.as_ref().unwrap();
-        register_egui_fonts(ctx);
-    }
-    let ctx = egui_ctx.as_ref().unwrap();
+    let ctx = sidebar_ui::context(egui_ctx);
+    let ctx = &ctx;
     if egui_renderer.is_none() {
         *egui_renderer = Some(egui_wgpu::Renderer::new(device, format, None, 1, false));
     }
@@ -729,44 +725,6 @@ fn composite_tab_sidebar(
     }
 
     Ok(user_cmd_bufs)
-}
-
-/// Register JetBrainsMono and SymbolsNerdFontMono into the egui context so
-/// Nerd Font / powerline glyphs render in the sidebar. Embeds the same vendored
-/// assets WezTerm uses for its terminal fonts (compile-time, no runtime fs).
-/// Called once when the egui context is first created.
-fn register_egui_fonts(ctx: &egui::Context) {
-    use std::sync::Arc;
-
-    let mut fonts = egui::FontDefinitions::default();
-
-    fonts.font_data.insert(
-        "JetBrainsMono".to_string(),
-        Arc::new(egui::FontData::from_owned(
-            include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf").to_vec(),
-        )),
-    );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_insert_with(Vec::new)
-            .insert(0, "JetBrainsMono".to_string());
-    }
-
-    fonts.font_data.insert(
-        "SymbolsNerdFontMono".to_string(),
-        Arc::new(egui::FontData::from_owned(
-            include_bytes!("../../../../assets/fonts/SymbolsNerdFontMono-Regular.ttf").to_vec(),
-        )),
-    );
-    fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_insert_with(Vec::new)
-        .push("SymbolsNerdFontMono".to_string());
-
-    ctx.set_fonts(fonts);
 }
 
 #[cfg(test)]
