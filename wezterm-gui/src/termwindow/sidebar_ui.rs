@@ -862,7 +862,11 @@ pub fn interpolate(from: Option<&UiLayout>, to: &UiLayout, progress: f32) -> UiL
         return layout;
     };
     for node in &mut layout.nodes {
-        let Some(previous) = from.nodes.iter().find(|item| item.id == node.id) else {
+        let Some(previous) = from.nodes.iter().find(|item| {
+            item.id == node.id
+                && item.on_click == node.on_click
+                && item.on_hover == node.on_hover
+        }) else {
             continue;
         };
         node.rect.x = previous.rect.x + (node.rect.x - previous.rect.x) * progress;
@@ -1545,6 +1549,36 @@ return { type = 'row', width = 100, height = 40, padding = 10,
         };
         assert!(layout.clickable_at(1.0, 1.0, 0.0).is_none());
         assert_eq!(layout.interactive_at(1.0, 1.0, 0.0).unwrap().id, "hover");
+    }
+
+    #[test]
+    fn interpolation_does_not_move_a_replaced_interactive_node() {
+        let node = |y, action: &str| LayoutNode {
+            id: "root.1".into(),
+            kind: "row".into(),
+            text: None,
+            image: None,
+            style: UiStyle::default(),
+            rect: Rect {
+                x: 0.0,
+                y,
+                width: 10.0,
+                height: 10.0,
+            },
+            scrollable: false,
+            clip_rect: None,
+            on_click: Some(DynamicValue::String(action.into())),
+            on_hover: None,
+        };
+        let from = UiLayout {
+            nodes: vec![node(0.0, "toggle-group")],
+            scroll_max: 0.0,
+        };
+        let to = UiLayout {
+            nodes: vec![node(100.0, "activate-tab")],
+            scroll_max: 0.0,
+        };
+        assert_eq!(interpolate(Some(&from), &to, 0.5).nodes[0].rect.y, 100.0);
     }
 
     #[test]
