@@ -27,7 +27,6 @@ pub enum AttachState {
 enum State {
     WaitForInitialGuard,
     Idle,
-    WaitingForResponse,
     Exit,
 }
 
@@ -63,11 +62,41 @@ pub(crate) struct TmuxTab {
 }
 
 pub(crate) type TmuxCmdQueue = VecDeque<Box<dyn TmuxCommand>>;
+
+fn take_pending_commands(
+    domain_id: DomainId,
+    pending: &mut TmuxCmdQueue,
+    awaiting_response: &mut TmuxCmdQueue,
+) -> String {
+    let mut output = String::new();
+    while let Some(command) = pending.pop_front() {
+        let encoded = command.get_command(domain_id);
+        if encoded.is_empty() {
+            continue;
+        }
+        output.push_str(&encoded);
+        awaiting_response.push_back(command);
+    }
+    output
+}
+
+fn take_response_command(
+    response: &Guarded,
+    awaiting_response: &mut TmuxCmdQueue,
+) -> Option<Box<dyn TmuxCommand>> {
+    if response.flags & 1 == 0 {
+        None
+    } else {
+        awaiting_response.pop_front()
+    }
+}
+
 pub(crate) struct TmuxDomainState {
     pub pane_id: PaneId,     // ID of the original pane
     pub domain_id: DomainId, // ID of TmuxDomain
     state: Mutex<State>,
     pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
+    response_queue: Mutex<TmuxCmdQueue>,
     pub gui_window: Mutex<Option<MuxWindowBuilder>>,
     pub gui_tabs: Mutex<HashMap<TmuxWindowId, TmuxTab>>,
     pub remote_panes: Mutex<HashMap<TmuxPaneId, RefTmuxRemotePane>>,
@@ -76,6 +105,60 @@ pub(crate) struct TmuxDomainState {
     pub attach_state: Mutex<AttachState>,
     pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tmux_commands::SendKeys;
+
+    fn guarded(flags: i64) -> Guarded {
+        Guarded {
+            error: false,
+            timestamp: 0,
+            number: 0,
+            flags,
+            output: String::new(),
+        }
+    }
+
+    #[test]
+    fn bursty_input_is_pipelined_in_one_dispatch() {
+        let mut pending: TmuxCmdQueue = VecDeque::from([
+            Box::new(SendKeys {
+                pane: 1,
+                keys: b"first".to_vec(),
+            }) as Box<dyn TmuxCommand>,
+            Box::new(SendKeys {
+                pane: 1,
+                keys: b"second".to_vec(),
+            }) as Box<dyn TmuxCommand>,
+        ]);
+        let mut awaiting_response = TmuxCmdQueue::new();
+
+        let encoded = take_pending_commands(0, &mut pending, &mut awaiting_response);
+
+        assert!(
+            pending.is_empty(),
+            "the whole input burst should be dispatched"
+        );
+        assert_eq!(awaiting_response.len(), 2);
+        assert_eq!(encoded.matches("send-keys").count(), 2);
+    }
+
+    #[test]
+    fn server_guard_does_not_consume_a_client_response() {
+        let mut awaiting_response: TmuxCmdQueue = VecDeque::from([Box::new(SendKeys {
+            pane: 1,
+            keys: b"input".to_vec(),
+        })
+            as Box<dyn TmuxCommand>]);
+
+        assert!(take_response_command(&guarded(0), &mut awaiting_response).is_none());
+        assert_eq!(awaiting_response.len(), 1);
+        assert!(take_response_command(&guarded(1), &mut awaiting_response).is_some());
+        assert!(awaiting_response.is_empty());
+    }
 }
 
 pub struct TmuxDomain {
@@ -93,11 +176,10 @@ impl TmuxDomainState {
                     State::WaitForInitialGuard => {
                         *self.state.lock() = State::Idle;
                     }
-                    State::WaitingForResponse => {
-                        let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                        if let Some(cmd) = cmd_queue.pop_front() {
+                    State::Idle => {
+                        let mut response_queue = self.response_queue.lock();
+                        if let Some(cmd) = take_response_command(response, &mut response_queue) {
                             let domain_id = self.domain_id;
-                            *self.state.lock() = State::Idle;
                             let resp = response.clone();
                             promise::spawn::spawn_into_main_thread(async move {
                                 if let Err(err) = cmd.process_result(domain_id, &resp) {
@@ -107,7 +189,6 @@ impl TmuxDomainState {
                             .detach();
                         }
                     }
-                    State::Idle => {}
                     State::Exit => {}
                 },
 
@@ -128,6 +209,7 @@ impl TmuxDomainState {
                     }
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
                     cmd_queue.clear();
+                    self.response_queue.lock().clear();
 
                     // Force to quit the tmux mode
                     let pane_id = self.pane_id;
@@ -234,27 +316,27 @@ impl TmuxDomainState {
         }
     }
 
-    /// send next command at the front of cmd_queue.
+    /// Send all queued commands without waiting for their guarded responses.
+    /// tmux returns client responses in command order, so response_queue keeps
+    /// the commands needed to process those responses later.
     /// must be called inside main thread
     fn send_next_command(&self) {
         if *self.state.lock() != State::Idle {
             return;
         }
         let mut cmd_queue = self.cmd_queue.as_ref().lock();
-        while let Some(first) = cmd_queue.front() {
-            let cmd = first.get_command(self.domain_id);
-            if cmd.is_empty() {
-                cmd_queue.pop_front();
-                continue;
-            }
-            log::debug!("sending cmd {:?}", cmd);
+        let mut response_queue = self.response_queue.lock();
+        let commands = take_pending_commands(self.domain_id, &mut cmd_queue, &mut response_queue);
+        drop(response_queue);
+        drop(cmd_queue);
+
+        if !commands.is_empty() {
+            log::debug!("sending tmux command batch {:?}", commands);
             let mux = Mux::get();
             if let Some(pane) = mux.get_pane(self.pane_id) {
                 let mut writer = pane.writer();
-                let _ = write!(writer, "{}", cmd);
+                let _ = write!(writer, "{}", commands);
             }
-            *self.state.lock() = State::WaitingForResponse;
-            break;
         }
     }
 
@@ -348,6 +430,7 @@ impl TmuxDomain {
             // parser,
             state: Mutex::new(State::WaitForInitialGuard),
             cmd_queue: Arc::new(Mutex::new(cmd_queue)),
+            response_queue: Mutex::new(VecDeque::new()),
             gui_window: Mutex::new(None),
             gui_tabs: Mutex::new(HashMap::default()),
             remote_panes: Mutex::new(HashMap::default()),
