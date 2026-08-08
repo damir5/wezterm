@@ -24,7 +24,7 @@ use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
 impl super::TermWindow {
-    fn activate_sidebar_tab(&mut self, tab_id: mux::tab::TabId) {
+    pub(super) fn activate_sidebar_tab(&mut self, tab_id: mux::tab::TabId) {
         // Keep the read guard in this scope. activate_tab takes the write
         // guard for the same mux window and would deadlock if both overlapped.
         let index = {
@@ -80,38 +80,7 @@ impl super::TermWindow {
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
 
-        // The sidebar is window chrome, not a terminal pane.  Resolve its
-        // stable hit rectangles before terminal mouse handling so activation
-        // happens in this event-loop turn.
-        if self.tab_sidebar_enabled
-            && event.coords.x >= 0
-            && (event.coords.x as usize) < self.tab_sidebar_width_pixels()
-        {
-            match event.kind {
-                WMEK::VertWheel(delta) => {
-                    if self.tab_sidebar_scroll((-delta).signum() as isize) {
-                        context.invalidate();
-                    }
-                }
-                WMEK::Press(MousePress::Left) => {
-                    match self.resolve_ui_item(&event).map(|item| item.item_type) {
-                        Some(UIItemType::TabSidebar(tab_id)) => {
-                            self.activate_sidebar_tab(tab_id);
-                        }
-                        Some(UIItemType::TabSidebarGroup(group)) => {
-                            if self.tab_sidebar.compact {
-                                self.expand_tab_sidebar_group(&group);
-                                self.config_was_reloaded();
-                            } else if !self.tab_sidebar.collapsed.insert(group.clone()) {
-                                self.tab_sidebar.collapsed.remove(&group);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-            context.invalidate();
+        if self.handle_tab_sidebar_mouse_event(&event, context) {
             return;
         }
 
@@ -301,6 +270,8 @@ impl super::TermWindow {
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
         self.current_mouse_event = None;
+        self.tab_sidebar.hovered = None;
+        self.tab_sidebar.drag = None;
         self.update_title();
         context.set_cursor(Some(CursorIcon::Default));
         context.invalidate();

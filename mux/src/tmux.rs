@@ -3,7 +3,7 @@ use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource}
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
-    ListAllPanes, ListAllWindows, ListCommands, NewWindow, SplitPane, TmuxCommand,
+    ListAllPanes, ListAllWindows, ListCommands, NewWindow, SplitPane, SwapWindow, TmuxCommand,
 };
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
@@ -91,6 +91,44 @@ fn take_response_command(
     }
 }
 
+fn adjacent_swap_targets<T: Copy + Eq>(
+    ordered: &[T],
+    source: T,
+    target: T,
+    before: bool,
+) -> Vec<T> {
+    let Some(source_index) = ordered.iter().position(|item| *item == source) else {
+        return vec![];
+    };
+    let Some(target_index) = ordered.iter().position(|item| *item == target) else {
+        return vec![];
+    };
+    if source_index == target_index {
+        return vec![];
+    }
+
+    let insertion_index = if before {
+        target_index
+    } else {
+        target_index + 1
+    };
+    let final_index = if insertion_index > source_index {
+        insertion_index - 1
+    } else {
+        insertion_index
+    };
+
+    if final_index < source_index {
+        ordered[final_index..source_index]
+            .iter()
+            .rev()
+            .copied()
+            .collect()
+    } else {
+        ordered[source_index + 1..=final_index].to_vec()
+    }
+}
+
 pub(crate) struct TmuxDomainState {
     pub pane_id: PaneId,     // ID of the original pane
     pub domain_id: DomainId, // ID of TmuxDomain
@@ -158,6 +196,14 @@ mod tests {
         assert_eq!(awaiting_response.len(), 1);
         assert!(take_response_command(&guarded(1), &mut awaiting_response).is_some());
         assert!(awaiting_response.is_empty());
+    }
+
+    #[test]
+    fn remote_reorder_uses_adjacent_swaps() {
+        let ordered = [10, 20, 30, 40];
+        assert_eq!(adjacent_swap_targets(&ordered, 10, 30, false), [20, 30]);
+        assert_eq!(adjacent_swap_targets(&ordered, 40, 20, true), [30, 20]);
+        assert!(adjacent_swap_targets(&ordered, 20, 20, true).is_empty());
     }
 }
 
@@ -419,6 +465,51 @@ impl TmuxDomain {
     /// associate tmux-created tabs with their original connection pane.
     pub fn controller_pane_id(&self) -> PaneId {
         self.inner.pane_id
+    }
+
+    pub fn reorder_tab(&self, source: TabId, target: TabId, before: bool) -> bool {
+        let Some(gui_window) = self
+            .inner
+            .gui_window
+            .lock()
+            .as_ref()
+            .map(|window| window.window_id)
+        else {
+            return false;
+        };
+        let tab_map = self.inner.gui_tabs.lock();
+        let remote_by_local = tab_map
+            .values()
+            .map(|tab| (tab.tab_id, tab.tmux_window_id))
+            .collect::<HashMap<_, _>>();
+        drop(tab_map);
+
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(gui_window) else {
+            return false;
+        };
+        let ordered = window
+            .iter()
+            .filter_map(|tab| remote_by_local.get(&tab.tab_id()).copied())
+            .collect::<Vec<_>>();
+        drop(window);
+        let (Some(source), Some(target)) = (
+            remote_by_local.get(&source).copied(),
+            remote_by_local.get(&target).copied(),
+        ) else {
+            return false;
+        };
+        let swaps = adjacent_swap_targets(&ordered, source, target, before);
+        if swaps.is_empty() {
+            return false;
+        }
+        let mut queue = self.inner.cmd_queue.lock();
+        for target in swaps {
+            queue.push_back(Box::new(SwapWindow { source, target }));
+        }
+        drop(queue);
+        TmuxDomainState::schedule_send_next_command(self.inner.domain_id);
+        true
     }
 
     pub fn new(pane_id: PaneId) -> Self {

@@ -1225,6 +1225,27 @@ impl TmuxCommand for SelectWindow {
 }
 
 #[derive(Debug)]
+pub(crate) struct SwapWindow {
+    pub source: TmuxWindowId,
+    pub target: TmuxWindowId,
+}
+
+impl TmuxCommand for SwapWindow {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!("swap-window -s @{} -t @{}\n", self.source, self.target)
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            let error = format!("swap-window in domain={domain_id} failed: {result:#?}");
+            log::error!("{error}");
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct SelectPane {
     pub pane_id: TmuxPaneId,
 }
@@ -1279,6 +1300,16 @@ impl TmuxCommand for AttachDone {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn swap_window_targets_tmux_window_ids() {
+        let command = SwapWindow {
+            source: 11,
+            target: 22,
+        };
+
+        assert_eq!(command.get_command(0), "swap-window -s @11 -t @22\n");
+    }
 
     #[test]
     fn attached_pane_restores_sgr_any_event_mouse() {

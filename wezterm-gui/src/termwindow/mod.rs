@@ -522,6 +522,8 @@ impl TermWindow {
             self.last_mouse_click = None;
             self.current_mouse_buttons.clear();
             self.current_mouse_capture = None;
+            self.tab_sidebar.hovered = None;
+            self.tab_sidebar.drag = None;
             self.is_click_to_focus_window = false;
 
             for state in self.pane_state.borrow_mut().values_mut() {

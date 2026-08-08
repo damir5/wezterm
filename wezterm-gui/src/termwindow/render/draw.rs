@@ -1,5 +1,5 @@
 use crate::colorease::ColorEaseUniform;
-use crate::termwindow::tab_sidebar::SidebarRow;
+use crate::termwindow::tab_sidebar::{SidebarDropTarget, SidebarHover, SidebarRow};
 use crate::termwindow::webgpu::ShaderUniform;
 use crate::termwindow::RenderFrame;
 use crate::uniforms::UniformBuilder;
@@ -160,6 +160,12 @@ impl crate::TermWindow {
                 ..Default::default()
             });
             let rows = self.tab_sidebar_rows.clone();
+            let hovered = self.tab_sidebar.hovered.clone();
+            let drop_target = self
+                .tab_sidebar
+                .drag
+                .as_ref()
+                .and_then(|drag| drag.target.clone());
             let sidebar_width = self.tab_sidebar_width_pixels() as u32;
             composite_tab_sidebar(
                 &mut self.egui_ctx,
@@ -167,6 +173,8 @@ impl crate::TermWindow {
                 &rows,
                 self.tab_sidebar.scroll_rows,
                 self.tab_sidebar.compact,
+                hovered.as_ref(),
+                drop_target.as_ref(),
                 sidebar_width,
                 self.dimensions.pixel_width as u32,
                 self.dimensions.pixel_height as u32,
@@ -323,6 +331,8 @@ fn composite_tab_sidebar(
     rows: &[SidebarRow],
     scroll_rows: usize,
     compact: bool,
+    hovered: Option<&SidebarHover>,
+    drop_target: Option<&SidebarDropTarget>,
     sidebar_width: u32,
     pixel_w: u32,
     pixel_h: u32,
@@ -384,7 +394,16 @@ fn composite_tab_sidebar(
         if compact {
             let SidebarRow::Group(group) = item else { continue };
             let tile = row_rect.shrink2(egui::vec2(3.0, 2.0));
-            painter.rect_filled(tile, 6.0, egui::Color32::from_rgb(43, 47, 56));
+            let hovered = matches!(hovered, Some(SidebarHover::Group(key)) if key == &group.key);
+            painter.rect_filled(
+                tile,
+                6.0,
+                if hovered {
+                    egui::Color32::from_rgb(52, 57, 67)
+                } else {
+                    egui::Color32::from_rgb(43, 47, 56)
+                },
+            );
             let name = if group.key == "@local" {
                 "MAC".to_string()
             } else {
@@ -422,6 +441,12 @@ fn composite_tab_sidebar(
             ),
         };
         let inner = row_rect.shrink2(egui::vec2(3.0, 2.0));
+        let row_hovered = match item {
+            SidebarRow::Group(group) => {
+                matches!(hovered, Some(SidebarHover::Group(key)) if key == &group.key)
+            }
+            SidebarRow::Tab(entry) => hovered == Some(&SidebarHover::Tab(entry.tab_id)),
+        };
         if active && (!is_group || compact) {
             painter.rect_filled(inner, 4.0, egui::Color32::from_rgb(24, 132, 245));
             painter.rect_filled(
@@ -446,6 +471,8 @@ fn composite_tab_sidebar(
                 1.0,
                 accent,
             );
+        } else if row_hovered {
+            painter.rect_filled(inner, 4.0, egui::Color32::from_rgb(35, 39, 47));
         }
         let color = status_color.as_deref().and_then(parse_color).unwrap_or_else(|| {
             if urgency == 2 { egui::Color32::from_rgb(255, 104, 110) }
@@ -478,6 +505,19 @@ fn composite_tab_sidebar(
                 font.clone(),
                 if active { egui::Color32::WHITE } else { egui::Color32::from_gray(150) },
             );
+        }
+        if let (SidebarRow::Tab(entry), Some(target)) = (item, drop_target) {
+            if entry.tab_id == target.tab_id {
+                let y = if target.before {
+                    row_rect.top()
+                } else {
+                    row_rect.bottom()
+                };
+                painter.line_segment(
+                    [egui::pos2(inner.left(), y), egui::pos2(inner.right(), y)],
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(24, 132, 245)),
+                );
+            }
         }
     }
 

@@ -99,7 +99,34 @@ impl Window {
         self.invalidate();
     }
 
-    /// Return true if this window contains no tabs.
+    pub fn move_tab_by_id(&mut self, source: TabId, target: TabId, before: bool) -> bool {
+        let Some(source_index) = self.get_tab_idx_for_id(source) else {
+            return false;
+        };
+        let Some(target_index) = self.get_tab_idx_for_id(target) else {
+            return false;
+        };
+        if source_index == target_index {
+            return false;
+        }
+        let active = self.get_active_tab().map(|tab| tab.tab_id());
+        let tab = self.tabs.remove(source_index);
+        let insertion_index = if before {
+            target_index
+        } else {
+            target_index + 1
+        };
+        let insertion_index = insertion_index
+            .saturating_sub(usize::from(insertion_index > source_index))
+            .min(self.tabs.len());
+        self.tabs.insert(insertion_index, tab);
+        if let Some(active) = active.and_then(|tab_id| self.get_tab_idx_for_id(tab_id)) {
+            self.active = active;
+        }
+        self.invalidate();
+        true
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
