@@ -173,8 +173,6 @@ pub(crate) struct SidebarScreenshotRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UIItemType {
     TabBar(TabBarItem),
-    TabSidebar(TabId),
-    TabSidebarGroup(String),
     SidebarNode(String),
     CloseTab(usize),
     AboveScrollThumb,
@@ -392,7 +390,6 @@ pub struct TermWindow {
     show_scroll_bar: bool,
     tab_bar: TabBarState,
     tab_sidebar: tab_sidebar::TabSidebar,
-    tab_sidebar_rows: Vec<tab_sidebar::SidebarRow>,
     tab_sidebar_refresh_queued: bool,
     tab_sidebar_enabled: bool,
     fancy_tab_bar: Option<box_model::ComputedElement>,
@@ -451,6 +448,10 @@ pub struct TermWindow {
     event_states: HashMap<String, EventState>,
     pub current_event: Option<Value>,
     has_animation: RefCell<Option<Instant>>,
+    sidebar_animation_due: RefCell<Option<Instant>>,
+    sidebar_animation_scheduled: RefCell<Option<Instant>>,
+    sidebar_only_repaint: bool,
+    sidebar_cache_needed: bool,
     /// We use this to attempt to do something reasonable
     /// if we run out of texture space
     allow_images: AllowImage,
@@ -473,6 +474,10 @@ pub struct TermWindow {
     egui_ctx: Option<egui::Context>,
     egui_renderer: Option<egui_wgpu::Renderer>,
     sidebar_images: HashMap<String, egui::TextureHandle>,
+    terminal_cache: Option<wgpu::Texture>,
+    terminal_cache_size: Option<(u32, u32, wgpu::TextureFormat)>,
+    terminal_cache_bind_group: Option<wgpu::BindGroup>,
+    terminal_cache_valid: bool,
     sidebar_screenshot: Option<SidebarScreenshotRequest>,
 }
 
@@ -544,7 +549,6 @@ impl TermWindow {
             self.current_mouse_buttons.clear();
             self.current_mouse_capture = None;
             self.tab_sidebar.hovered = None;
-            self.tab_sidebar.drag = None;
             self.is_click_to_focus_window = false;
 
             for state in self.pane_state.borrow_mut().values_mut() {
@@ -661,8 +665,11 @@ impl TermWindow {
             log::warn!("enable_tab_sidebar requires front_end = 'WebGpu'; sidebar disabled for this window");
         }
         let sidebar_width = if tab_sidebar_enabled {
-            config.tab_sidebar_width.max(tab_sidebar::COMPACT_WIDTH_CELLS + 1)
-                * render_metrics.cell_size.width as usize
+            tab_sidebar::responsive_width_cells(
+                config.tab_sidebar_width,
+                render_metrics.cell_size.width as f32,
+                dpi as u32,
+            ) * render_metrics.cell_size.width as usize
         } else {
             0
         };
@@ -715,6 +722,10 @@ impl TermWindow {
             egui_ctx: None,
             egui_renderer: None,
             sidebar_images: HashMap::new(),
+            terminal_cache: None,
+            terminal_cache_size: None,
+            terminal_cache_bind_group: None,
+            terminal_cache_valid: false,
             sidebar_screenshot: None,
             window: None,
             window_background,
@@ -744,7 +755,6 @@ impl TermWindow {
                 dirty: tab_sidebar_enabled,
                 ..Default::default()
             },
-            tab_sidebar_rows: vec![],
             tab_sidebar_refresh_queued: false,
             tab_sidebar_enabled,
             fancy_tab_bar: None,
@@ -814,6 +824,10 @@ impl TermWindow {
             event_states: HashMap::new(),
             current_event: None,
             has_animation: RefCell::new(None),
+            sidebar_animation_due: RefCell::new(None),
+            sidebar_animation_scheduled: RefCell::new(None),
+            sidebar_only_repaint: false,
+            sidebar_cache_needed: false,
             scheduled_animation: RefCell::new(None),
             allow_images: AllowImage::Yes,
             semantic_zones: HashMap::new(),
@@ -2819,13 +2833,6 @@ impl TermWindow {
                     WindowLevel::AlwaysOnTop | WindowLevel::Normal => {
                         window.set_window_level(WindowLevel::AlwaysOnBottom);
                     }
-                }
-            }
-            ToggleTabSidebarMode => {
-                if self.tab_sidebar_enabled {
-                    self.tab_sidebar.compact = !self.tab_sidebar.compact;
-                    self.mark_tab_sidebar_dirty();
-                    self.config_was_reloaded();
                 }
             }
             SetWindowLevel(level) => {

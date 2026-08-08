@@ -2,8 +2,10 @@ use anyhow::{anyhow, bail, Context};
 use luahelper::lua_value_to_dynamic;
 use mlua::{Table, Value};
 use std::collections::HashMap;
-use taffy::geometry::Rect as TaffyRect;
+use std::time::Duration;
+use taffy::geometry::{Point as TaffyPoint, Rect as TaffyRect};
 use taffy::prelude::*;
+use taffy::style::Overflow;
 use wezterm_dynamic::Value as DynamicValue;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -22,6 +24,12 @@ pub enum Background {
         end: [u8; 4],
         horizontal: bool,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UiAnimation {
+    Spin { frames: Vec<String>, fps: f32 },
+    Pulse { period: f32, min: f32, max: f32 },
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -45,6 +53,7 @@ pub struct UiStyle {
     pub color: Option<[u8; 4]>,
     pub font_size: Option<f32>,
     pub font_family: Option<String>,
+    pub animation: Option<UiAnimation>,
     pub row: bool,
 }
 
@@ -72,9 +81,26 @@ impl Rect {
     pub fn contains(self, x: f32, y: f32) -> bool {
         x >= self.x && y >= self.y && x <= self.x + self.width && y <= self.y + self.height
     }
+
+    pub fn bottom(self) -> f32 {
+        self.y + self.height
+    }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = (self.x + self.width).min(other.x + other.width);
+        let bottom = (self.y + self.height).min(other.y + other.height);
+        (right > left && bottom > top).then_some(Self {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        })
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LayoutNode {
     pub id: String,
     pub kind: String,
@@ -82,21 +108,31 @@ pub struct LayoutNode {
     pub image: Option<String>,
     pub style: UiStyle,
     pub rect: Rect,
+    pub scrollable: bool,
+    pub clip_rect: Option<Rect>,
     pub on_click: Option<DynamicValue>,
     pub on_hover: Option<DynamicValue>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiLayout {
     pub nodes: Vec<LayoutNode>,
+    pub scroll_max: f32,
 }
 
 impl UiLayout {
-    pub fn hit_test(&self, x: f32, y: f32) -> Option<&LayoutNode> {
-        self.nodes
-            .iter()
-            .rev()
-            .find(|node| node.rect.contains(x, y))
+    pub fn hit_test_scrolled(&self, x: f32, y: f32, scroll_offset: f32) -> Option<&LayoutNode> {
+        self.nodes.iter().rev().find(|node| {
+            let mut rect = node.rect;
+            if node.scrollable {
+                rect.y -= scroll_offset;
+            }
+            rect.contains(x, y)
+                && node
+                    .clip_rect
+                    .map(|clip| clip.contains(x, y))
+                    .unwrap_or(true)
+        })
     }
 }
 
@@ -214,6 +250,42 @@ fn event(table: &Table, name: &str) -> anyhow::Result<Option<DynamicValue>> {
     }
 }
 
+fn animation(table: &Table) -> anyhow::Result<Option<UiAnimation>> {
+    let Value::Table(value) = table.get::<_, Value>("animation")? else {
+        return Ok(None);
+    };
+    let kind = value
+        .get::<_, Option<String>>("type")?
+        .unwrap_or_else(|| "pulse".into());
+    match kind.as_str() {
+        "spin" => Ok(Some(UiAnimation::Spin {
+            frames: match value.get::<_, Value>("frames")? {
+                Value::Table(frames) => frames
+                    .sequence_values::<String>()
+                    .collect::<mlua::Result<Vec<_>>>()?,
+                Value::Nil => vec![],
+                _ => bail!("animation.frames must be a sequence"),
+            },
+            fps: value.get::<_, Option<f32>>("fps")?.unwrap_or(6.0).max(0.1),
+        })),
+        "pulse" => Ok(Some(UiAnimation::Pulse {
+            period: value
+                .get::<_, Option<f32>>("period")?
+                .unwrap_or(2.4)
+                .max(0.1),
+            min: value
+                .get::<_, Option<f32>>("min")?
+                .unwrap_or(0.42)
+                .clamp(0.0, 1.0),
+            max: value
+                .get::<_, Option<f32>>("max")?
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0),
+        })),
+        _ => bail!("animation.type must be spin or pulse"),
+    }
+}
+
 fn style(table: &Table, kind: &str) -> anyhow::Result<UiStyle> {
     let mut style = UiStyle {
         row: kind == "row",
@@ -242,6 +314,7 @@ fn style(table: &Table, kind: &str) -> anyhow::Result<UiStyle> {
     style.color = optional_color(table, "color")?;
     style.font_size = optional_number(table, "font_size")?;
     style.font_family = table.get::<_, Option<String>>("font_family")?;
+    style.animation = animation(table)?;
     style.row = table
         .get::<_, Option<String>>("flex_direction")?
         .map(|direction| direction == "row")
@@ -320,6 +393,14 @@ fn taffy_style(node: &UiNode) -> Style {
         } else {
             FlexDirection::Column
         },
+        overflow: if node.kind == "scroll" {
+            TaffyPoint {
+                x: Overflow::Hidden,
+                y: Overflow::Scroll,
+            }
+        } else {
+            TaffyPoint::default()
+        },
         flex_grow: style.flex_grow,
         flex_shrink: style.flex_shrink,
         flex_basis: dimension(style.flex_basis),
@@ -392,6 +473,8 @@ fn walk(
     node_id: NodeId,
     nodes: &HashMap<NodeId, UiNode>,
     origin: (f32, f32),
+    scrollable: bool,
+    clip_rect: Option<Rect>,
     output: &mut Vec<LayoutNode>,
 ) -> anyhow::Result<()> {
     let node = nodes
@@ -412,11 +495,32 @@ fn walk(
             width: layout.size.width,
             height: layout.size.height,
         },
+        scrollable,
+        clip_rect,
         on_click: node.on_click.clone(),
         on_hover: node.on_hover.clone(),
     });
+    let next_scrollable = scrollable || node.kind == "scroll";
+    let next_clip_rect = if node.kind == "scroll" {
+        Some(Rect {
+            x,
+            y,
+            width: layout.size.width,
+            height: layout.size.height,
+        })
+    } else {
+        clip_rect
+    };
     for child in taffy.children(node_id)? {
-        walk(taffy, child, nodes, (x, y), output)?;
+        walk(
+            taffy,
+            child,
+            nodes,
+            (x, y),
+            next_scrollable,
+            next_clip_rect,
+            output,
+        )?;
     }
     Ok(())
 }
@@ -443,12 +547,70 @@ pub fn layout(root: &UiNode, width: f32, height: f32) -> anyhow::Result<UiLayout
         },
     )?;
     let mut output = Vec::new();
-    walk(&taffy, root_id, &nodes, (0.0, 0.0), &mut output)?;
-    Ok(UiLayout { nodes: output })
+    walk(
+        &taffy,
+        root_id,
+        &nodes,
+        (0.0, 0.0),
+        false,
+        None,
+        &mut output,
+    )?;
+    let scroll_max = output
+        .iter()
+        .filter_map(|node| {
+            node.clip_rect
+                .map(|clip| node.rect.bottom() - clip.bottom())
+        })
+        .fold(0.0, f32::max);
+    Ok(UiLayout {
+        nodes: output,
+        scroll_max: scroll_max.max(0.0),
+    })
+}
+
+pub fn interpolate(from: Option<&UiLayout>, to: &UiLayout, progress: f32) -> UiLayout {
+    let progress = progress.clamp(0.0, 1.0);
+    let mut layout = to.clone();
+    let Some(from) = from else {
+        return layout;
+    };
+    for node in &mut layout.nodes {
+        let Some(previous) = from.nodes.iter().find(|item| item.id == node.id) else {
+            continue;
+        };
+        node.rect.x = previous.rect.x + (node.rect.x - previous.rect.x) * progress;
+        node.rect.y = previous.rect.y + (node.rect.y - previous.rect.y) * progress;
+        node.rect.width = previous.rect.width + (node.rect.width - previous.rect.width) * progress;
+        node.rect.height =
+            previous.rect.height + (node.rect.height - previous.rect.height) * progress;
+    }
+    layout
+}
+
+pub fn animation_frame_delay(layout: &UiLayout) -> Option<Duration> {
+    layout
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            node.style
+                .animation
+                .as_ref()
+                .map(|animation| match animation {
+                    UiAnimation::Pulse { .. } => Duration::from_millis(16),
+                    UiAnimation::Spin { fps, frames } if !frames.is_empty() => {
+                        Duration::from_secs_f32(1.0 / *fps)
+                    }
+                    UiAnimation::Spin { .. } => Duration::ZERO,
+                })
+        })
+        .filter(|delay| !delay.is_zero())
+        .min()
 }
 
 pub fn ui_items_for_layout(
     layout: &UiLayout,
+    scroll_offset: f32,
     pixels_per_point: f32,
     width: usize,
     height: usize,
@@ -458,10 +620,18 @@ pub fn ui_items_for_layout(
         .iter()
         .filter(|node| node.on_click.is_some() || node.on_hover.is_some())
         .filter_map(|node| {
-            let x = (node.rect.x * pixels_per_point).max(0.0) as usize;
-            let y = (node.rect.y * pixels_per_point).max(0.0) as usize;
-            let node_width = (node.rect.width * pixels_per_point).max(0.0) as usize;
-            let node_height = (node.rect.height * pixels_per_point).max(0.0) as usize;
+            let mut node_rect = node.rect;
+            if node.scrollable {
+                node_rect.y -= scroll_offset;
+            }
+            let rect = node
+                .clip_rect
+                .and_then(|clip| node_rect.intersection(clip))
+                .unwrap_or(node_rect);
+            let x = (rect.x * pixels_per_point).max(0.0) as usize;
+            let y = (rect.y * pixels_per_point).max(0.0) as usize;
+            let node_width = (rect.width * pixels_per_point).max(0.0) as usize;
+            let node_height = (rect.height * pixels_per_point).max(0.0) as usize;
             let node_width = node_width.min(width.saturating_sub(x));
             let node_height = node_height.min(height.saturating_sub(y));
             (node_width > 0 && node_height > 0).then(|| super::UIItem {
@@ -481,21 +651,49 @@ pub fn paint(
     layout: &UiLayout,
     hovered: Option<&str>,
     images: &mut HashMap<String, egui::TextureHandle>,
+    scroll_offset: f32,
+    time: f64,
 ) {
     for node in &layout.nodes {
+        let mut node_rect = node.rect;
+        if node.scrollable {
+            node_rect.y -= scroll_offset;
+        }
+        let visible = match node.clip_rect {
+            Some(clip) => node_rect.intersection(clip),
+            None => Some(node_rect),
+        };
+        let Some(visible) = visible else {
+            continue;
+        };
         let rect = egui::Rect::from_min_size(
-            egui::pos2(node.rect.x, node.rect.y),
-            egui::vec2(node.rect.width, node.rect.height),
+            egui::pos2(visible.x, visible.y),
+            egui::vec2(visible.width, visible.height),
         );
         let background = if hovered == Some(node.id.as_str()) {
             node.style.hover_background.or(node.style.background)
         } else {
             node.style.background
         };
+        let pulse = node
+            .style
+            .animation
+            .as_ref()
+            .and_then(|animation| match animation {
+                UiAnimation::Pulse { period, min, max } => {
+                    let phase = (time as f32 % period) / period;
+                    let eased = (phase * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+                    Some(min + (max - min) * eased)
+                }
+                UiAnimation::Spin { .. } => None,
+            });
         if let Some(background) = background {
             match background {
                 Background::Solid(color) => {
-                    painter.rect_filled(rect, node.style.border_radius, color32(color));
+                    let color = pulse
+                        .map(|amount| color32(color).gamma_multiply(amount))
+                        .unwrap_or_else(|| color32(color));
+                    painter.rect_filled(rect, node.style.border_radius, color);
                 }
                 Background::LinearGradient {
                     start,
@@ -607,9 +805,16 @@ pub fn paint(
             .text
             .as_deref()
             .or_else(|| (node.kind == "icon").then_some(node.image.as_deref().unwrap_or("")));
+        let text = match (&node.style.animation, text) {
+            (Some(UiAnimation::Spin { frames, fps }), Some(_)) if !frames.is_empty() => {
+                Some(frames[((time as f32 * fps).floor() as usize) % frames.len()].as_str())
+            }
+            (_, text) => text,
+        };
         if let Some(text) = text.filter(|text| !text.is_empty()) {
             let font_size = node.style.font_size.unwrap_or(13.0);
-            let color = color32(node.style.color.unwrap_or([235, 235, 240, 255]));
+            let color = color32(node.style.color.unwrap_or([235, 235, 240, 255]))
+                .gamma_multiply(pulse.unwrap_or(1.0));
             painter.text(
                 rect.left_center() + egui::vec2(node.style.padding.left, 0.0),
                 egui::Align2::LEFT_CENTER,
@@ -691,6 +896,30 @@ return { type = 'row', width = 100, height = 40, padding = 10,
             on_hover: None,
         };
         let layout = layout(&root, 20.0, 20.0).unwrap();
-        assert_eq!(layout.hit_test(1.0, 1.0).unwrap().id, "child");
+        assert_eq!(layout.hit_test_scrolled(1.0, 1.0, 0.0).unwrap().id, "child");
+    }
+
+    #[test]
+    fn scroll_layout_preserves_content_and_animation_metadata() {
+        let lua = mlua::Lua::new();
+        let root = lua
+            .load(
+                r#"
+return { type = 'scroll', width = 100, height = 40, children = {
+  { type = 'text', text = 'a', height = 30,
+    animation = { type = 'spin', frames = {'◐', '◓'}, fps = 6 } },
+  { type = 'text', text = 'b', height = 30 },
+} }
+"#,
+            )
+            .eval::<Value>()
+            .unwrap();
+        let root = decode(root, &lua).unwrap().unwrap();
+        let layout = layout(&root, 100.0, 40.0).unwrap();
+        assert!(layout.scroll_max > 0.0);
+        let delay = animation_frame_delay(&layout).unwrap();
+        assert!(delay > Duration::from_millis(100));
+        assert!(delay < Duration::from_millis(200));
+        assert!(layout.hit_test_scrolled(10.0, 45.0, 0.0).is_none());
     }
 }

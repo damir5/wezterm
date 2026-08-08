@@ -8,8 +8,8 @@ Upstream base: `4b1c3c1`. Branch: `feat/egui-guipane-dashboards`.
 ## Tab sidebar
 
 - Enable with `enable_tab_sidebar = true` and `front_end = 'WebGpu'`.
-- `tab_sidebar_width` is the regular width in terminal cells; compact mode is
-  six cells and is toggled with `ToggleTabSidebarMode`.
+- `tab_sidebar_width` selects the automatic responsive width class in terminal
+  cells; compact is at most 120pt and regular is clamped to 240–520pt.
 - Lua may optionally implement synchronous `format-tab-sidebar(tabs)`, returning
   `{ entries = {...}, refresh_after_ms = n }`. Entries are keyed by an existing
   `tab_id`; malformed data falls back to the native snapshot.
