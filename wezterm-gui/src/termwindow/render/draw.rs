@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 
+fn rebuilds_cached_frame(cache_frame: bool, use_cached_terminal: bool) -> bool {
+    cache_frame && !use_cached_terminal
+}
+
 struct SidebarCaptureSpec {
     index: usize,
     path: PathBuf,
@@ -287,7 +291,7 @@ impl crate::TermWindow {
         }
 
         let mut egui_cmd_bufs = Vec::new();
-        if cache_frame && !sidebar_only && self.tab_sidebar_enabled {
+        if rebuilds_cached_frame(cache_frame, use_cached_terminal) && self.tab_sidebar_enabled {
             let config = webgpu.config.borrow();
             let linear_format = config.format.remove_srgb_suffix();
             let egui_format = if config.view_formats.contains(&linear_format) {
@@ -827,5 +831,12 @@ mod test {
             super::screenshot_path(Path::new("/tmp/sidebar.png"), 1, 100),
             Path::new("/tmp/sidebar-100ms.png")
         );
+    }
+
+    #[test]
+    fn stale_sidebar_only_cache_rebuilds_static_sidebar() {
+        assert!(super::rebuilds_cached_frame(true, false));
+        assert!(!super::rebuilds_cached_frame(true, true));
+        assert!(!super::rebuilds_cached_frame(false, false));
     }
 }
