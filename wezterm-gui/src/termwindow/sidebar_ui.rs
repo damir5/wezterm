@@ -878,20 +878,28 @@ pub fn interpolate(from: Option<&UiLayout>, to: &UiLayout, progress: f32) -> UiL
     layout
 }
 
-pub fn animation_frame_delay(layout: &UiLayout) -> Option<Duration> {
+pub fn animation_frame_delay(layout: &UiLayout, scroll_offset: f32) -> Option<Duration> {
+    let frame_delay = Duration::from_secs_f32(1.0 / 12.0);
     layout
         .nodes
         .iter()
+        .filter(|node| {
+            let mut rect = node.rect;
+            if node.scrollable {
+                rect.y -= scroll_offset;
+            }
+            node.clip_rect
+                .map(|clip| rect.intersection(clip).is_some())
+                .unwrap_or(true)
+        })
         .filter_map(|node| {
             node.style
                 .animation
                 .as_ref()
                 .map(|animation| match animation {
-                    UiAnimation::Pulse { .. } | UiAnimation::Rotate { .. } => {
-                        Duration::from_millis(16)
-                    }
+                    UiAnimation::Pulse { .. } | UiAnimation::Rotate { .. } => frame_delay,
                     UiAnimation::Spin { fps, frames } if !frames.is_empty() => {
-                        Duration::from_secs_f32(1.0 / *fps)
+                        Duration::from_secs_f32(1.0 / *fps).max(frame_delay)
                     }
                     UiAnimation::Spin { .. } => Duration::ZERO,
                 })
@@ -1589,7 +1597,7 @@ return { type = 'row', width = 100, height = 40, padding = 10,
                 r#"
 return { type = 'scroll', width = 100, height = 40, children = {
   { type = 'text', text = 'a', height = 30,
-    animation = { type = 'spin', frames = {'◐', '◓'}, fps = 6 } },
+    animation = { type = 'spin', frames = {'a', 'b'}, fps = 60 } },
   { type = 'text', text = 'b', height = 30 },
 } }
 "#,
@@ -1599,9 +1607,11 @@ return { type = 'scroll', width = 100, height = 40, children = {
         let root = decode(root, &lua).unwrap().unwrap();
         let layout = layout(&test_context(), &root, 100.0, 40.0).unwrap();
         assert!(layout.scroll_max > 0.0);
-        let delay = animation_frame_delay(&layout).unwrap();
-        assert!(delay > Duration::from_millis(100));
-        assert!(delay < Duration::from_millis(200));
+        assert_eq!(
+            animation_frame_delay(&layout, 0.0),
+            Some(Duration::from_secs_f32(1.0 / 12.0))
+        );
+        assert!(animation_frame_delay(&layout, 30.0).is_none());
         assert!(layout.hit_test_scrolled(10.0, 45.0, 0.0).is_none());
     }
 

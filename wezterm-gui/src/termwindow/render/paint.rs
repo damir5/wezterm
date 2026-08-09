@@ -117,7 +117,12 @@ impl crate::TermWindow {
                 .tab_sidebar
                 .ui_layout
                 .as_ref()
-                .and_then(crate::termwindow::sidebar_ui::animation_frame_delay)
+                .and_then(|layout| {
+                    crate::termwindow::sidebar_ui::animation_frame_delay(
+                        layout,
+                        self.tab_sidebar.ui_scroll_offset,
+                    )
+                })
                 .map(|delay| Instant::now() + delay);
             self.sidebar_cache_needed = next_due.is_some();
             *self.sidebar_animation_due.borrow_mut() = next_due;
@@ -295,9 +300,10 @@ impl crate::TermWindow {
                         .min(self.tab_sidebar.ui_scroll_max);
                     let layout = self.tab_sidebar.ui_layout.as_ref().unwrap();
                     if self.tab_sidebar.ui_animation_started.is_none() {
-                        if let Some(delay) =
-                            crate::termwindow::sidebar_ui::animation_frame_delay(layout)
-                        {
+                        if let Some(delay) = crate::termwindow::sidebar_ui::animation_frame_delay(
+                            layout,
+                            self.tab_sidebar.ui_scroll_offset,
+                        ) {
                             let due = Instant::now() + delay;
                             self.sidebar_cache_needed = true;
                             let mut animation = self.sidebar_animation_due.borrow_mut();
