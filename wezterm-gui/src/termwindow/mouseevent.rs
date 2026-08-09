@@ -35,6 +35,7 @@ impl super::TermWindow {
 
         if let Some(index) = index {
             let _ = self.activate_tab(index as isize);
+            self.request_terminal_repaint();
             self.mark_tab_sidebar_dirty();
             self.emit_status_event();
         }
