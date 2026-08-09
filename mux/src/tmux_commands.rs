@@ -13,8 +13,9 @@ use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
 use termwiz::escape::csi::{Cursor, DecPrivateMode, DecPrivateModeCode, Mode, CSI};
-use termwiz::escape::{Action, OneBased};
+use termwiz::escape::{Action, OneBased, OperatingSystemCommand};
 use termwiz::tmux_cc::*;
+use url::Url;
 use wezterm_term::TerminalSize;
 
 pub(crate) trait TmuxCommand: Send + Debug {
@@ -22,7 +23,9 @@ pub(crate) trait TmuxCommand: Send + Debug {
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()>;
 }
 
-#[derive(Debug, Clone, Copy)]
+pub(crate) const PANE_CWD_SUBSCRIPTION: &str = "wezterm-pane-cwd";
+
+#[derive(Debug, Clone)]
 pub(crate) struct PaneItem {
     session_id: TmuxSessionId,
     window_id: TmuxWindowId,
@@ -40,6 +43,7 @@ pub(crate) struct PaneItem {
     mouse_all: bool,
     mouse_utf8: bool,
     mouse_sgr: bool,
+    current_path: Option<String>,
 }
 
 fn tmux_mouse_mode_actions(pane: &PaneItem) -> Vec<Action> {
@@ -66,6 +70,19 @@ fn tmux_mouse_mode_actions(pane: &PaneItem) -> Vec<Action> {
     actions
 }
 
+fn tmux_current_path_action(path: &str) -> Option<Action> {
+    let url = Url::from_directory_path(path).ok()?;
+    Some(Action::OperatingSystemCommand(Box::new(
+        OperatingSystemCommand::CurrentWorkingDirectory(url.into()),
+    )))
+}
+
+fn set_tmux_pane_current_path(pane: &Arc<dyn Pane>, path: Option<&str>) {
+    if let Some(action) = path.and_then(tmux_current_path_action) {
+        pane.perform_actions(vec![action]);
+    }
+}
+
 #[derive(Debug)]
 struct WindowItem {
     session_id: TmuxSessionId,
@@ -80,6 +97,25 @@ struct WindowItem {
 }
 
 impl TmuxDomainState {
+    pub fn update_pane_current_path(
+        &self,
+        session_id: TmuxSessionId,
+        window_id: TmuxWindowId,
+        pane_id: TmuxPaneId,
+        path: &str,
+    ) {
+        if *self.tmux_session.lock() != Some(session_id) {
+            return;
+        }
+        let local_pane_id = self.remote_panes.lock().get(&pane_id).and_then(|pane| {
+            let pane = pane.lock();
+            (pane.window_id == window_id).then_some(pane.local_pane_id)
+        });
+        if let Some(pane) = local_pane_id.and_then(|pane_id| Mux::get().get_pane(pane_id)) {
+            set_tmux_pane_current_path(&pane, Some(path));
+        }
+    }
+
     /// check if a PaneItem received from ListAllPanes has been attached
     pub fn check_pane_attached(&self, window_id: TmuxWindowId, pane_id: TmuxPaneId) -> bool {
         let gui_tabs = self.gui_tabs.lock();
@@ -248,7 +284,7 @@ impl TmuxDomainState {
             Box::new(writer.clone()),
         );
 
-        Ok(Arc::new(LocalPane::new(
+        let local_pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
             local_pane_id,
             terminal,
             Box::new(child),
@@ -256,7 +292,9 @@ impl TmuxDomainState {
             Box::new(writer),
             self.domain_id,
             "tmux pane".to_string(),
-        )))
+        ));
+        set_tmux_pane_current_path(&local_pane, pane.current_path.as_deref());
+        Ok(local_pane)
     }
 
     pub fn split_pane(
@@ -308,6 +346,7 @@ impl TmuxDomainState {
             mouse_all: false,
             mouse_utf8: false,
             mouse_sgr: false,
+            current_path: None,
         };
 
         let pane = self.create_pane(&p).context("failed to create pane")?;
@@ -383,6 +422,7 @@ impl TmuxDomainState {
                 }
                 // tmux retains these per pane but does not replay them to new control clients.
                 local_pane.perform_actions(tmux_mouse_mode_actions(pane));
+                set_tmux_pane_current_path(&local_pane, pane.current_path.as_deref());
             }
 
             log::info!("new pane synced, id: {}", pane.pane_id);
@@ -449,6 +489,7 @@ impl TmuxDomainState {
                             mouse_all: false,
                             mouse_utf8: false,
                             mouse_sgr: false,
+                            current_path: None,
                         };
                         let local_pane = self.create_pane(&p).context("failed to create pane")?;
                         tab.assign_pane(&local_pane);
@@ -486,6 +527,7 @@ impl TmuxDomainState {
                         mouse_all: false,
                         mouse_utf8: false,
                         mouse_sgr: false,
+                        current_path: None,
                     };
                     let local_pane;
                     if !self.check_pane_attached(p.window_id, p.pane_id) {
@@ -677,6 +719,83 @@ fn parse_sigil_number(text: &str) -> anyhow::Result<u64> {
     Ok(num)
 }
 
+fn parse_pane_item(line: &str) -> anyhow::Result<PaneItem> {
+    let mut fields = line.splitn(17, ' ');
+    let session_id =
+        parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
+    let window_id = parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing window_id"))?)?;
+    let pane_id = parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing pane_id"))?)?;
+    let _pane_index = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_index"))?
+        .parse()?;
+    let cursor_x = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing cursor_x"))?
+        .parse()?;
+    let cursor_y = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing cursor_y"))?
+        .parse()?;
+    let pane_width = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_width"))?
+        .parse()?;
+    let pane_height = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_height"))?
+        .parse()?;
+    let pane_left = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_left"))?
+        .parse()?;
+    let pane_top = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_top"))?
+        .parse()?;
+    let pane_active = fields
+        .next()
+        .ok_or_else(|| anyhow!("missing pane_active"))?
+        .parse::<usize>()?
+        == 1;
+    let mut mouse_flag = |name| -> anyhow::Result<bool> {
+        Ok(fields
+            .next()
+            .ok_or_else(|| anyhow!("missing {name}"))?
+            .parse::<usize>()?
+            == 1)
+    };
+    let mouse_standard = mouse_flag("mouse_standard_flag")?;
+    let mouse_button = mouse_flag("mouse_button_flag")?;
+    let mouse_all = mouse_flag("mouse_all_flag")?;
+    let mouse_utf8 = mouse_flag("mouse_utf8_flag")?;
+    let mouse_sgr = mouse_flag("mouse_sgr_flag")?;
+    let current_path = fields
+        .next()
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
+
+    Ok(PaneItem {
+        session_id,
+        window_id,
+        pane_id,
+        _pane_index,
+        cursor_x,
+        cursor_y,
+        pane_width,
+        pane_height,
+        pane_left,
+        pane_top,
+        pane_active,
+        mouse_standard,
+        mouse_button,
+        mouse_all,
+        mouse_utf8,
+        mouse_sgr,
+        current_path,
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct ListAllPanes {
     pub window_id: TmuxWindowId,
@@ -716,7 +835,7 @@ impl TmuxCommand for ListAllPanes {
             #{{pane_left}} #{{pane_top}} #{{pane_active}} \
             #{{?mouse_standard_flag,1,0}} #{{?mouse_button_flag,1,0}} \
             #{{?mouse_all_flag,1,0}} #{{?mouse_utf8_flag,1,0}} \
-            #{{?mouse_sgr_flag,1,0}}' -t @{}\n",
+            #{{?mouse_sgr_flag,1,0}} #{{pane_current_path}}' -t @{}\n",
             self.window_id
         )
     }
@@ -733,95 +852,9 @@ impl TmuxCommand for ListAllPanes {
             if line.is_empty() {
                 continue;
             }
-            let mut fields = line.split(' ');
-            // These ids all have various sigils such as `$`, `%`, `@`,
-            // so skip those prior to parsing them
-            let session_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
-            let window_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing window_id"))?)?;
-            let pane_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing pane_id"))?)?;
-            let _pane_index = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_index"))?
-                .parse()?;
-            let cursor_x = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing cursor_x"))?
-                .parse()?;
-            let cursor_y = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing cursor_y"))?
-                .parse()?;
-            let pane_width = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_width"))?
-                .parse()?;
-            let pane_height = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_height"))?
-                .parse()?;
-            let pane_left = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_left"))?
-                .parse()?;
-            let pane_top = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_top"))?
-                .parse()?;
-            let pane_active = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing pane_active"))?
-                .parse::<usize>()?;
-            let mouse_standard = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing mouse_standard_flag"))?
-                .parse::<usize>()?
-                == 1;
-            let mouse_button = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing mouse_button_flag"))?
-                .parse::<usize>()?
-                == 1;
-            let mouse_all = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing mouse_all_flag"))?
-                .parse::<usize>()?
-                == 1;
-            let mouse_utf8 = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing mouse_utf8_flag"))?
-                .parse::<usize>()?
-                == 1;
-            let mouse_sgr = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing mouse_sgr_flag"))?
-                .parse::<usize>()?
-                == 1;
-
-            let pane_active = pane_active == 1;
-
-            pane_set.insert(pane_id);
-
-            items.push(PaneItem {
-                session_id,
-                window_id,
-                pane_id,
-                _pane_index,
-                cursor_x,
-                cursor_y,
-                pane_width,
-                pane_height,
-                pane_left,
-                pane_top,
-                pane_active,
-                mouse_standard,
-                mouse_button,
-                mouse_all,
-                mouse_utf8,
-                mouse_sgr,
-            });
+            let pane = parse_pane_item(line)?;
+            pane_set.insert(pane.pane_id);
+            items.push(pane);
         }
 
         log::debug!("panes in domain_id {}: {:?}", domain_id, items);
@@ -1134,6 +1167,25 @@ impl TmuxCommand for NewWindow {
 }
 
 #[derive(Debug)]
+pub(crate) struct SubscribePaneCwd;
+
+impl TmuxCommand for SubscribePaneCwd {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!(
+            "refresh-client -B '{}:%*:#{{pane_current_path}}'\n",
+            PANE_CWD_SUBSCRIPTION
+        )
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            anyhow::bail!("pane cwd subscription in domain={domain_id} failed: {result:#?}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct ListCommands;
 impl TmuxCommand for ListCommands {
     fn get_command(&self, _domain_id: DomainId) -> String {
@@ -1337,6 +1389,7 @@ mod test {
             mouse_all: true,
             mouse_utf8: false,
             mouse_sgr: true,
+            current_path: None,
         };
 
         terminal.perform_actions(tmux_mouse_mode_actions(&pane));
@@ -1349,5 +1402,41 @@ mod test {
         };
         terminal.perform_actions(tmux_mouse_mode_actions(&mouse_disabled));
         assert!(!terminal.is_mouse_grabbed());
+    }
+
+    #[test]
+    fn list_pane_parser_preserves_spaced_current_path() {
+        let pane =
+            parse_pane_item("$1 @2 %3 0 4 5 80 24 0 0 1 0 0 0 0 0 /home/damir/My Project").unwrap();
+
+        assert_eq!(pane.current_path.as_deref(), Some("/home/damir/My Project"));
+    }
+
+    #[test]
+    fn current_path_uses_terminal_cwd_action() {
+        let mut terminal = wezterm_term::Terminal::new(
+            TerminalSize::default(),
+            Arc::new(config::TermConfig::new()),
+            "WezTerm",
+            "test",
+            Box::new(std::io::sink()),
+        );
+
+        terminal.perform_actions(vec![
+            tmux_current_path_action("/home/damir/My Project").unwrap()
+        ]);
+
+        assert_eq!(
+            terminal.get_current_dir().map(Url::path),
+            Some("/home/damir/My%20Project/")
+        );
+    }
+
+    #[test]
+    fn pane_cwd_subscription_uses_all_panes() {
+        assert_eq!(
+            SubscribePaneCwd.get_command(0),
+            "refresh-client -B 'wezterm-pane-cwd:%*:#{pane_current_path}'\n"
+        );
     }
 }

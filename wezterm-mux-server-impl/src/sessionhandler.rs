@@ -1064,6 +1064,7 @@ async fn split_pane(split: SplitPane, client_id: Option<Arc<ClientId>>) -> anyho
 
     Ok::<Pdu, anyhow::Error>(Pdu::SpawnResponse(SpawnResponse {
         pane_id: pane.pane_id(),
+        controller_pane_id: pane.controller_pane_id(),
         tab_id,
         window_id,
         size,
@@ -1081,7 +1082,7 @@ async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> an
             spawn.command,
             spawn.command_dir,
             spawn.size,
-            None, // optional current pane_id
+            spawn.current_pane_id,
             spawn.workspace,
             None, // optional gui window position
         )
@@ -1089,6 +1090,7 @@ async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> an
 
     Ok::<Pdu, anyhow::Error>(Pdu::SpawnResponse(SpawnResponse {
         pane_id: pane.pane_id(),
+        controller_pane_id: pane.controller_pane_id(),
         tab_id: tab.tab_id(),
         window_id,
         size: tab.get_size(),

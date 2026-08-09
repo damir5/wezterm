@@ -141,6 +141,23 @@ impl Pane for LocalPane {
         self.pane_id
     }
 
+    fn controller_pane_id(&self) -> Option<PaneId> {
+        if let Some(domain) = self.tmux_domain.lock().as_ref() {
+            return Some(domain.pane_id);
+        }
+        Mux::try_get()?
+            .get_domain(self.domain_id)?
+            .downcast_ref::<TmuxDomain>()
+            .map(TmuxDomain::controller_pane_id)
+    }
+
+    fn domain_id_for_spawn(&self) -> DomainId {
+        self.tmux_domain
+            .lock()
+            .as_ref()
+            .map_or(self.domain_id, |domain| domain.domain_id)
+    }
+
     fn get_metadata(&self) -> Value {
         #[allow(unused_mut)]
         let mut map: BTreeMap<Value, Value> = BTreeMap::new();

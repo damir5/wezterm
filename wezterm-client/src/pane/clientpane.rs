@@ -36,6 +36,7 @@ pub struct ClientPane {
     local_pane_id: PaneId,
     pub remote_pane_id: PaneId,
     pub remote_tab_id: TabId,
+    remote_controller_pane_id: Mutex<Option<PaneId>>,
     pub renderable: Mutex<RenderableState>,
     configured_palette: Mutex<ColorPalette>,
     palette: Mutex<ColorPalette>,
@@ -58,6 +59,8 @@ impl ClientPane {
         remote_pane_id: PaneId,
         size: TerminalSize,
         title: &str,
+        working_dir: Option<Url>,
+        remote_controller_pane_id: Option<PaneId>,
     ) -> Self {
         let local_pane_id = alloc_pane_id();
         let writer = PaneWriter {
@@ -90,6 +93,7 @@ impl ClientPane {
                     reverse_video: false,
                 },
                 title,
+                working_dir,
                 fetch_limiter,
             )),
         };
@@ -119,6 +123,7 @@ impl ClientPane {
             remote_pane_id,
             local_pane_id,
             remote_tab_id,
+            remote_controller_pane_id: Mutex::new(remote_controller_pane_id),
             application_palette: Mutex::new(false),
             renderable: Mutex::new(render),
             writer: Mutex::new(writer),
@@ -240,6 +245,18 @@ impl ClientPane {
         self.remote_pane_id
     }
 
+    pub fn remote_controller_pane_id(&self) -> Option<PaneId> {
+        *self.remote_controller_pane_id.lock()
+    }
+
+    pub fn set_remote_controller_pane_id(&self, pane_id: Option<PaneId>) {
+        *self.remote_controller_pane_id.lock() = pane_id;
+    }
+
+    pub fn set_current_working_dir(&self, working_dir: Option<Url>) {
+        self.renderable.lock().inner.borrow_mut().working_dir = working_dir;
+    }
+
     /// Arrange to suppress the next Pane::kill call.
     /// This is a bit of a hack that we use when closing a window;
     /// our Domain::local_window_is_closing impl calls this for each
@@ -256,6 +273,11 @@ impl ClientPane {
 impl Pane for ClientPane {
     fn pane_id(&self) -> PaneId {
         self.local_pane_id
+    }
+
+    fn controller_pane_id(&self) -> Option<PaneId> {
+        self.remote_controller_pane_id()
+            .and_then(|pane_id| self.client.remote_to_local_pane_id(pane_id))
     }
 
     fn get_metadata(&self) -> Value {

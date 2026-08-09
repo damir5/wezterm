@@ -98,6 +98,7 @@ impl SpawnCommand {
 
         let spawned = client
             .spawn_v2(codec::SpawnV2 {
+                current_pane_id: None,
                 domain: self
                     .domain_name
                     .map_or(SpawnTabDomain::DefaultDomain, |name| {

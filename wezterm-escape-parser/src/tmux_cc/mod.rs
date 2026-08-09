@@ -1,8 +1,8 @@
 use crate::error::Context;
-use crate::{Result, bail, format_err};
+use crate::{bail, format_err, Result};
 use parser::Rule;
-use pest::Parser as _;
 use pest::iterators::{Pair, Pairs};
+use pest::Parser as _;
 
 pub type TmuxWindowId = u64;
 pub type TmuxPaneId = u64;
@@ -103,7 +103,13 @@ pub enum Event {
         session: TmuxSessionId,
         window: TmuxWindowId,
     },
-    SubscriptionChanged,
+    SubscriptionChanged {
+        name: String,
+        session: TmuxSessionId,
+        window: Option<TmuxWindowId>,
+        pane: Option<TmuxPaneId>,
+        value: String,
+    },
     UnlinkedWindowAdd {
         window: TmuxWindowId,
     },
@@ -194,6 +200,64 @@ fn parse_session_id(pair: Pair<Rule>) -> Result<TmuxSessionId> {
             pair
         ),
     }
+}
+
+fn parse_subscription_id(text: &str, prefix: char, name: &str) -> Result<u64> {
+    text.strip_prefix(prefix)
+        .ok_or_else(|| format_err!("invalid {name}: {text}"))?
+        .parse()
+        .with_context(|| format!("invalid {name}: {text}"))
+}
+
+fn parse_optional_subscription_id(text: &str, prefix: char, name: &str) -> Result<Option<u64>> {
+    if text == "-" {
+        return Ok(None);
+    }
+    parse_subscription_id(text, prefix, name).map(Some)
+}
+
+fn parse_subscription_changed(text: &str) -> Result<Event> {
+    let (header, value) = text
+        .split_once(" : ")
+        .ok_or_else(|| format_err!("subscription change is missing value separator"))?;
+    let mut fields = header.split_whitespace();
+    let name = unvis(
+        fields
+            .next()
+            .ok_or_else(|| format_err!("missing subscription name"))?,
+    )?;
+    let session = parse_subscription_id(
+        fields
+            .next()
+            .ok_or_else(|| format_err!("missing session id"))?,
+        '$',
+        "session id",
+    )?;
+    let window = parse_optional_subscription_id(
+        fields
+            .next()
+            .ok_or_else(|| format_err!("missing window id"))?,
+        '@',
+        "window id",
+    )?;
+    fields
+        .next()
+        .ok_or_else(|| format_err!("missing window index"))?;
+    let pane = parse_optional_subscription_id(
+        fields
+            .next()
+            .ok_or_else(|| format_err!("missing pane id"))?,
+        '%',
+        "pane id",
+    )?;
+
+    Ok(Event::SubscriptionChanged {
+        name,
+        session,
+        window,
+        pane,
+        value: unvis(value)?,
+    })
 }
 
 /// Parses a %begin, %end, %error guard line tuple
@@ -424,7 +488,13 @@ fn parse_line(line: &[u8]) -> Result<Event> {
             Ok(Event::SessionWindowChanged { session, window })
         }
         Rule::sessions_changed => Ok(Event::SessionsChanged),
-        Rule::subscription_changed => Ok(Event::SubscriptionChanged),
+        Rule::subscription_changed => {
+            let text = pair
+                .into_inner()
+                .next()
+                .ok_or_else(|| format_err!("missing subscription change"))?;
+            parse_subscription_changed(text.as_str())
+        }
         Rule::unlinked_window_add => {
             let mut pairs = pair.into_inner();
             let window = parse_window_id(
@@ -1043,7 +1113,7 @@ here
 %paste-buffer-changed just something
 %paste-buffer-deleted just something else
 %pause %3
-%subscription-changed something we don't handle so far
+%subscription-changed wezterm-pane-cwd $1 @2 0 %3 : /home/wez/My Project
 ";
 
         let mut p = Parser::new();
@@ -1139,9 +1209,56 @@ here
                     buffer: "just something else".to_owned()
                 },
                 Event::Pause { pane: 3 },
-                Event::SubscriptionChanged,
+                Event::SubscriptionChanged {
+                    name: "wezterm-pane-cwd".to_string(),
+                    session: 1,
+                    window: Some(2),
+                    pane: Some(3),
+                    value: "/home/wez/My Project".to_string(),
+                },
             ],
             events
+        );
+    }
+
+    #[test]
+    fn parses_subscription_changed_fields_and_spaced_value() {
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "wezterm-pane-cwd".to_string(),
+                session: 1,
+                window: Some(2),
+                pane: Some(3),
+                value: "/home/damir/My Project".to_string(),
+            },
+            parse_line(
+                b"%subscription-changed wezterm-pane-cwd $1 @2 0 %3 future : /home/damir/My Project"
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn parses_window_and_session_subscription_changes() {
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "window-name".to_string(),
+                session: 1,
+                window: Some(2),
+                pane: None,
+                value: "window value".to_string(),
+            },
+            parse_line(b"%subscription-changed window-name $1 @2 0 - : window value").unwrap()
+        );
+        assert_eq!(
+            Event::SubscriptionChanged {
+                name: "session-name".to_string(),
+                session: 1,
+                window: None,
+                pane: None,
+                value: "session value".to_string(),
+            },
+            parse_line(b"%subscription-changed session-name $1 - - - : session value").unwrap()
         );
     }
 

@@ -381,6 +381,30 @@ pub struct MuxWindowBuilder {
     notified: bool,
 }
 
+fn effective_spawn_tab_domain(
+    domain: SpawnTabDomain,
+    current_pane_id: Option<PaneId>,
+) -> SpawnTabDomain {
+    if current_pane_id.is_none() && matches!(domain, SpawnTabDomain::CurrentPaneDomain) {
+        SpawnTabDomain::DefaultDomain
+    } else {
+        domain
+    }
+}
+
+#[cfg(test)]
+mod spawn_domain_test {
+    use super::*;
+
+    #[test]
+    fn current_pane_domain_without_a_pane_uses_default_domain() {
+        assert_eq!(
+            effective_spawn_tab_domain(SpawnTabDomain::CurrentPaneDomain, None),
+            SpawnTabDomain::DefaultDomain
+        );
+    }
+}
+
 impl MuxWindowBuilder {
     fn notify(&mut self) {
         if self.notified {
@@ -1131,11 +1155,11 @@ impl Mux {
             SpawnTabDomain::DefaultDomain => self.default_domain(),
             SpawnTabDomain::CurrentPaneDomain => match pane_id {
                 Some(pane_id) => {
-                    let (pane_domain_id, _window_id, _tab_id) = self
-                        .resolve_pane_id(pane_id)
+                    let pane = self
+                        .get_pane(pane_id)
                         .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
-                    self.get_domain(pane_domain_id)
-                        .expect("resolve_pane_id to give valid domain_id")
+                    self.get_domain(pane.domain_id_for_spawn())
+                        .expect("pane to have valid domain_id")
                 }
                 None => self.default_domain(),
             },
@@ -1324,8 +1348,10 @@ impl Mux {
         workspace_for_new_window: String,
         window_position: Option<GuiPosition>,
     ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
+        // Normalize the historical fallback before forwarding through client domains.
+        let spawn_domain = effective_spawn_tab_domain(domain, current_pane_id);
         let domain = self
-            .resolve_spawn_tab_domain(current_pane_id, &domain)
+            .resolve_spawn_tab_domain(current_pane_id, &spawn_domain)
             .context("resolve_spawn_tab_domain")?;
 
         let window_builder;
@@ -1378,7 +1404,14 @@ impl Mux {
         );
 
         let tab = domain
-            .spawn(size, command.clone(), cwd.clone(), window_id)
+            .spawn(
+                size,
+                command.clone(),
+                cwd.clone(),
+                window_id,
+                spawn_domain,
+                current_pane_id,
+            )
             .await
             .with_context(|| {
                 format!(

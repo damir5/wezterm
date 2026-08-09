@@ -582,7 +582,15 @@ impl ClientDomain {
                     remote_panes_to_forget.remove(&entry.pane_id);
                     if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
                         match mux.get_pane(pane_id) {
-                            Some(pane) => pane,
+                            Some(pane) => {
+                                if let Some(pane) = pane.downcast_ref::<ClientPane>() {
+                                    pane.set_remote_controller_pane_id(entry.controller_pane_id);
+                                    pane.set_current_working_dir(
+                                        entry.working_dir.clone().map(Into::into),
+                                    );
+                                }
+                                pane
+                            }
                             None => {
                                 // We likely decided that we hit EOF on the tab and
                                 // removed it from the mux.  Let's add it back, but
@@ -594,6 +602,8 @@ impl ClientDomain {
                                     entry.pane_id,
                                     entry.size,
                                     &entry.title,
+                                    entry.working_dir.clone().map(Into::into),
+                                    entry.controller_pane_id,
                                 ));
                                 mux.add_pane(&pane).expect("failed to add pane to mux");
                                 pane
@@ -606,6 +616,8 @@ impl ClientDomain {
                             entry.pane_id,
                             entry.size,
                             &entry.title,
+                            entry.working_dir.clone().map(Into::into),
+                            entry.controller_pane_id,
                         ));
                         log::debug!(
                             "domain: {} attaching to remote pane {:?} -> local pane_id {}",
@@ -820,17 +832,33 @@ impl Domain for ClientDomain {
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
         window: WindowId,
+        domain: SpawnTabDomain,
+        current_pane_id: Option<PaneId>,
     ) -> anyhow::Result<Arc<Tab>> {
         let inner = self
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
         let workspace = Mux::get().active_workspace();
-
+        let (domain, current_pane_id) = match domain {
+            SpawnTabDomain::CurrentPaneDomain => {
+                let pane_id = current_pane_id
+                    .ok_or_else(|| anyhow!("CurrentPaneDomain requires a current pane"))?;
+                let pane = Mux::get()
+                    .get_pane(pane_id)
+                    .ok_or_else(|| anyhow!("pane_id {pane_id} is invalid"))?;
+                let pane = pane
+                    .downcast_ref::<ClientPane>()
+                    .ok_or_else(|| anyhow!("pane_id {pane_id} is not a ClientPane"))?;
+                (SpawnTabDomain::CurrentPaneDomain, Some(pane.remote_pane_id))
+            }
+            _ => (SpawnTabDomain::DefaultDomain, None),
+        };
         let result = inner
             .client
             .spawn_v2(SpawnV2 {
-                domain: SpawnTabDomain::DefaultDomain,
+                domain,
+                current_pane_id,
                 window_id: inner.local_to_remote_window(window),
                 size,
                 command,
@@ -847,6 +875,8 @@ impl Domain for ClientDomain {
             result.pane_id,
             size,
             "wezterm",
+            None,
+            result.controller_pane_id,
         ));
         let tab = Arc::new(Tab::new(&size));
         tab.assign_pane(&pane);
@@ -909,6 +939,8 @@ impl Domain for ClientDomain {
             result.pane_id,
             result.size,
             "wezterm",
+            None,
+            result.controller_pane_id,
         ));
 
         let pane_index = match tab

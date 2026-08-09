@@ -278,6 +278,7 @@ fn pane_tree(
                 left_col,
                 top_row,
                 tty_name: pane.tty_name(),
+                controller_pane_id: pane.controller_pane_id(),
             })
         }
     }
@@ -2161,6 +2162,7 @@ pub struct PaneEntry {
     pub top_row: usize,
     pub left_col: usize,
     pub tty_name: Option<String>,
+    pub controller_pane_id: Option<PaneId>,
 }
 
 #[derive(Deserialize, Clone, Serialize, PartialEq, Debug)]
