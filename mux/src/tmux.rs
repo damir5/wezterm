@@ -3,7 +3,8 @@ use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource}
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
-    ListAllPanes, ListAllWindows, ListCommands, NewWindow, SplitPane, SwapWindow, TmuxCommand,
+    ListAllPanes, ListAllWindows, ListCommands, NewWindow, SplitPane, SubscribePaneCwd, SwapWindow,
+    TmuxCommand, PANE_CWD_SUBSCRIPTION,
 };
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
@@ -303,6 +304,7 @@ impl TmuxDomainState {
                     *self.tmux_session.lock() = Some(*session);
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
                     cmd_queue.push_back(Box::new(ListCommands));
+                    cmd_queue.push_back(Box::new(SubscribePaneCwd));
 
                     self.subscribe_notification();
                     log::info!("tmux session changed:{}", session);
@@ -345,6 +347,19 @@ impl TmuxDomainState {
                         let mux = Mux::get();
                         if let Some(tab) = mux.get_tab(x.tab_id) {
                             tab.set_title(&format!("{}", name));
+                        }
+                    }
+                }
+                Event::SubscriptionChanged {
+                    name,
+                    session,
+                    window,
+                    pane,
+                    value,
+                } => {
+                    if name == PANE_CWD_SUBSCRIPTION {
+                        if let (Some(window), Some(pane)) = (window, pane) {
+                            self.update_pane_current_path(*session, *window, *pane, value);
                         }
                     }
                 }
@@ -548,6 +563,8 @@ impl Domain for TmuxDomain {
         _command: Option<CommandBuilder>,
         _command_dir: Option<String>,
         _window: WindowId,
+        _domain: config::keyassignment::SpawnTabDomain,
+        _current_pane_id: Option<PaneId>,
     ) -> anyhow::Result<Arc<Tab>> {
         self.inner.create_tmux_window();
         // This is intention, we would not return a Tab, since we don't have now!

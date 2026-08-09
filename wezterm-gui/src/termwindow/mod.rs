@@ -3246,6 +3246,8 @@ impl TermWindow {
                                 None,
                                 None,
                                 window,
+                                config::keyassignment::SpawnTabDomain::DefaultDomain,
+                                None,
                             )
                             .await?;
                     }
@@ -3596,12 +3598,6 @@ impl TermWindow {
     }
 
     fn pos_pane_to_pane_info(pos: &PositionedPane) -> PaneInformation {
-        let domain = Mux::try_get().and_then(|mux| mux.get_domain(pos.pane.domain_id()));
-        let controller_pane_id = domain.as_ref().and_then(|domain| {
-            domain
-                .downcast_ref::<mux::tmux::TmuxDomain>()
-                .map(|domain| domain.controller_pane_id())
-        });
         PaneInformation {
             pane_id: pos.pane.pane_id(),
             pane_index: pos.index,
@@ -3617,13 +3613,14 @@ impl TermWindow {
             title: pos.pane.get_title(),
             user_vars: pos.pane.copy_user_vars(),
             progress: pos.pane.get_progress(),
-            controller_pane_id,
+            controller_pane_id: pos.pane.controller_pane_id(),
             current_working_dir: pos.pane.get_current_working_dir(CachePolicy::AllowStale),
             foreground_process_name: pos
                 .pane
                 .get_foreground_process_name(CachePolicy::AllowStale)
                 .unwrap_or_default(),
-            domain_name: domain
+            domain_name: Mux::try_get()
+                .and_then(|mux| mux.get_domain(pos.pane.domain_id()))
                 .map(|domain| domain.domain_name().to_string())
                 .unwrap_or_default(),
         }

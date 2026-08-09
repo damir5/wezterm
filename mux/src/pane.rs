@@ -172,6 +172,14 @@ impl LogicalLine {
 pub trait Pane: Downcast + Send + Sync {
     fn pane_id(&self) -> PaneId;
 
+    fn controller_pane_id(&self) -> Option<PaneId> {
+        None
+    }
+
+    fn domain_id_for_spawn(&self) -> DomainId {
+        self.domain_id()
+    }
+
     /// Returns the 0-based cursor position relative to the top left of
     /// the visible screen
     fn get_cursor_position(&self) -> StableCursorPosition;

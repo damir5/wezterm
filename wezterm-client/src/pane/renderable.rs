@@ -91,6 +91,7 @@ impl RenderableInner {
         local_pane_id: PaneId,
         dimensions: RenderableDimensions,
         title: &str,
+        working_dir: Option<Url>,
         fetch_limiter: RateLimiter,
     ) -> Self {
         let now = Instant::now();
@@ -109,7 +110,7 @@ impl RenderableInner {
                 NonZeroUsize::new(configuration().scrollback_lines.max(128)).unwrap(),
             ),
             title: title.to_string(),
-            working_dir: None,
+            working_dir,
             fetch_limiter,
             last_send_time: now,
             last_recv_time: now,

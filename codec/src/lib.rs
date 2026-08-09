@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 45;
+pub const CODEC_VERSION: usize = 46;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -677,6 +677,7 @@ pub struct MovePaneToNewTabResponse {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SpawnV2 {
     pub domain: config::keyassignment::SpawnTabDomain,
+    pub current_pane_id: Option<PaneId>,
     /// If None, create a new window for this new tab
     pub window_id: Option<WindowId>,
     pub command: Option<CommandBuilder>,
@@ -699,6 +700,7 @@ pub struct KillPane {
 pub struct SpawnResponse {
     pub tab_id: TabId,
     pub pane_id: PaneId,
+    pub controller_pane_id: Option<PaneId>,
     pub window_id: WindowId,
     pub size: TerminalSize,
 }
@@ -1185,6 +1187,55 @@ mod test {
             },
             Pdu::decode(encoded.as_slice()).unwrap()
         );
+    }
+
+    #[test]
+    fn tmux_routing_ids_round_trip() {
+        fn assert_round_trip(pdu: Pdu) {
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, 1).unwrap();
+            assert_eq!(Pdu::decode(encoded.as_slice()).unwrap().pdu, pdu);
+        }
+
+        assert_round_trip(Pdu::SpawnV2(SpawnV2 {
+            domain: config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+            current_pane_id: Some(42),
+            window_id: Some(3),
+            command: None,
+            command_dir: None,
+            size: TerminalSize::default(),
+            workspace: "default".to_string(),
+        }));
+
+        assert_round_trip(Pdu::SpawnResponse(SpawnResponse {
+            tab_id: 4,
+            pane_id: 5,
+            controller_pane_id: Some(2),
+            window_id: 3,
+            size: TerminalSize::default(),
+        }));
+
+        assert_round_trip(Pdu::ListPanesResponse(ListPanesResponse {
+            tabs: vec![PaneNode::Leaf(mux::tab::PaneEntry {
+                window_id: 3,
+                tab_id: 4,
+                pane_id: 5,
+                title: "pane".to_string(),
+                size: TerminalSize::default(),
+                working_dir: None,
+                is_active_pane: true,
+                is_zoomed_pane: false,
+                workspace: "default".to_string(),
+                cursor_pos: StableCursorPosition::default(),
+                physical_top: 0,
+                top_row: 0,
+                left_col: 0,
+                tty_name: None,
+                controller_pane_id: Some(2),
+            })],
+            tab_titles: vec!["tab".to_string()],
+            window_titles: HashMap::new(),
+        }));
     }
 
     #[test]
