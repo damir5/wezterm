@@ -5,6 +5,7 @@ use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
     ListAllPanes, ListAllWindows, ListCommands, NewWindow, Resize, SplitPane, SubscribePaneCommand,
     SubscribePaneCwd, SwapWindow, TmuxCommand, PANE_COMMAND_SUBSCRIPTION, PANE_CWD_SUBSCRIPTION,
+    PANE_TITLE_SUBSCRIPTION,
 };
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
@@ -150,6 +151,7 @@ pub(crate) struct TmuxDomainState {
     pub support_commands: Mutex<HashMap<String, String>>,
     pub attach_state: Mutex<AttachState>,
     pub pending_resizes: Mutex<HashMap<TmuxPaneId, (PtySize, u64)>>,
+    pub pending_titles: Mutex<HashMap<TmuxPaneId, (TmuxWindowId, String)>>,
     next_resize_request_id: AtomicU64,
     pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
@@ -541,6 +543,10 @@ impl TmuxDomainState {
                         if let (Some(window), Some(pane)) = (window, pane) {
                             self.update_pane_current_command(*session, *window, *pane, value);
                         }
+                    } else if name == PANE_TITLE_SUBSCRIPTION {
+                        if let (Some(window), Some(pane)) = (window, pane) {
+                            self.update_pane_title(*session, *window, *pane, value);
+                        }
                     }
                 }
                 Event::UnlinkedWindowClose { window } => {
@@ -732,6 +738,7 @@ impl TmuxDomain {
             support_commands: Mutex::new(HashMap::default()),
             attach_state: Mutex::new(AttachState::Init),
             pending_resizes: Mutex::new(HashMap::default()),
+            pending_titles: Mutex::new(HashMap::default()),
             next_resize_request_id: AtomicU64::new(0),
             pending_splits: Mutex::new(VecDeque::default()),
             backlog: Mutex::new(HashMap::default()),
