@@ -28,6 +28,8 @@ opt-level = 3
 # debug = 2
 
 [profile.dev]
+# Remote pane rendering is unusably CPU-heavy without optimization.
+opt-level = 2
 # https://jakedeichert.com/blog/reducing-rust-incremental-compilation-times-on-macos-by-70-percent/
 # Disabled because it breaks builds on Windows
 #split-debuginfo = "unpacked"
