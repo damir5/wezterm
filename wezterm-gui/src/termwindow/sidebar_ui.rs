@@ -992,14 +992,12 @@ fn paint_shape(
             if let Some(track) = track {
                 painter.circle_stroke(center, radius, egui::Stroke::new(width, track));
             }
-            // A quarter turn of bright arc over the dim track reads as
-            // indeterminate progress at 12px in a way a full ring cannot.
-            let steps = 12;
+            let steps = 36;
             let points = (0..=steps)
                 .map(|index| {
                     point(
                         radius,
-                        index as f32 / steps as f32 * std::f32::consts::FRAC_PI_2
+                        index as f32 / steps as f32 * std::f32::consts::PI * 1.5
                             - std::f32::consts::FRAC_PI_2,
                     )
                 })
@@ -1039,7 +1037,12 @@ fn paint_shape(
         }
         ShapeKind::Triangle | ShapeKind::Hexagon => {
             let sides = if kind == ShapeKind::Triangle { 3 } else { 6 };
-            let points = polygon(sides, -std::f32::consts::FRAC_PI_2);
+            let start = if kind == ShapeKind::Triangle {
+                -std::f32::consts::FRAC_PI_2
+            } else {
+                0.0
+            };
+            let points = polygon(sides, start);
             painter.add(if fill {
                 egui::Shape::convex_polygon(points, color, egui::Stroke::NONE)
             } else {
@@ -1048,8 +1051,8 @@ fn paint_shape(
         }
         ShapeKind::Asterisk => {
             let arm = size * 0.42;
-            for index in 0..3 {
-                let base = index as f32 / 3.0 * std::f32::consts::PI;
+            for index in 0..4 {
+                let base = index as f32 / 4.0 * std::f32::consts::PI;
                 painter.add(egui::Shape::line_segment(
                     [point(arm, base), point(arm, base + std::f32::consts::PI)],
                     stroke,
@@ -1057,13 +1060,11 @@ fn paint_shape(
             }
         }
         ShapeKind::Chevron => {
-            let arm = size * 0.34;
-            let tip = point(arm, 0.0);
             painter.add(egui::Shape::line(
                 vec![
-                    point(arm, -std::f32::consts::FRAC_PI_2 - 0.6),
-                    tip,
-                    point(arm, std::f32::consts::FRAC_PI_2 + 0.6),
+                    point(size * 0.44, -2.096),
+                    point(size * 0.18, 0.0),
+                    point(size * 0.44, 2.096),
                 ],
                 stroke,
             ));
