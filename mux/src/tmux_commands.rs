@@ -25,6 +25,7 @@ pub(crate) trait TmuxCommand: Send + Debug {
 
 pub(crate) const PANE_CWD_SUBSCRIPTION: &str = "wezterm-pane-cwd";
 pub(crate) const PANE_COMMAND_SUBSCRIPTION: &str = "wezterm-pane-command";
+pub(crate) const PANE_TITLE_SUBSCRIPTION: &str = "wezterm-pane-title";
 
 fn pane_command(command: &str) -> Option<String> {
     (!command.is_empty()).then(|| command.to_owned())
@@ -89,6 +90,12 @@ fn set_tmux_pane_current_path(pane: &Arc<dyn Pane>, path: Option<&str>) {
     }
 }
 
+fn set_tmux_pane_title(pane: &Arc<dyn Pane>, title: &str) {
+    pane.perform_actions(vec![Action::OperatingSystemCommand(Box::new(
+        OperatingSystemCommand::SetWindowTitle(title.to_string()),
+    ))]);
+}
+
 #[derive(Debug)]
 struct WindowItem {
     session_id: TmuxSessionId,
@@ -146,6 +153,48 @@ impl TmuxDomainState {
         });
         if let Some(pane) = local_pane_id.and_then(|pane_id| Mux::get().get_pane(pane_id)) {
             set_tmux_pane_current_path(&pane, Some(path));
+        }
+    }
+
+    pub fn update_pane_title(
+        &self,
+        session_id: TmuxSessionId,
+        window_id: TmuxWindowId,
+        pane_id: TmuxPaneId,
+        title: &str,
+    ) {
+        if *self.tmux_session.lock() != Some(session_id) {
+            return;
+        }
+        let local_pane_id = self.remote_panes.lock().get(&pane_id).and_then(|pane| {
+            let pane = pane.lock();
+            (pane.window_id == window_id).then_some(pane.local_pane_id)
+        });
+        if let Some(pane) = local_pane_id.and_then(|pane_id| Mux::get().get_pane(pane_id)) {
+            set_tmux_pane_title(&pane, title);
+            self.pending_titles.lock().remove(&pane_id);
+        } else {
+            self.pending_titles
+                .lock()
+                .insert(pane_id, (window_id, title.to_string()));
+        }
+    }
+
+    fn register_pane(
+        &self,
+        mux: &Mux,
+        pane: &Arc<dyn Pane>,
+        remote_pane_id: TmuxPaneId,
+        window_id: TmuxWindowId,
+    ) {
+        if mux.add_pane(pane).is_ok() {
+            let title =
+                self.pending_titles.lock().remove(&remote_pane_id).and_then(
+                    |(pending_window, title)| (pending_window == window_id).then_some(title),
+                );
+            if let Some(title) = title {
+                set_tmux_pane_title(pane, &title);
+            }
         }
     }
 
@@ -389,7 +438,7 @@ impl TmuxDomainState {
 
         self.add_attached_pane(window_id, remote_id)?;
 
-        let _ = mux.add_pane(&pane);
+        self.register_pane(&mux, &pane, remote_id, window_id);
 
         return Ok(pane);
     }
@@ -537,7 +586,7 @@ impl TmuxDomainState {
                         let local_pane = self.create_pane(&p).context("failed to create pane")?;
                         tab.assign_pane(&local_pane);
                         self.add_attached_pane(p.window_id, p.pane_id)?;
-                        let _ = mux.add_pane(&local_pane);
+                        self.register_pane(&mux, &local_pane, p.pane_id, p.window_id);
                         break;
                     }
 
@@ -577,7 +626,7 @@ impl TmuxDomainState {
                     if !self.check_pane_attached(p.window_id, p.pane_id) {
                         local_pane = self.create_pane(&p).context("failed to create pane")?;
                         self.add_attached_pane(p.window_id, p.pane_id)?;
-                        let _ = mux.add_pane(&local_pane);
+                        self.register_pane(&mux, &local_pane, p.pane_id, p.window_id);
                         if let None = tab.get_active_pane() {
                             tab.assign_pane(&local_pane);
                             split_pane_index = tab.get_active_idx();
@@ -1286,6 +1335,25 @@ impl TmuxCommand for SubscribePaneCommand {
 }
 
 #[derive(Debug)]
+pub(crate) struct SubscribePaneTitle;
+
+impl TmuxCommand for SubscribePaneTitle {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!(
+            "refresh-client -B '{}:%*:#{{pane_title}}'\n",
+            PANE_TITLE_SUBSCRIPTION
+        )
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            anyhow::bail!("pane title subscription in domain={domain_id} failed: {result:#?}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct ListCommands;
 impl TmuxCommand for ListCommands {
     fn get_command(&self, _domain_id: DomainId) -> String {
@@ -1451,6 +1519,7 @@ impl TmuxCommand for AttachDone {
         for (pane_id, (size, _)) in pending_resizes {
             cmd_queue.push_back(Box::new(Resize { pane_id, size }));
         }
+        cmd_queue.push_back(Box::new(SubscribePaneTitle));
         drop(cmd_queue);
         TmuxDomainState::schedule_send_next_command(domain_id);
         Ok(())
@@ -1581,6 +1650,14 @@ mod test {
     }
 
     #[test]
+    fn pane_title_subscription_uses_all_panes() {
+        assert_eq!(
+            SubscribePaneTitle.get_command(0),
+            "refresh-client -B 'wezterm-pane-title:%*:#{pane_title}'\n"
+        );
+    }
+
+    #[test]
     fn pane_command_changes_and_clears() {
         assert_eq!(pane_command("claude").as_deref(), Some("claude"));
         assert_eq!(pane_command(""), None);
@@ -1601,6 +1678,16 @@ mod test {
             .insert("resize-window".to_string(), String::new());
 
         let remote_pane_id = 3;
+        *domain.inner.tmux_session.lock() = Some(1);
+        domain
+            .inner
+            .advance(Box::new(vec![Event::SubscriptionChanged {
+                name: PANE_TITLE_SUBSCRIPTION.to_string(),
+                session: 1,
+                window: Some(2),
+                pane: Some(remote_pane_id),
+                value: "Early Remote Title".to_string(),
+            }]));
         let pane = domain
             .inner
             .create_pane(&PaneItem {
@@ -1639,7 +1726,9 @@ mod test {
         assert_eq!(tab.get_size().cols, 80);
         tab.assign_pane(&pane);
         mux.add_tab_no_panes(&tab);
-        mux.add_pane(&pane).unwrap();
+        domain.inner.register_pane(&mux, &pane, remote_pane_id, 2);
+        assert_eq!(pane.get_title(), "Early Remote Title");
+        assert!(domain.inner.pending_titles.lock().is_empty());
         domain.inner.gui_tabs.lock().insert(
             2,
             TmuxTab {
@@ -1649,7 +1738,6 @@ mod test {
                 panes: HashSet::from([remote_pane_id]),
             },
         );
-        *domain.inner.tmux_session.lock() = Some(1);
         domain
             .inner
             .sync_pane_state(&[PaneItem {
@@ -1709,6 +1797,10 @@ mod test {
                 pixel_height: 0
             })
         );
+        assert!(
+            domain.inner.cmd_queue.lock().is_empty(),
+            "pane title subscription waits for AttachDone"
+        );
         AttachDone
             .process_result(
                 domain.inner.domain_id,
@@ -1722,11 +1814,36 @@ mod test {
             )
             .unwrap();
 
-        let replay = domain.inner.cmd_queue.lock().pop_front().unwrap();
+        let mut queue = domain.inner.cmd_queue.lock();
+        let replay = queue.pop_front().unwrap();
         let encoded = replay.get_command(domain.inner.domain_id);
         assert!(encoded.contains("resize-window -x 120 -y 40"));
         assert!(!encoded.contains("resize-pane"));
         assert_eq!(encoded.matches('\n').count(), 1);
+        assert_eq!(
+            queue
+                .pop_front()
+                .unwrap()
+                .get_command(domain.inner.domain_id),
+            "refresh-client -B 'wezterm-pane-title:%*:#{pane_title}'\n"
+        );
+        drop(queue);
+
+        domain
+            .inner
+            .advance(Box::new(vec![Event::SubscriptionChanged {
+                name: PANE_TITLE_SUBSCRIPTION.to_string(),
+                session: 1,
+                window: Some(2),
+                pane: Some(remote_pane_id),
+                value: "Remote Project".to_string(),
+            }]));
+        assert_eq!(pane.get_title(), "Remote Project");
+        assert_eq!(
+            pane.get_foreground_process_name(crate::pane::CachePolicy::AllowStale)
+                .as_deref(),
+            Some("claude")
+        );
         Mux::shutdown();
     }
 }
