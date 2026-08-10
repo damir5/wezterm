@@ -15,6 +15,7 @@ log.workspace = true
 metrics.workspace = true
 mux.workspace = true
 portable-pty = { workspace = true, features = ["serde_support"]}
+procinfo.workspace = true
 rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 smol.workspace = true

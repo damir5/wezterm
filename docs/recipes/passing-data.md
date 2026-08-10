@@ -157,8 +157,9 @@ arrange for bash/zsh to set OSC 7 for you.
 ## Local Process State
 
 wezterm provides some functions that can attempt to extract information about
-processes that are running on the local machine; these will not work with
-multiplexer connections of any kind (even unix multiplexers):
+processes running beside a local pane or on a compatible multiplexer server.
+Multiplexer clients receive cached foreground-process information from the
+server. Plain SSH sessions cannot inspect processes on the remote host:
 
 * [pane:get_foreground_process_info()](../config/lua/pane/get_foreground_process_info.md) -
   returns information about the process hierarchy in a pane

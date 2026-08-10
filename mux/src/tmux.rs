@@ -3,18 +3,20 @@ use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource}
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
-    ListAllPanes, ListAllWindows, ListCommands, NewWindow, SplitPane, SubscribePaneCwd, SwapWindow,
-    TmuxCommand, PANE_CWD_SUBSCRIPTION,
+    ListAllPanes, ListAllWindows, ListCommands, NewWindow, Resize, SplitPane, SubscribePaneCommand,
+    SubscribePaneCwd, SwapWindow, TmuxCommand, PANE_COMMAND_SUBSCRIPTION, PANE_CWD_SUBSCRIPTION,
 };
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
 use async_trait::async_trait;
 use filedescriptor::FileDescriptor;
 use parking_lot::{Condvar, Mutex};
-use portable_pty::CommandBuilder;
+use portable_pty::{CommandBuilder, PtySize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use termwiz::tmux_cc::*;
 use wezterm_term::TerminalSize;
 
@@ -48,6 +50,7 @@ pub(crate) struct TmuxRemotePane {
     pub pane_height: u64,
     pub pane_left: u64,
     pub pane_top: u64,
+    pub current_command: Option<String>,
 }
 
 pub(crate) type RefTmuxRemotePane = Arc<Mutex<TmuxRemotePane>>;
@@ -63,11 +66,13 @@ pub(crate) struct TmuxTab {
 }
 
 pub(crate) type TmuxCmdQueue = VecDeque<Box<dyn TmuxCommand>>;
+type TmuxResponseQueue = VecDeque<Option<Box<dyn TmuxCommand>>>;
+const RESIZE_QUIET_PERIOD: Duration = Duration::from_millis(50);
 
 fn take_pending_commands(
     domain_id: DomainId,
     pending: &mut TmuxCmdQueue,
-    awaiting_response: &mut TmuxCmdQueue,
+    awaiting_response: &mut TmuxResponseQueue,
 ) -> String {
     let mut output = String::new();
     while let Some(command) = pending.pop_front() {
@@ -75,20 +80,22 @@ fn take_pending_commands(
         if encoded.is_empty() {
             continue;
         }
+        let response_count = encoded.lines().filter(|line| !line.is_empty()).count();
         output.push_str(&encoded);
-        awaiting_response.push_back(command);
+        awaiting_response.push_back(Some(command));
+        awaiting_response.extend((1..response_count).map(|_| None));
     }
     output
 }
 
 fn take_response_command(
     response: &Guarded,
-    awaiting_response: &mut TmuxCmdQueue,
+    awaiting_response: &mut TmuxResponseQueue,
 ) -> Option<Box<dyn TmuxCommand>> {
     if response.flags & 1 == 0 {
         None
     } else {
-        awaiting_response.pop_front()
+        awaiting_response.pop_front().flatten()
     }
 }
 
@@ -135,13 +142,15 @@ pub(crate) struct TmuxDomainState {
     pub domain_id: DomainId, // ID of TmuxDomain
     state: Mutex<State>,
     pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
-    response_queue: Mutex<TmuxCmdQueue>,
+    response_queue: Mutex<TmuxResponseQueue>,
     pub gui_window: Mutex<Option<MuxWindowBuilder>>,
     pub gui_tabs: Mutex<HashMap<TmuxWindowId, TmuxTab>>,
     pub remote_panes: Mutex<HashMap<TmuxPaneId, RefTmuxRemotePane>>,
     pub tmux_session: Mutex<Option<TmuxSessionId>>,
     pub support_commands: Mutex<HashMap<String, String>>,
     pub attach_state: Mutex<AttachState>,
+    pub pending_resizes: Mutex<HashMap<TmuxPaneId, (PtySize, u64)>>,
+    next_resize_request_id: AtomicU64,
     pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
 }
@@ -150,6 +159,19 @@ pub(crate) struct TmuxDomainState {
 mod tests {
     use super::*;
     use crate::tmux_commands::SendKeys;
+
+    #[derive(Debug)]
+    struct TwoLineCommand;
+
+    impl TmuxCommand for TwoLineCommand {
+        fn get_command(&self, _domain_id: DomainId) -> String {
+            "first\nsecond\n".to_string()
+        }
+
+        fn process_result(&self, _domain_id: DomainId, _result: &Guarded) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
 
     fn guarded(flags: i64) -> Guarded {
         Guarded {
@@ -173,7 +195,7 @@ mod tests {
                 keys: b"second".to_vec(),
             }) as Box<dyn TmuxCommand>,
         ]);
-        let mut awaiting_response = TmuxCmdQueue::new();
+        let mut awaiting_response = TmuxResponseQueue::new();
 
         let encoded = take_pending_commands(0, &mut pending, &mut awaiting_response);
 
@@ -187,16 +209,117 @@ mod tests {
 
     #[test]
     fn server_guard_does_not_consume_a_client_response() {
-        let mut awaiting_response: TmuxCmdQueue = VecDeque::from([Box::new(SendKeys {
+        let mut awaiting_response: TmuxResponseQueue = VecDeque::from([Some(Box::new(SendKeys {
             pane: 1,
             keys: b"input".to_vec(),
         })
-            as Box<dyn TmuxCommand>]);
+            as Box<dyn TmuxCommand>)]);
 
         assert!(take_response_command(&guarded(0), &mut awaiting_response).is_none());
         assert_eq!(awaiting_response.len(), 1);
         assert!(take_response_command(&guarded(1), &mut awaiting_response).is_some());
         assert!(awaiting_response.is_empty());
+    }
+
+    #[test]
+    fn multiline_command_does_not_consume_the_next_handler() {
+        let mut pending: TmuxCmdQueue = VecDeque::from([
+            Box::new(TwoLineCommand) as Box<dyn TmuxCommand>,
+            Box::new(SendKeys {
+                pane: 1,
+                keys: b"next".to_vec(),
+            }) as Box<dyn TmuxCommand>,
+        ]);
+        let mut awaiting_response = TmuxResponseQueue::new();
+
+        take_pending_commands(0, &mut pending, &mut awaiting_response);
+
+        assert_eq!(awaiting_response.len(), 3);
+        assert!(take_response_command(&guarded(1), &mut awaiting_response).is_some());
+        assert!(take_response_command(&guarded(1), &mut awaiting_response).is_none());
+        assert!(take_response_command(&guarded(1), &mut awaiting_response).is_some());
+        assert!(awaiting_response.is_empty());
+    }
+
+    #[test]
+    fn resize_burst_keeps_only_the_latest_size() {
+        let domain = TmuxDomain::new(1);
+        let requests: Vec<_> = (0..7)
+            .map(|step| {
+                let size = PtySize {
+                    rows: 24 + step,
+                    cols: 80 + step,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                };
+                (domain.inner.remember_resize(1, size), size)
+            })
+            .collect();
+        let (latest, latest_size) = requests[6];
+        assert_eq!(domain.inner.remember_resize(1, latest_size), latest);
+
+        for (obsolete, _) in &requests[..6] {
+            assert_eq!(domain.inner.take_resize(1, *obsolete), None);
+        }
+        assert_eq!(domain.inner.take_resize(1, latest), Some(latest_size));
+        assert!(domain.inner.pending_resizes.lock().is_empty());
+    }
+
+    #[test]
+    fn spawn_queues_initial_size_and_cwd() {
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let domain = TmuxDomain::new(1);
+        domain
+            .inner
+            .support_commands
+            .lock()
+            .insert("resize-window".to_string(), String::new());
+
+        let result = promise::spawn::block_on(domain.spawn(
+            TerminalSize {
+                rows: 47,
+                cols: 141,
+                ..TerminalSize::default()
+            },
+            None,
+            Some("/home/damir/My Project".to_string()),
+            1,
+            config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+            None,
+        ));
+
+        assert!(result.is_err(), "tmux spawn completes from WindowAdd");
+        let command = domain.inner.cmd_queue.lock().pop_front().unwrap();
+        assert_eq!(
+            command.get_command(domain.inner.domain_id),
+            "new-window -c '/home/damir/My Project' ; resize-window -x 141 -y 47\n"
+        );
+    }
+
+    #[test]
+    fn spawn_without_resize_support_keeps_cwd() {
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let domain = TmuxDomain::new(1);
+
+        let result = promise::spawn::block_on(domain.spawn(
+            TerminalSize {
+                rows: 47,
+                cols: 141,
+                ..TerminalSize::default()
+            },
+            None,
+            Some("/home/damir/My Project".to_string()),
+            1,
+            config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+            None,
+        ));
+
+        assert!(result.is_err(), "tmux spawn completes from WindowAdd");
+        let command = domain.inner.cmd_queue.lock().pop_front().unwrap();
+        assert_eq!(
+            command.get_command(domain.inner.domain_id),
+            "new-window -c '/home/damir/My Project'\n"
+        );
     }
 
     #[test]
@@ -213,6 +336,58 @@ pub struct TmuxDomain {
 }
 
 impl TmuxDomainState {
+    pub fn remember_resize(&self, pane_id: TmuxPaneId, size: PtySize) -> u64 {
+        let mut pending = self.pending_resizes.lock();
+        if let Some((pending_size, request_id)) = pending.get(&pane_id) {
+            if *pending_size == size {
+                return *request_id;
+            }
+        }
+        let request_id = self.next_resize_request_id.fetch_add(1, Ordering::Relaxed);
+        pending.insert(pane_id, (size, request_id));
+        request_id
+    }
+
+    fn take_resize(&self, pane_id: TmuxPaneId, request_id: u64) -> Option<PtySize> {
+        let mut pending = self.pending_resizes.lock();
+        (pending.get(&pane_id).map(|resize| resize.1) == Some(request_id))
+            .then(|| pending.remove(&pane_id).unwrap().0)
+    }
+
+    pub fn schedule_resize(domain_id: DomainId, pane_id: TmuxPaneId, size: PtySize) {
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        let Some(domain) = mux.get_domain(domain_id) else {
+            return;
+        };
+        let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+            return;
+        };
+        let request_id = tmux_domain.inner.remember_resize(pane_id, size);
+        smol::spawn(async move {
+            smol::Timer::after(RESIZE_QUIET_PERIOD).await;
+            let Some(mux) = Mux::try_get() else {
+                return;
+            };
+            let Some(domain) = mux.get_domain(domain_id) else {
+                return;
+            };
+            let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+                return;
+            };
+            if let Some(size) = tmux_domain.inner.take_resize(pane_id, request_id) {
+                tmux_domain
+                    .inner
+                    .cmd_queue
+                    .lock()
+                    .push_back(Box::new(Resize { pane_id, size }));
+                Self::schedule_send_next_command(domain_id);
+            }
+        })
+        .detach();
+    }
+
     pub fn advance(&self, events: Box<Vec<Event>>) {
         for event in events.iter() {
             let state = *self.state.lock();
@@ -305,6 +480,7 @@ impl TmuxDomainState {
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
                     cmd_queue.push_back(Box::new(ListCommands));
                     cmd_queue.push_back(Box::new(SubscribePaneCwd));
+                    cmd_queue.push_back(Box::new(SubscribePaneCommand));
 
                     self.subscribe_notification();
                     log::info!("tmux session changed:{}", session);
@@ -360,6 +536,10 @@ impl TmuxDomainState {
                     if name == PANE_CWD_SUBSCRIPTION {
                         if let (Some(window), Some(pane)) = (window, pane) {
                             self.update_pane_current_path(*session, *window, *pane, value);
+                        }
+                    } else if name == PANE_COMMAND_SUBSCRIPTION {
+                        if let (Some(window), Some(pane)) = (window, pane) {
+                            self.update_pane_current_command(*session, *window, *pane, value);
                         }
                     }
                 }
@@ -441,9 +621,17 @@ impl TmuxDomainState {
     }
 
     /// create a tmux window
-    pub fn create_tmux_window(&self) {
+    pub fn create_tmux_window(&self, size: TerminalSize, command_dir: Option<String>) {
+        let resize = self
+            .support_commands
+            .lock()
+            .contains_key("resize-window")
+            .then_some(size);
         let mut cmd_queue = self.cmd_queue.as_ref().lock();
-        cmd_queue.push_back(Box::new(NewWindow));
+        cmd_queue.push_back(Box::new(NewWindow {
+            command_dir,
+            resize,
+        }));
         TmuxDomainState::schedule_send_next_command(self.domain_id);
     }
 
@@ -543,6 +731,8 @@ impl TmuxDomain {
             tmux_session: Mutex::new(None),
             support_commands: Mutex::new(HashMap::default()),
             attach_state: Mutex::new(AttachState::Init),
+            pending_resizes: Mutex::new(HashMap::default()),
+            next_resize_request_id: AtomicU64::new(0),
             pending_splits: Mutex::new(VecDeque::default()),
             backlog: Mutex::new(HashMap::default()),
         });
@@ -559,18 +749,18 @@ impl TmuxDomain {
 impl Domain for TmuxDomain {
     async fn spawn(
         &self,
-        _size: TerminalSize,
+        size: TerminalSize,
         _command: Option<CommandBuilder>,
-        _command_dir: Option<String>,
+        command_dir: Option<String>,
         _window: WindowId,
         _domain: config::keyassignment::SpawnTabDomain,
         _current_pane_id: Option<PaneId>,
     ) -> anyhow::Result<Arc<Tab>> {
-        self.inner.create_tmux_window();
+        self.inner.create_tmux_window(size, command_dir);
         // This is intention, we would not return a Tab, since we don't have now!
         // We use create_tmux_window to create back end tmux window, then the
         // Tmux WindowAdd event will triage us to do the rest things.
-        anyhow::bail!("Intention: we use tmux command to do so");
+        anyhow::bail!("Intention: tmux WindowAdd completes new-window and initial resize");
     }
 
     async fn split_pane(

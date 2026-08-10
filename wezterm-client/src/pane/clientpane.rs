@@ -31,6 +31,19 @@ use wezterm_term::{
     TerminalConfiguration, TerminalSize,
 };
 
+fn process_name(info: Option<&procinfo::LocalProcessInfo>) -> Option<String> {
+    info.map(|info| info.executable.to_string_lossy().into_owned())
+}
+
+fn apply_process_info_update(
+    current: &mut Option<procinfo::LocalProcessInfo>,
+    update: Option<Option<procinfo::LocalProcessInfo>>,
+) {
+    if let Some(info) = update {
+        *current = info;
+    }
+}
+
 pub struct ClientPane {
     client: Arc<ClientInner>,
     local_pane_id: PaneId,
@@ -50,6 +63,7 @@ pub struct ClientPane {
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
+    foreground_process_info: Mutex<Option<procinfo::LocalProcessInfo>>,
 }
 
 impl ClientPane {
@@ -136,6 +150,7 @@ impl ClientPane {
             user_vars: Mutex::new(HashMap::new()),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
+            foreground_process_info: Mutex::new(None),
         }
     }
 
@@ -143,6 +158,13 @@ impl ClientPane {
         match pdu {
             Pdu::GetPaneRenderChangesResponse(mut delta) => {
                 *self.mouse_grabbed.lock() = delta.mouse_grabbed;
+                apply_process_info_update(
+                    &mut self.foreground_process_info.lock(),
+                    delta
+                        .foreground_process_info
+                        .take()
+                        .map(|update| update.map(Into::into)),
+                );
 
                 let bonus_lines = std::mem::take(&mut delta.bonus_lines);
                 let client = { Arc::clone(&self.renderable.lock().inner.borrow().client) };
@@ -576,6 +598,24 @@ impl Pane for ClientPane {
         self.renderable.lock().inner.borrow().working_dir.clone()
     }
 
+    fn get_foreground_process_name(&self, _policy: CachePolicy) -> Option<String> {
+        process_name(self.foreground_process_info.lock().as_ref())
+    }
+
+    fn get_foreground_process_info(
+        &self,
+        _policy: CachePolicy,
+    ) -> Option<procinfo::LocalProcessInfo> {
+        self.foreground_process_info.lock().clone()
+    }
+
+    fn get_foreground_process_id(&self, _policy: CachePolicy) -> Option<u32> {
+        self.foreground_process_info
+            .lock()
+            .as_ref()
+            .map(|info| info.pid)
+    }
+
     fn focus_changed(&self, focused: bool) {
         if focused {
             self.advise_focus();
@@ -660,6 +700,44 @@ impl Pane for ClientPane {
 
     fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
         self.config.lock().clone()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{apply_process_info_update, process_name};
+    use procinfo::{LocalProcessInfo, LocalProcessStatus};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn transported_process_info_supplies_client_pane_process_name() {
+        let info = LocalProcessInfo {
+            pid: 42,
+            ppid: 1,
+            name: "2.1.226".to_string(),
+            executable: PathBuf::from("/Users/damir/.local/share/claude/versions/2.1.226"),
+            argv: vec!["claude".to_string()],
+            cwd: PathBuf::new(),
+            status: LocalProcessStatus::Run,
+            start_time: 0,
+            #[cfg(windows)]
+            console: 0,
+            children: HashMap::new(),
+        };
+
+        assert_eq!(
+            process_name(Some(&info)).as_deref(),
+            Some("/Users/damir/.local/share/claude/versions/2.1.226")
+        );
+
+        let mut cached = Some(info.clone());
+        apply_process_info_update(&mut cached, None);
+        assert_eq!(cached, Some(info.clone()), "no update preserves the cache");
+        apply_process_info_update(&mut cached, Some(None));
+        assert_eq!(cached, None, "an explicit clear removes the cache");
+        apply_process_info_update(&mut cached, Some(Some(info.clone())));
+        assert_eq!(cached, Some(info), "a replacement populates the cache");
     }
 }
 
