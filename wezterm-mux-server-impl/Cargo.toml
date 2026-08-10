@@ -21,6 +21,7 @@ libc.workspace = true
 log.workspace = true
 mux.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
+procinfo.workspace = true
 promise.workspace = true
 rangeset.workspace = true
 rcgen.workspace = true

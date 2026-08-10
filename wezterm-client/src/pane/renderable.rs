@@ -25,7 +25,27 @@ use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
 
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const LOCAL_MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const BASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+fn max_poll_interval(is_local: bool) -> Duration {
+    if is_local {
+        LOCAL_MAX_POLL_INTERVAL
+    } else {
+        MAX_POLL_INTERVAL
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{max_poll_interval, LOCAL_MAX_POLL_INTERVAL, MAX_POLL_INTERVAL};
+
+    #[test]
+    fn only_local_mux_uses_five_second_poll_cap() {
+        assert_eq!(max_poll_interval(true), LOCAL_MAX_POLL_INTERVAL);
+        assert_eq!(max_poll_interval(false), MAX_POLL_INTERVAL);
+    }
+}
 
 #[derive(Debug)]
 enum LineEntry {
@@ -61,6 +81,7 @@ pub struct RenderableInner {
     pub dead: bool,
     poll_in_progress: AtomicBool,
     poll_interval: Duration,
+    max_poll_interval: Duration,
 
     cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
@@ -104,6 +125,7 @@ impl RenderableInner {
             dead: false,
             poll_in_progress: AtomicBool::new(false),
             poll_interval: BASE_POLL_INTERVAL,
+            max_poll_interval: max_poll_interval(client.is_local()),
             cursor_position: StableCursorPosition::default(),
             dimensions,
             lines: LruCache::new(
@@ -595,7 +617,7 @@ impl RenderableInner {
         }
 
         let interval = self.poll_interval;
-        let interval = (interval + interval).min(MAX_POLL_INTERVAL);
+        let interval = (interval + interval).min(self.max_poll_interval);
         self.poll_interval = interval;
 
         self.last_poll = Instant::now();

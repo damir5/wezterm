@@ -12,6 +12,7 @@ lua = ["dep:luahelper", "dep:wezterm-dynamic"]
 [dependencies]
 libc.workspace = true
 log.workspace = true
+serde = { workspace = true, features = ["derive"] }
 luahelper = { workspace=true, optional = true }
 wezterm-dynamic = { workspace=true, optional = true, features=["std"]}
 
@@ -25,4 +26,3 @@ winapi = { workspace=true, features = [
     "shellapi",
     "tlhelp32",
 ]}
-

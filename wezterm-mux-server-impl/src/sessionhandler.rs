@@ -11,7 +11,7 @@ use mux::{Mux, MuxNotification};
 use promise::spawn::spawn_into_main_thread;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use termwiz::surface::SequenceNo;
 use url::Url;
 use wezterm_term::terminal::Alert;
@@ -40,12 +40,42 @@ pub(crate) struct PerPane {
     cursor_position: StableCursorPosition,
     title: String,
     working_dir: Option<Url>,
+    foreground_process_name: Option<String>,
+    foreground_process_id: Option<u32>,
+    foreground_process_info: Option<procinfo::LocalProcessInfo>,
+    foreground_process_checked_at: Option<Instant>,
+    foreground_process_probe_failed: bool,
     dimensions: RenderableDimensions,
     mouse_grabbed: bool,
     sent_initial_palette: bool,
     seqno: SequenceNo,
     config_generation: usize,
     pub(crate) notifications: Vec<Alert>,
+}
+
+const FOREGROUND_PROCESS_REFRESH: Duration = Duration::from_secs(5);
+
+fn foreground_process_update(
+    current: &Option<procinfo::LocalProcessInfo>,
+    next: Option<procinfo::LocalProcessInfo>,
+) -> Option<Option<procinfo::LocalProcessInfo>> {
+    if current == &next {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+fn foreground_process_probe_due(
+    process_identity_changed: bool,
+    prior_probe_failed: bool,
+    since_last_probe: Option<Duration>,
+) -> bool {
+    process_identity_changed
+        || prior_probe_failed
+            && since_last_probe
+                .map(|elapsed| elapsed >= FOREGROUND_PROCESS_REFRESH)
+                .unwrap_or(true)
 }
 
 impl PerPane {
@@ -78,6 +108,35 @@ impl PerPane {
         let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
         if working_dir != self.working_dir {
             changed = true;
+        }
+
+        let foreground_process_name = pane.get_foreground_process_name(CachePolicy::AllowStale);
+        let foreground_process_id = pane.get_foreground_process_id(CachePolicy::AllowStale);
+        let mut foreground_process_info = None;
+        let process_identity_changed = foreground_process_name != self.foreground_process_name
+            || foreground_process_id != self.foreground_process_id;
+        let process_probe_due = foreground_process_probe_due(
+            process_identity_changed,
+            self.foreground_process_probe_failed,
+            self.foreground_process_checked_at
+                .map(|checked| checked.elapsed()),
+        );
+        if process_probe_due {
+            self.foreground_process_checked_at = Some(Instant::now());
+            self.foreground_process_name = foreground_process_name.clone();
+            self.foreground_process_id = foreground_process_id;
+            let next_process_info = pane.get_foreground_process_info(CachePolicy::AllowStale);
+            let process_absent = foreground_process_id.is_none();
+            self.foreground_process_probe_failed = next_process_info.is_none() && !process_absent;
+            if !self.foreground_process_probe_failed {
+                if let Some(update) =
+                    foreground_process_update(&self.foreground_process_info, next_process_info)
+                {
+                    changed = true;
+                    self.foreground_process_info = update.clone();
+                    foreground_process_info = Some(update.map(Into::into));
+                }
+            }
         }
 
         let old_seqno = self.seqno;
@@ -137,9 +196,69 @@ impl PerPane {
             title,
             bonus_lines,
             working_dir: working_dir.map(Into::into),
+            foreground_process_info,
             input_serial: force_with_input_serial,
             seqno: self.seqno,
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{foreground_process_probe_due, foreground_process_update};
+    use procinfo::{LocalProcessInfo, LocalProcessStatus};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    fn process(pid: u32) -> LocalProcessInfo {
+        LocalProcessInfo {
+            pid,
+            ppid: 1,
+            name: "claude".to_string(),
+            executable: "/opt/claude/2.1.226".into(),
+            argv: vec!["claude".to_string()],
+            cwd: "/tmp".into(),
+            status: LocalProcessStatus::Run,
+            start_time: pid as u64,
+            #[cfg(windows)]
+            console: 0,
+            children: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn same_executable_with_new_pid_replaces_cached_process() {
+        let current = Some(process(41));
+        assert_eq!(foreground_process_update(&current, current.clone()), None);
+        assert_eq!(
+            foreground_process_update(&current, Some(process(42))),
+            Some(Some(process(42)))
+        );
+        assert_eq!(foreground_process_update(&current, None), Some(None));
+    }
+
+    #[test]
+    fn failed_probe_backs_off_until_five_second_refresh() {
+        assert!(foreground_process_probe_due(
+            true,
+            false,
+            Some(Duration::ZERO)
+        ));
+        assert!(!foreground_process_probe_due(
+            false,
+            true,
+            Some(Duration::from_secs(4))
+        ));
+        assert!(foreground_process_probe_due(
+            false,
+            true,
+            Some(Duration::from_secs(5))
+        ));
+        assert!(!foreground_process_probe_due(
+            false,
+            false,
+            Some(Duration::from_secs(5))
+        ));
     }
 }
 

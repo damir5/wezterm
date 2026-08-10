@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -8,7 +9,7 @@ mod linux;
 mod macos;
 mod windows;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "lua", derive(FromDynamic, ToDynamic))]
 pub enum LocalProcessStatus {
     Idle,
@@ -25,7 +26,7 @@ pub enum LocalProcessStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "lua", derive(FromDynamic, ToDynamic))]
 pub struct LocalProcessInfo {
     /// The process identifier

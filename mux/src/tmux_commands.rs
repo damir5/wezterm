@@ -24,6 +24,11 @@ pub(crate) trait TmuxCommand: Send + Debug {
 }
 
 pub(crate) const PANE_CWD_SUBSCRIPTION: &str = "wezterm-pane-cwd";
+pub(crate) const PANE_COMMAND_SUBSCRIPTION: &str = "wezterm-pane-command";
+
+fn pane_command(command: &str) -> Option<String> {
+    (!command.is_empty()).then(|| command.to_owned())
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct PaneItem {
@@ -43,6 +48,7 @@ pub(crate) struct PaneItem {
     mouse_all: bool,
     mouse_utf8: bool,
     mouse_sgr: bool,
+    current_command: Option<String>,
     current_path: Option<String>,
 }
 
@@ -97,6 +103,33 @@ struct WindowItem {
 }
 
 impl TmuxDomainState {
+    pub fn pane_current_command(&self, local_pane_id: PaneId) -> Option<String> {
+        self.remote_panes.lock().values().find_map(|pane| {
+            let pane = pane.lock();
+            (pane.local_pane_id == local_pane_id)
+                .then(|| pane.current_command.clone())
+                .flatten()
+        })
+    }
+
+    pub fn update_pane_current_command(
+        &self,
+        session_id: TmuxSessionId,
+        window_id: TmuxWindowId,
+        pane_id: TmuxPaneId,
+        command: &str,
+    ) {
+        if *self.tmux_session.lock() != Some(session_id) {
+            return;
+        }
+        if let Some(pane) = self.remote_panes.lock().get(&pane_id) {
+            let mut pane = pane.lock();
+            if pane.window_id == window_id {
+                pane.current_command = pane_command(command);
+            }
+        }
+    }
+
     pub fn update_pane_current_path(
         &self,
         session_id: TmuxSessionId,
@@ -248,6 +281,7 @@ impl TmuxDomainState {
             pane_height: pane.pane_height,
             pane_left: pane.pane_left,
             pane_top: pane.pane_top,
+            current_command: pane.current_command.clone(),
         }));
 
         {
@@ -346,6 +380,7 @@ impl TmuxDomainState {
             mouse_all: false,
             mouse_utf8: false,
             mouse_sgr: false,
+            current_command: None,
             current_path: None,
         };
 
@@ -371,6 +406,13 @@ impl TmuxDomainState {
             {
                 continue;
             }
+
+            self.update_pane_current_command(
+                pane.session_id,
+                pane.window_id,
+                pane.pane_id,
+                pane.current_command.as_deref().unwrap_or_default(),
+            );
 
             // We now have the cursor information, fix the cursor position
             let pane_map = self.remote_panes.lock();
@@ -489,6 +531,7 @@ impl TmuxDomainState {
                             mouse_all: false,
                             mouse_utf8: false,
                             mouse_sgr: false,
+                            current_command: None,
                             current_path: None,
                         };
                         let local_pane = self.create_pane(&p).context("failed to create pane")?;
@@ -527,6 +570,7 @@ impl TmuxDomainState {
                         mouse_all: false,
                         mouse_utf8: false,
                         mouse_sgr: false,
+                        current_command: None,
                         current_path: None,
                     };
                     let local_pane;
@@ -720,7 +764,7 @@ fn parse_sigil_number(text: &str) -> anyhow::Result<u64> {
 }
 
 fn parse_pane_item(line: &str) -> anyhow::Result<PaneItem> {
-    let mut fields = line.splitn(17, ' ');
+    let mut fields = line.splitn(18, '\t');
     let session_id =
         parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
     let window_id = parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing window_id"))?)?;
@@ -770,6 +814,7 @@ fn parse_pane_item(line: &str) -> anyhow::Result<PaneItem> {
     let mouse_all = mouse_flag("mouse_all_flag")?;
     let mouse_utf8 = mouse_flag("mouse_utf8_flag")?;
     let mouse_sgr = mouse_flag("mouse_sgr_flag")?;
+    let current_command = fields.next().and_then(pane_command);
     let current_path = fields
         .next()
         .filter(|path| !path.is_empty())
@@ -792,6 +837,7 @@ fn parse_pane_item(line: &str) -> anyhow::Result<PaneItem> {
         mouse_all,
         mouse_utf8,
         mouse_sgr,
+        current_command,
         current_path,
     })
 }
@@ -830,12 +876,12 @@ impl TmuxCommand for ListAllPanes {
         }
 
         format!(
-            "list-panes -F '#{{session_id}} #{{window_id}} #{{pane_id}} \
-            #{{pane_index}} #{{cursor_x}} #{{cursor_y}} #{{pane_width}} #{{pane_height}} \
-            #{{pane_left}} #{{pane_top}} #{{pane_active}} \
-            #{{?mouse_standard_flag,1,0}} #{{?mouse_button_flag,1,0}} \
-            #{{?mouse_all_flag,1,0}} #{{?mouse_utf8_flag,1,0}} \
-            #{{?mouse_sgr_flag,1,0}} #{{pane_current_path}}' -t @{}\n",
+            "list-panes -F '#{{session_id}}\t#{{window_id}}\t#{{pane_id}}\t\
+            #{{pane_index}}\t#{{cursor_x}}\t#{{cursor_y}}\t#{{pane_width}}\t#{{pane_height}}\t\
+            #{{pane_left}}\t#{{pane_top}}\t#{{pane_active}}\t\
+            #{{?mouse_standard_flag,1,0}}\t#{{?mouse_button_flag,1,0}}\t\
+            #{{?mouse_all_flag,1,0}}\t#{{?mouse_utf8_flag,1,0}}\t\
+            #{{?mouse_sgr_flag,1,0}}\t#{{pane_current_command}}\t#{{pane_current_path}}' -t @{}\n",
             self.window_id
         )
     }
@@ -1003,9 +1049,12 @@ impl TmuxCommand for Resize {
 
         // Not in stable state for now, don't do resizing, otherwise it will cause tmux output
         // unexpected content.
-        if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
+        let attach_state = tmux_domain.inner.attach_state.lock();
+        if *attach_state == AttachState::Init {
+            tmux_domain.inner.remember_resize(self.pane_id, self.size);
             return "".to_string();
         }
+        drop(attach_state);
 
         let pane_map = tmux_domain.inner.remote_panes.lock();
         {
@@ -1033,6 +1082,7 @@ impl TmuxCommand for Resize {
             Some(t) => t,
             None => return "".to_string(),
         };
+        let single_pane = local_tab.panes.len() == 1;
 
         let size = match mux.get_tab(local_tab.tab_id) {
             Some(x) => x.get_size(),
@@ -1042,10 +1092,22 @@ impl TmuxCommand for Resize {
         let support_commands = tmux_domain.inner.support_commands.lock();
 
         if let Some(_x) = support_commands.get("resize-window") {
-            format!(
-                "resize-window -x {} -y {} -t @{}\nresize-pane -x {} -y {} -t %{}\n",
-                size.cols, size.rows, tmux_window_id, self.size.cols, self.size.rows, self.pane_id
-            )
+            if single_pane {
+                format!(
+                    "resize-window -x {} -y {} -t @{}\n",
+                    size.cols, size.rows, tmux_window_id
+                )
+            } else {
+                format!(
+                    "resize-window -x {} -y {} -t @{}\nresize-pane -x {} -y {} -t %{}\n",
+                    size.cols,
+                    size.rows,
+                    tmux_window_id,
+                    self.size.cols,
+                    self.size.rows,
+                    self.pane_id
+                )
+            }
         } else if let Some(x) = support_commands.get("refresh-client") {
             if x.contains("-C XxY") {
                 format!(
@@ -1150,15 +1212,34 @@ impl TmuxCommand for SendKeys {
 }
 
 #[derive(Debug)]
-pub(crate) struct NewWindow;
+pub(crate) struct NewWindow {
+    pub command_dir: Option<String>,
+    pub resize: Option<TerminalSize>,
+}
 impl TmuxCommand for NewWindow {
     fn get_command(&self, _domain_id: DomainId) -> String {
-        "new-window\n".to_owned()
+        let cwd = self
+            .command_dir
+            .as_deref()
+            .map(|cwd| format!(" -c {}", shell_words::quote(cwd)))
+            .unwrap_or_default();
+        match self.resize {
+            Some(size) => format!(
+                "new-window{cwd} ; resize-window -x {} -y {}\n",
+                size.cols, size.rows
+            ),
+            None => format!("new-window{cwd}\n"),
+        }
     }
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
-            let error = format!("new-window in domain={domain_id} failed: {result:#?}");
+            let operation = if self.resize.is_some() {
+                "new-window/resize-window"
+            } else {
+                "new-window"
+            };
+            let error = format!("{operation} in domain={domain_id} failed: {result:#?}");
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
@@ -1180,6 +1261,25 @@ impl TmuxCommand for SubscribePaneCwd {
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
             anyhow::bail!("pane cwd subscription in domain={domain_id} failed: {result:#?}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SubscribePaneCommand;
+
+impl TmuxCommand for SubscribePaneCommand {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!(
+            "refresh-client -B '{}:%*:#{{pane_current_command}}'\n",
+            PANE_COMMAND_SUBSCRIPTION
+        )
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            anyhow::bail!("pane command subscription in domain={domain_id} failed: {result:#?}");
         }
         Ok(())
     }
@@ -1343,8 +1443,16 @@ impl TmuxCommand for AttachDone {
             None => anyhow::bail!("Tmux domain lost"),
         };
 
-        // Do nothing, just change the state.
-        *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+        let mut attach_state = tmux_domain.inner.attach_state.lock();
+        *attach_state = AttachState::Done;
+        let pending_resizes = std::mem::take(&mut *tmux_domain.inner.pending_resizes.lock());
+        drop(attach_state);
+        let mut cmd_queue = tmux_domain.inner.cmd_queue.lock();
+        for (pane_id, (size, _)) in pending_resizes {
+            cmd_queue.push_back(Box::new(Resize { pane_id, size }));
+        }
+        drop(cmd_queue);
+        TmuxDomainState::schedule_send_next_command(domain_id);
         Ok(())
     }
 }
@@ -1361,6 +1469,26 @@ mod test {
         };
 
         assert_eq!(command.get_command(0), "swap-window -s @11 -t @22\n");
+    }
+
+    #[test]
+    fn new_window_without_resize_keeps_optional_cwd() {
+        assert_eq!(
+            NewWindow {
+                command_dir: Some("/home/damir/My Project".to_string()),
+                resize: None,
+            }
+            .get_command(0),
+            "new-window -c '/home/damir/My Project'\n"
+        );
+        assert_eq!(
+            NewWindow {
+                command_dir: None,
+                resize: None,
+            }
+            .get_command(0),
+            "new-window\n"
+        );
     }
 
     #[test]
@@ -1389,6 +1517,7 @@ mod test {
             mouse_all: true,
             mouse_utf8: false,
             mouse_sgr: true,
+            current_command: Some("claude".to_string()),
             current_path: None,
         };
 
@@ -1406,9 +1535,12 @@ mod test {
 
     #[test]
     fn list_pane_parser_preserves_spaced_current_path() {
-        let pane =
-            parse_pane_item("$1 @2 %3 0 4 5 80 24 0 0 1 0 0 0 0 0 /home/damir/My Project").unwrap();
+        let pane = parse_pane_item(
+            "$1\t@2\t%3\t0\t4\t5\t80\t24\t0\t0\t1\t0\t0\t0\t0\t0\tclaude\t/home/damir/My Project",
+        )
+        .unwrap();
 
+        assert_eq!(pane.current_command.as_deref(), Some("claude"));
         assert_eq!(pane.current_path.as_deref(), Some("/home/damir/My Project"));
     }
 
@@ -1438,5 +1570,163 @@ mod test {
             SubscribePaneCwd.get_command(0),
             "refresh-client -B 'wezterm-pane-cwd:%*:#{pane_current_path}'\n"
         );
+    }
+
+    #[test]
+    fn pane_command_subscription_uses_all_panes() {
+        assert_eq!(
+            SubscribePaneCommand.get_command(0),
+            "refresh-client -B 'wezterm-pane-command:%*:#{pane_current_command}'\n"
+        );
+    }
+
+    #[test]
+    fn pane_command_changes_and_clears() {
+        assert_eq!(pane_command("claude").as_deref(), Some("claude"));
+        assert_eq!(pane_command(""), None);
+    }
+
+    #[test]
+    fn tmux_attach_restores_resize_and_process_identity() {
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let domain = Arc::new(TmuxDomain::new(alloc_pane_id()));
+        let dyn_domain: Arc<dyn crate::Domain> = domain.clone();
+        mux.add_domain(&dyn_domain);
+        domain
+            .inner
+            .support_commands
+            .lock()
+            .insert("resize-window".to_string(), String::new());
+
+        let remote_pane_id = 3;
+        let pane = domain
+            .inner
+            .create_pane(&PaneItem {
+                session_id: 1,
+                window_id: 2,
+                pane_id: remote_pane_id,
+                _pane_index: 0,
+                cursor_x: 0,
+                cursor_y: 0,
+                pane_width: 80,
+                pane_height: 24,
+                pane_left: 0,
+                pane_top: 0,
+                pane_active: true,
+                mouse_standard: false,
+                mouse_button: false,
+                mouse_all: false,
+                mouse_utf8: false,
+                mouse_sgr: false,
+                current_command: None,
+                current_path: None,
+            })
+            .unwrap();
+        let initial = TerminalSize {
+            rows: 24,
+            cols: 80,
+            ..TerminalSize::default()
+        };
+        let desired = TerminalSize {
+            rows: 40,
+            cols: 120,
+            ..TerminalSize::default()
+        };
+        let tab = Arc::new(Tab::new(&initial));
+        assert_eq!(tab.get_size().rows, 24);
+        assert_eq!(tab.get_size().cols, 80);
+        tab.assign_pane(&pane);
+        mux.add_tab_no_panes(&tab);
+        mux.add_pane(&pane).unwrap();
+        domain.inner.gui_tabs.lock().insert(
+            2,
+            TmuxTab {
+                tab_id: tab.tab_id(),
+                tmux_window_id: 2,
+                layout_csum: String::new(),
+                panes: HashSet::from([remote_pane_id]),
+            },
+        );
+        *domain.inner.tmux_session.lock() = Some(1);
+        domain
+            .inner
+            .sync_pane_state(&[PaneItem {
+                session_id: 1,
+                window_id: 2,
+                pane_id: remote_pane_id,
+                _pane_index: 0,
+                cursor_x: 0,
+                cursor_y: 0,
+                pane_width: 80,
+                pane_height: 24,
+                pane_left: 0,
+                pane_top: 0,
+                pane_active: true,
+                mouse_standard: false,
+                mouse_button: false,
+                mouse_all: false,
+                mouse_utf8: false,
+                mouse_sgr: false,
+                current_command: Some("claude".to_string()),
+                current_path: None,
+            }])
+            .unwrap();
+        assert_eq!(
+            pane.get_foreground_process_name(crate::pane::CachePolicy::AllowStale)
+                .as_deref(),
+            Some("claude")
+        );
+        domain.inner.cmd_queue.lock().clear();
+        tab.resize(desired);
+        domain.inner.cmd_queue.lock().clear();
+
+        assert_eq!(
+            Resize {
+                pane_id: remote_pane_id,
+                size: PtySize {
+                    rows: desired.rows as u16,
+                    cols: desired.cols as u16,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }
+            .get_command(domain.inner.domain_id),
+            ""
+        );
+        assert_eq!(
+            domain
+                .inner
+                .pending_resizes
+                .lock()
+                .get(&remote_pane_id)
+                .map(|resize| resize.0),
+            Some(PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0
+            })
+        );
+        AttachDone
+            .process_result(
+                domain.inner.domain_id,
+                &Guarded {
+                    error: false,
+                    timestamp: 0,
+                    number: 0,
+                    flags: 1,
+                    output: String::new(),
+                },
+            )
+            .unwrap();
+
+        let replay = domain.inner.cmd_queue.lock().pop_front().unwrap();
+        let encoded = replay.get_command(domain.inner.domain_id);
+        assert!(encoded.contains("resize-window -x 120 -y 40"));
+        assert!(!encoded.contains("resize-pane"));
+        assert_eq!(encoded.matches('\n').count(), 1);
+        Mux::shutdown();
     }
 }

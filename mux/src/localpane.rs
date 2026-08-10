@@ -556,7 +556,34 @@ impl Pane for LocalPane {
         self.divine_foreground_process(policy)
     }
 
+    fn get_foreground_process_id(&self, _policy: CachePolicy) -> Option<u32> {
+        #[cfg(unix)]
+        if let Some(pid) = self.pty.lock().process_group_leader() {
+            return pid.try_into().ok();
+        }
+
+        #[cfg(windows)]
+        if let Some(info) = self.divine_foreground_process(_policy) {
+            return Some(info.pid);
+        }
+
+        #[allow(unreachable_code)]
+        None
+    }
+
     fn get_foreground_process_name(&self, policy: CachePolicy) -> Option<String> {
+        // tmux process identity comes from tmux, not screen text.
+        if let Some(command) = Mux::try_get()
+            .and_then(|mux| mux.get_domain(self.domain_id))
+            .and_then(|domain| {
+                domain
+                    .downcast_ref::<TmuxDomain>()
+                    .and_then(|tmux| tmux.inner.pane_current_command(self.pane_id))
+            })
+        {
+            return Some(command);
+        }
+
         #[cfg(unix)]
         {
             let leader = self.get_leader(policy);

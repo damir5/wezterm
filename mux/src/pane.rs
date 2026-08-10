@@ -345,6 +345,10 @@ pub trait Pane: Downcast + Send + Sync {
     ) -> Option<procinfo::LocalProcessInfo> {
         None
     }
+    fn get_foreground_process_id(&self, policy: CachePolicy) -> Option<u32> {
+        self.get_foreground_process_info(policy)
+            .map(|info| info.pid)
+    }
 
     fn tty_name(&self) -> Option<String> {
         None

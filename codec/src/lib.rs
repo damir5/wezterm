@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 46;
+pub const CODEC_VERSION: usize = 47;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -912,6 +912,72 @@ pub struct LivenessResponse {
     pub is_alive: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ForegroundProcessInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub name: String,
+    pub executable: PathBuf,
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub status: procinfo::LocalProcessStatus,
+    pub start_time: u64,
+    pub console: Option<u64>,
+    pub children: HashMap<u32, ForegroundProcessInfo>,
+}
+
+impl From<procinfo::LocalProcessInfo> for ForegroundProcessInfo {
+    fn from(info: procinfo::LocalProcessInfo) -> Self {
+        Self {
+            pid: info.pid,
+            ppid: info.ppid,
+            name: info.name,
+            executable: info.executable,
+            argv: info.argv,
+            cwd: info.cwd,
+            status: info.status,
+            start_time: info.start_time,
+            console: {
+                #[cfg(windows)]
+                {
+                    Some(info.console)
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            },
+            children: info
+                .children
+                .into_iter()
+                .map(|(pid, child)| (pid, child.into()))
+                .collect(),
+        }
+    }
+}
+
+impl From<ForegroundProcessInfo> for procinfo::LocalProcessInfo {
+    fn from(info: ForegroundProcessInfo) -> Self {
+        Self {
+            pid: info.pid,
+            ppid: info.ppid,
+            name: info.name,
+            executable: info.executable,
+            argv: info.argv,
+            cwd: info.cwd,
+            status: info.status,
+            start_time: info.start_time,
+            #[cfg(windows)]
+            console: info.console.unwrap_or_default(),
+            children: info
+                .children
+                .into_iter()
+                .map(|(pid, child)| (pid, child.into()))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct GetPaneRenderChangesResponse {
     pub pane_id: PaneId,
@@ -921,6 +987,9 @@ pub struct GetPaneRenderChangesResponse {
     pub dirty_lines: Vec<Range<StableRowIndex>>,
     pub title: String,
     pub working_dir: Option<SerdeUrl>,
+    /// `None` means unchanged; `Some(None)` clears the cached process;
+    /// `Some(Some(info))` replaces it.
+    pub foreground_process_info: Option<Option<ForegroundProcessInfo>>,
     /// Lines that the server thought we'd almost certainly
     /// want to fetch as soon as we received this response
     pub bonus_lines: SerializedLines,
@@ -1236,6 +1305,38 @@ mod test {
             tab_titles: vec!["tab".to_string()],
             window_titles: HashMap::new(),
         }));
+    }
+
+    #[test]
+    fn foreground_process_info_round_trips() {
+        let info = ForegroundProcessInfo {
+            pid: 42,
+            ppid: 1,
+            name: "2.1.226".to_string(),
+            executable: "/opt/claude/2.1.226".into(),
+            argv: vec!["claude".to_string()],
+            cwd: "/tmp".into(),
+            status: procinfo::LocalProcessStatus::Run,
+            start_time: 1,
+            console: Some(99),
+            children: HashMap::new(),
+        };
+        let pdu = Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+            pane_id: 5,
+            mouse_grabbed: false,
+            cursor_position: StableCursorPosition::default(),
+            dimensions: RenderableDimensions::default(),
+            dirty_lines: vec![],
+            title: "Claude Code".to_string(),
+            working_dir: None,
+            foreground_process_info: Some(Some(info)),
+            bonus_lines: SerializedLines::default(),
+            input_serial: None,
+            seqno: SequenceNo::default(),
+        });
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 1).unwrap();
+        assert_eq!(Pdu::decode(encoded.as_slice()).unwrap().pdu, pdu);
     }
 
     #[test]
