@@ -654,6 +654,17 @@ impl TermWindow {
                     tab.resize(terminal_size);
                 }
             };
+        } else if let Some(window) = mux.get_window(mux_window_id) {
+            for tab in window.iter() {
+                // Mirrored tmux tabs created while no window was attached keep
+                // the detached session's size (tmux -CC attach does not size
+                // the session to the control client) and dpi 0. The
+                // TabAddedToWindow fixup never ran for them, so activation
+                // alone leaves them at the wrong size until a window resize.
+                if tab.get_size().dpi == 0 {
+                    tab.resize(terminal_size);
+                }
+            }
         }
 
         let h_context = DimensionContext {

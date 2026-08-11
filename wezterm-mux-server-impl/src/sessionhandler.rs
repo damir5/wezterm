@@ -66,6 +66,26 @@ fn foreground_process_update(
     }
 }
 
+/// tmux panes have no local procinfo; their identity is the
+/// pane_current_command reported by tmux. Synthesize just enough process
+/// info for clients to learn the foreground process name, since the codec
+/// carries ForegroundProcessInfo rather than the bare name.
+fn synthesize_process_info(name: &str) -> procinfo::LocalProcessInfo {
+    procinfo::LocalProcessInfo {
+        pid: 0,
+        ppid: 0,
+        name: name.to_string(),
+        executable: name.into(),
+        argv: vec![name.to_string()],
+        cwd: Default::default(),
+        status: procinfo::LocalProcessStatus::Run,
+        start_time: 0,
+        #[cfg(windows)]
+        console: 0,
+        children: Default::default(),
+    }
+}
+
 fn foreground_process_probe_due(
     process_identity_changed: bool,
     prior_probe_failed: bool,
@@ -125,7 +145,18 @@ impl PerPane {
             self.foreground_process_checked_at = Some(Instant::now());
             self.foreground_process_name = foreground_process_name.clone();
             self.foreground_process_id = foreground_process_id;
-            let next_process_info = pane.get_foreground_process_info(CachePolicy::AllowStale);
+            let is_tmux_pane = Mux::try_get()
+                .and_then(|mux| mux.get_domain(pane.domain_id()))
+                .map(|domain| domain.downcast_ref::<mux::tmux::TmuxDomain>().is_some())
+                .unwrap_or(false);
+            let next_process_info = pane
+                .get_foreground_process_info(CachePolicy::AllowStale)
+                .or_else(|| {
+                    is_tmux_pane
+                        .then(|| foreground_process_name.as_deref())
+                        .flatten()
+                        .map(synthesize_process_info)
+                });
             let process_absent = foreground_process_id.is_none();
             self.foreground_process_probe_failed = next_process_info.is_none() && !process_absent;
             if !self.foreground_process_probe_failed {
