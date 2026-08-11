@@ -331,6 +331,7 @@ impl TmuxDomainState {
             pane_left: pane.pane_left,
             pane_top: pane.pane_top,
             current_command: pane.current_command.clone(),
+            passthrough_pending: Vec::new(),
         }));
 
         {
@@ -480,7 +481,7 @@ impl TmuxDomainState {
                     if let Some(text) = self.backlog.lock().remove(&pane.pane_id) {
                         if let Some(ref_pane) = pane_map.get(&pane.pane_id) {
                             let mut ref_pane = ref_pane.lock();
-                            if let Err(err) = ref_pane.output_write.write_all(&text) {
+                            if let Err(err) = ref_pane.write_output(&text) {
                                 log::error!("Failed to write tmux data to output: {:#}", err);
                             }
                         }

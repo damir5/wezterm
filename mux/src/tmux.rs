@@ -52,6 +52,16 @@ pub(crate) struct TmuxRemotePane {
     pub pane_left: u64,
     pub pane_top: u64,
     pub current_command: Option<String>,
+    pub(crate) passthrough_pending: Vec<u8>,
+}
+
+impl TmuxRemotePane {
+    /// Feed raw tmux `%output` bytes into the pane's terminal, unwrapping any
+    /// DCS `tmux;` passthrough so remote user vars and titles land.
+    pub fn write_output(&mut self, text: &[u8]) -> std::io::Result<()> {
+        let data = unwrap_tmux_passthrough(&mut self.passthrough_pending, text);
+        self.output_write.write_all(&data)
+    }
 }
 
 pub(crate) type RefTmuxRemotePane = Arc<Mutex<TmuxRemotePane>>;
@@ -69,6 +79,80 @@ pub(crate) struct TmuxTab {
 pub(crate) type TmuxCmdQueue = VecDeque<Box<dyn TmuxCommand>>;
 type TmuxResponseQueue = VecDeque<Option<Box<dyn TmuxCommand>>>;
 const RESIZE_QUIET_PERIOD: Duration = Duration::from_millis(50);
+
+/// tmux control-mode `%output` carries the pane's raw bytes. An application
+/// that wants a sequence to reach the outer terminal (eg: OSC 1337 user vars)
+/// wraps it in a DCS `tmux;` passthrough with ESC doubled. A control client
+/// must unwrap that itself: tmux only unwraps passthrough for tty clients.
+/// Without this, user vars set by remote programs are dropped by the pane's
+/// terminal parser as an unknown device control string.
+pub(crate) fn unwrap_tmux_passthrough(pending: &mut Vec<u8>, input: &[u8]) -> Vec<u8> {
+    const MAGIC: &[u8] = b"\x1bPtmux;";
+    pending.extend_from_slice(input);
+    let mut out = Vec::with_capacity(pending.len());
+    let mut i = 0;
+    while i < pending.len() {
+        if pending[i] != 0x1b {
+            let start = i;
+            while i < pending.len() && pending[i] != 0x1b {
+                i += 1;
+            }
+            out.extend_from_slice(&pending[start..i]);
+            continue;
+        }
+        let rest = &pending[i..];
+        if rest.len() < MAGIC.len() {
+            if MAGIC.starts_with(rest) {
+                break; // maybe a passthrough header split across chunks
+            }
+            out.push(0x1b);
+            i += 1;
+            continue;
+        }
+        if !rest.starts_with(MAGIC) {
+            out.push(0x1b);
+            i += 1;
+            continue;
+        }
+        // Inside a passthrough: payload until ESC \, with ESC ESC un-doubled.
+        // Buffer it so a chunk split mid-payload doesn't emit twice on retry.
+        let mut payload = Vec::new();
+        let mut j = MAGIC.len();
+        let mut complete = false;
+        while j < rest.len() {
+            if rest[j] == 0x1b {
+                if j + 1 >= rest.len() {
+                    break; // need another chunk to decide
+                }
+                match rest[j + 1] {
+                    b'\\' => {
+                        complete = true;
+                        j += 2;
+                        break;
+                    }
+                    0x1b => {
+                        payload.push(0x1b);
+                        j += 2;
+                    }
+                    _ => {
+                        payload.extend_from_slice(&rest[j..j + 2]);
+                        j += 2;
+                    }
+                }
+            } else {
+                payload.push(rest[j]);
+                j += 1;
+            }
+        }
+        if !complete {
+            break; // incomplete passthrough: retry when more output arrives
+        }
+        out.extend_from_slice(&payload);
+        i += j;
+    }
+    pending.drain(..i);
+    out
+}
 
 fn take_pending_commands(
     domain_id: DomainId,
@@ -331,6 +415,47 @@ mod tests {
         assert_eq!(adjacent_swap_targets(&ordered, 40, 20, true), [30, 20]);
         assert!(adjacent_swap_targets(&ordered, 20, 20, true).is_empty());
     }
+
+    #[test]
+    fn passthrough_unwraps_user_var_sequence() {
+        let osc = b"\x1b]1337;SetUserVar=QUdFTlRfSEFSTkVTUz1jbGF1ZGU=\x07";
+        let mut wrapped = b"\x1bPtmux;".to_vec();
+        for &b in osc.iter() {
+            if b == 0x1b {
+                wrapped.extend_from_slice(b"\x1b\x1b");
+            } else {
+                wrapped.push(b);
+            }
+        }
+        wrapped.extend_from_slice(b"\x1b\\");
+
+        let mut pending = Vec::new();
+        let out = unwrap_tmux_passthrough(&mut pending, &wrapped);
+        assert_eq!(out, osc.to_vec());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn passthrough_survives_chunk_splits() {
+        let wrapped = b"before\x1bPtmux;\x1b\x1b]0;title\x07\x1b\\after";
+        let mut pending = Vec::new();
+        let mut out = Vec::new();
+        // Feed one byte at a time: every split point must reassemble.
+        for &b in wrapped.iter() {
+            out.extend_from_slice(&unwrap_tmux_passthrough(&mut pending, &[b]));
+        }
+        assert_eq!(out, b"before\x1b]0;title\x07after".to_vec());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn passthrough_leaves_other_escapes_alone() {
+        let input = b"\x1b[31mred\x1bP1000p\x1b]8;;http://x\x07";
+        let mut pending = Vec::new();
+        let out = unwrap_tmux_passthrough(&mut pending, input);
+        assert_eq!(out, input.to_vec());
+        assert!(pending.is_empty());
+    }
 }
 
 pub struct TmuxDomain {
@@ -467,7 +592,7 @@ impl TmuxDomainState {
                     let pane_map = self.remote_panes.lock();
                     if let Some(ref_pane) = pane_map.get(pane) {
                         let mut tmux_pane = ref_pane.lock();
-                        if let Err(err) = tmux_pane.output_write.write_all(text) {
+                        if let Err(err) = tmux_pane.write_output(text) {
                             log::error!("Failed to write tmux data to output: {:#}", err);
                         }
                     } else {
