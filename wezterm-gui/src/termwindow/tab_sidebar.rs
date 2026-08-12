@@ -114,6 +114,7 @@ pub struct TabSidebar {
     pub ui_tree: Option<UiNode>,
     pub ui_layout: Option<UiLayout>,
     pub ui_target_layout: Option<UiLayout>,
+    pub tab_ids: Vec<TabId>,
     pub ui_layout_size: Option<(usize, usize)>,
     pub ui_animation_started: Option<Instant>,
     pub ui_scroll_offset: f32,
@@ -127,6 +128,10 @@ pub struct TabSidebar {
 }
 
 impl TabSidebar {
+    fn relative_tab_id(&self, active_tab_id: TabId, delta: isize, wrap: bool) -> Option<TabId> {
+        relative_sidebar_tab_id(&self.tab_ids, active_tab_id, delta, wrap)
+    }
+
     pub fn width_cells(&self, config: &ConfigHandle, cell_width: f32, dpi: u32) -> usize {
         responsive_width_cells(
             self.width_cells_override
@@ -182,19 +187,11 @@ fn toggled_sidebar_width(
 }
 impl TermWindow {
     pub fn sidebar_relative_tab_id(&self, delta: isize, wrap: bool) -> Option<TabId> {
-        let layout = self.tab_sidebar.ui_layout.as_ref()?;
         let active_tab_id = Mux::get()
             .get_window(self.mux_window_id)
             .and_then(|window| window.get_active().map(|tab| tab.tab_id()))?;
-        let mut tab_ids = Vec::new();
-        for node in &layout.nodes {
-            if let Some(tab_id) = node.on_click.as_ref().and_then(activate_tab_id) {
-                if !tab_ids.contains(&tab_id) {
-                    tab_ids.push(tab_id);
-                }
-            }
-        }
-        relative_sidebar_tab_id(&tab_ids, active_tab_id, delta, wrap)
+        self.tab_sidebar
+            .relative_tab_id(active_tab_id, delta, wrap)
     }
 
     pub fn tab_sidebar_width_pixels(&self) -> usize {
@@ -235,6 +232,7 @@ impl TermWindow {
 
         let started = std::time::Instant::now();
         let mut ui_tree = None;
+        let mut tab_ids = vec![];
         let refresh_after = match callback_entries(
             tabs,
             self.tab_sidebar.is_compact(
@@ -256,6 +254,7 @@ impl TermWindow {
                     log::warn!("format-tab-sidebar: ignoring all callback output: {err:#}");
                     None
                 } else {
+                    tab_ids = callback.tab_ids;
                     callback.refresh_after
                 }
             }
@@ -266,6 +265,7 @@ impl TermWindow {
         };
 
         self.tab_sidebar.ui_tree = ui_tree;
+        self.tab_sidebar.tab_ids = tab_ids;
         self.tab_sidebar.ui_target_layout = None;
         self.tab_sidebar.ui_layout_size = None;
         self.sidebar_images.clear();
@@ -559,6 +559,7 @@ impl TermWindow {
 
 struct CallbackResult {
     entries: HashMap<TabId, SidebarEntry>,
+    tab_ids: Vec<TabId>,
     ui_tree: Option<UiNode>,
     refresh_after: Option<Duration>,
 }
@@ -584,6 +585,7 @@ fn callback_entries(
         let Some(lua) = lua else {
             return Ok(CallbackResult {
                 entries: HashMap::new(),
+                tab_ids: vec![],
                 ui_tree: None,
                 refresh_after: None,
             });
@@ -611,6 +613,7 @@ fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResu
     let Value::Table(result) = value else {
         return Ok(CallbackResult {
             entries: HashMap::new(),
+            tab_ids: vec![],
             ui_tree: None,
             refresh_after: None,
         });
@@ -629,6 +632,7 @@ fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResu
         _ => anyhow::bail!("format-tab-sidebar must return {{ entries = {{...}} }}"),
     };
     let mut decoded = HashMap::new();
+    let mut tab_ids = vec![];
     for value in entries.sequence_values::<Value>() {
         let Value::Table(entry) = value? else {
             anyhow::bail!("format-tab-sidebar entries must be tables");
@@ -677,9 +681,11 @@ fn decode_callback(lua: &mlua::Lua, value: Value) -> anyhow::Result<CallbackResu
         {
             anyhow::bail!("format-tab-sidebar returned duplicate tab_id {tab_id}");
         }
+        tab_ids.push(tab_id);
     }
     Ok(CallbackResult {
         entries: decoded,
+        tab_ids,
         ui_tree: None,
         refresh_after,
     })
@@ -789,6 +795,28 @@ mod tests {
         assert_eq!(relative_sidebar_tab_id(&tabs, 10, -1, true), Some(30));
         assert_eq!(relative_sidebar_tab_id(&tabs, 30, -1, true), Some(20));
         assert_eq!(relative_sidebar_tab_id(&tabs, 30, -1, false), Some(30));
+    }
+
+    #[test]
+    fn callback_order_wins_over_duplicated_layout_rows() {
+        let lua = mlua::Lua::new();
+        let value = lua
+            .load("return { entries = {{tab_id=10}, {tab_id=20}, {tab_id=30}} }")
+            .eval()
+            .unwrap();
+        let callback = decode_callback(&lua, value).unwrap();
+        let mut layout_tabs = vec![];
+        for tab_id in [20, 10, 20, 30] {
+            if !layout_tabs.contains(&tab_id) {
+                layout_tabs.push(tab_id);
+            }
+        }
+        assert_eq!(relative_sidebar_tab_id(&layout_tabs, 10, 1, true), Some(30));
+        let sidebar = TabSidebar {
+            tab_ids: callback.tab_ids,
+            ..Default::default()
+        };
+        assert_eq!(sidebar.relative_tab_id(10, 1, true), Some(20));
     }
 
     #[test]
