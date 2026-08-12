@@ -29,6 +29,34 @@ fn activate_tab_id(action: &DynamicValue) -> Option<TabId> {
         .map(|tab_id| tab_id as TabId)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SpawnHostTabTarget {
+    DefaultDomain,
+    Pane(PaneId),
+}
+
+fn spawn_host_tab_target(action: &DynamicValue) -> Option<SpawnHostTabTarget> {
+    let DynamicValue::Object(object) = action else {
+        return None;
+    };
+    if !matches!(
+        object.get_by_str("action"),
+        Some(DynamicValue::String(action)) if action == "spawn-host-tab")
+    {
+        return None;
+    }
+    if matches!(
+        object.get_by_str("domain"),
+        Some(DynamicValue::String(domain)) if domain == "default")
+    {
+        return Some(SpawnHostTabTarget::DefaultDomain);
+    }
+    object
+        .get_by_str("pane_id")
+        .and_then(DynamicValue::coerce_unsigned)
+        .map(|pane_id| SpawnHostTabTarget::Pane(pane_id as PaneId))
+}
+
 fn relative_sidebar_tab_id(
     tab_ids: &[TabId],
     active_tab_id: TabId,
@@ -284,18 +312,13 @@ impl TermWindow {
 
     fn sidebar_item_at(&self, event: &MouseEvent) -> Option<UIItemType> {
         let pixels_per_point = (self.dimensions.dpi as f32 / 96.0).max(1.0);
-        if let Some(node) = self
-            .tab_sidebar
-            .ui_layout
-            .as_ref()
-            .and_then(|layout| {
-                layout.interactive_at(
-                    event.coords.x as f32 / pixels_per_point,
-                    event.coords.y as f32 / pixels_per_point,
-                    self.tab_sidebar.ui_scroll_offset,
-                )
-            })
-        {
+        if let Some(node) = self.tab_sidebar.ui_layout.as_ref().and_then(|layout| {
+            layout.interactive_at(
+                event.coords.x as f32 / pixels_per_point,
+                event.coords.y as f32 / pixels_per_point,
+                self.tab_sidebar.ui_scroll_offset,
+            )
+        }) {
             return Some(UIItemType::SidebarNode(node.id.clone()));
         }
         self.ui_items
@@ -401,6 +424,22 @@ impl TermWindow {
         }
         if let Some(tab_id) = activate_tab_id(&action) {
             self.activate_sidebar_tab(tab_id);
+            return;
+        }
+        if let Some(target) = spawn_host_tab_target(&action) {
+            let domain = match target {
+                SpawnHostTabTarget::DefaultDomain => {
+                    config::keyassignment::SpawnTabDomain::DefaultDomain
+                }
+                SpawnHostTabTarget::Pane(pane_id) => {
+                    let Some(pane) = Mux::get().get_pane(pane_id) else {
+                        log::warn!("spawn-host-tab pane {pane_id} is no longer available");
+                        return;
+                    };
+                    config::keyassignment::SpawnTabDomain::DomainId(pane.domain_id_for_spawn())
+                }
+            };
+            self.spawn_tab(&domain); // @fdb:fleet-navigation-and-gui-qa
             return;
         }
         self.emit_sidebar_action(action);
@@ -750,5 +789,26 @@ mod tests {
         assert_eq!(relative_sidebar_tab_id(&tabs, 10, -1, true), Some(30));
         assert_eq!(relative_sidebar_tab_id(&tabs, 30, -1, true), Some(20));
         assert_eq!(relative_sidebar_tab_id(&tabs, 30, -1, false), Some(30));
+    }
+
+    #[test]
+    fn host_tab_action_selects_default_or_exact_pane() {
+        let lua = mlua::Lua::new();
+        let local = lua
+            .load("return {action='spawn-host-tab', domain='default'}")
+            .eval::<Value>()
+            .unwrap();
+        let remote = lua
+            .load("return {action='spawn-host-tab', pane_id=42}")
+            .eval::<Value>()
+            .unwrap();
+        assert_eq!(
+            spawn_host_tab_target(&luahelper::lua_value_to_dynamic(local).unwrap()),
+            Some(SpawnHostTabTarget::DefaultDomain)
+        );
+        assert_eq!(
+            spawn_host_tab_target(&luahelper::lua_value_to_dynamic(remote).unwrap()),
+            Some(SpawnHostTabTarget::Pane(42))
+        );
     }
 }

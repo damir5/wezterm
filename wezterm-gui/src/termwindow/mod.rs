@@ -82,8 +82,8 @@ mod prevcursor;
 pub mod render;
 pub mod resize;
 mod selection;
-pub mod spawn;
 mod sidebar_ui;
+pub mod spawn;
 mod tab_sidebar;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
@@ -257,9 +257,7 @@ impl UserData for TabInformation {
                 Ok(None)
             }
         });
-        fields.add_field_method_get("panes", |_, this| {
-            Ok(this.panes.clone())
-        });
+        fields.add_field_method_get("panes", |_, this| Ok(this.panes.clone()));
         fields.add_field_method_get("window_id", |_, this| Ok(this.window_id));
         fields.add_field_method_get("tab_title", |_, this| Ok(this.tab_title.clone()));
         fields.add_field_method_get("window_title", |_, this| {
@@ -332,9 +330,7 @@ impl UserData for PaneInformation {
                 .clone()
                 .map(|url| url_funcs::Url { url }))
         });
-        fields.add_field_method_get("domain_name", |_, this| {
-            Ok(this.domain_name.clone())
-        });
+        fields.add_field_method_get("domain_name", |_, this| Ok(this.domain_name.clone()));
     }
 }
 
@@ -679,10 +675,12 @@ impl TermWindow {
         };
         let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
         let padding_right = resize::effective_right_padding(&config, h_context) as usize;
-        let tab_sidebar_enabled = config.enable_tab_sidebar
-            && config.front_end == FrontEndSelection::WebGpu;
+        let tab_sidebar_enabled =
+            config.enable_tab_sidebar && config.front_end == FrontEndSelection::WebGpu;
         if config.enable_tab_sidebar && !tab_sidebar_enabled {
-            log::warn!("enable_tab_sidebar requires front_end = 'WebGpu'; sidebar disabled for this window");
+            log::warn!(
+                "enable_tab_sidebar requires front_end = 'WebGpu'; sidebar disabled for this window"
+            );
         }
         let sidebar_width = if tab_sidebar_enabled {
             tab_sidebar::responsive_width_cells(
@@ -702,7 +700,8 @@ impl TermWindow {
         let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
 
         let mut dimensions = Dimensions {
-            pixel_width: (terminal_size.pixel_width + padding_left + padding_right + sidebar_width) as usize,
+            pixel_width: (terminal_size.pixel_width + padding_left + padding_right + sidebar_width)
+                as usize,
             pixel_height: ((terminal_size.rows * render_metrics.cell_size.height as usize)
                 + padding_top
                 + padding_bottom) as usize
@@ -1074,8 +1073,7 @@ impl TermWindow {
                         }
                         DeadKeyStatus::None => egui::Event::Ime(egui::ImeEvent::Disabled),
                     };
-                    crate::frontend::front_end()
-                        .push_input_stack_event(self.mux_window_id, event);
+                    crate::frontend::front_end().push_input_stack_event(self.mux_window_id, event);
                 }
                 self.dead_key_status = status;
                 self.update_title();
@@ -1456,8 +1454,10 @@ impl TermWindow {
                 tx,
             } => {
                 if self.webgpu.is_none() {
-                    tx.try_send(Err(anyhow!("sidebar screenshots require the WebGpu frontend")))
-                        .ok();
+                    tx.try_send(Err(anyhow!(
+                        "sidebar screenshots require the WebGpu frontend"
+                    )))
+                    .ok();
                 } else if self.sidebar_screenshot.is_some() {
                     tx.try_send(Err(anyhow!("another sidebar screenshot is in progress")))
                         .ok();
@@ -1762,23 +1762,27 @@ impl TermWindow {
         };
         let pane = MuxPane(pane.pane_id());
         let os_window = self.window.clone();
-        promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| async move {
-            let Some(lua) = lua else { return Ok(()) };
-            let payload = luahelper::dynamic_to_lua_value(&lua, action)?;
-            let args = lua.pack_multi((window, pane, payload))?;
-            if let Err(err) = config::lua::emit_event(&lua, ("sidebar-action".to_string(), args)).await {
-                log::error!("while processing sidebar-action event: {err:#}");
-            }
-            // The handler most likely changed state the tree is built from
-            // (collapse, filter), so rebuild now instead of waiting for the
-            // next refresh tick.
-            if let Some(os_window) = os_window {
-                os_window.notify(TermWindowNotif::Apply(Box::new(|term| {
-                    term.mark_tab_sidebar_dirty();
-                })));
-            }
-            Ok(())
-        }))
+        promise::spawn::spawn(config::with_lua_config_on_main_thread(
+            move |lua| async move {
+                let Some(lua) = lua else { return Ok(()) };
+                let payload = luahelper::dynamic_to_lua_value(&lua, action)?;
+                let args = lua.pack_multi((window, pane, payload))?;
+                if let Err(err) =
+                    config::lua::emit_event(&lua, ("sidebar-action".to_string(), args)).await
+                {
+                    log::error!("while processing sidebar-action event: {err:#}");
+                }
+                // The handler most likely changed state the tree is built from
+                // (collapse, filter), so rebuild now instead of waiting for the
+                // next refresh tick.
+                if let Some(os_window) = os_window {
+                    os_window.notify(TermWindowNotif::Apply(Box::new(|term| {
+                        term.mark_tab_sidebar_dirty();
+                    })));
+                }
+                Ok(())
+            },
+        ))
         .detach();
     }
 
@@ -1916,7 +1920,9 @@ impl TermWindow {
         self.config = config.clone();
         let tab_sidebar_enabled = config.enable_tab_sidebar && self.webgpu.is_some();
         if config.enable_tab_sidebar && !tab_sidebar_enabled {
-            log::warn!("enable_tab_sidebar requires the WebGpu frontend; sidebar disabled for this window");
+            log::warn!(
+                "enable_tab_sidebar requires the WebGpu frontend; sidebar disabled for this window"
+            );
         }
         if self.tab_sidebar_enabled != tab_sidebar_enabled {
             self.tab_sidebar_enabled = tab_sidebar_enabled;

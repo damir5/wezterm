@@ -44,73 +44,73 @@ impl crate::TermWindow {
 
         if !sidebar_only_repaint {
             'pass: for pass in 0.. {
-            match self.paint_pass() {
-                Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
-                    Ok(allocated) => {
-                        if !allocated {
+                match self.paint_pass() {
+                    Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
+                        Ok(allocated) => {
+                            if !allocated {
+                                break 'pass;
+                            }
+                            self.invalidate_fancy_tab_bar();
+                            self.invalidate_modal();
+                        }
+                        Err(err) => {
+                            log::error!("{:#}", err);
                             break 'pass;
                         }
-                        self.invalidate_fancy_tab_bar();
-                        self.invalidate_modal();
-                    }
+                    },
                     Err(err) => {
-                        log::error!("{:#}", err);
-                        break 'pass;
-                    }
-                },
-                Err(err) => {
-                    if let Some(&OutOfTextureSpace {
-                        size: Some(size),
-                        current_size,
-                    }) = err.root_cause().downcast_ref::<OutOfTextureSpace>()
-                    {
-                        let result = if pass == 0 {
-                            // Let's try clearing out the atlas and trying again
-                            // self.clear_texture_atlas()
-                            log::trace!("recreate_texture_atlas");
-                            self.recreate_texture_atlas(Some(current_size))
-                        } else {
-                            log::trace!("grow texture atlas to {}", size);
-                            self.recreate_texture_atlas(Some(size))
-                        };
-                        self.invalidate_fancy_tab_bar();
-                        self.invalidate_modal();
-
-                        if let Err(err) = result {
-                            self.allow_images = match self.allow_images {
-                                AllowImage::Yes => AllowImage::Scale(2),
-                                AllowImage::Scale(2) => AllowImage::Scale(4),
-                                AllowImage::Scale(4) => AllowImage::Scale(8),
-                                AllowImage::Scale(8) => AllowImage::No,
-                                AllowImage::No | _ => {
-                                    log::error!(
-                                        "Failed to {} texture: {}",
-                                        if pass == 0 { "clear" } else { "resize" },
-                                        err
-                                    );
-                                    break 'pass;
-                                }
+                        if let Some(&OutOfTextureSpace {
+                            size: Some(size),
+                            current_size,
+                        }) = err.root_cause().downcast_ref::<OutOfTextureSpace>()
+                        {
+                            let result = if pass == 0 {
+                                // Let's try clearing out the atlas and trying again
+                                // self.clear_texture_atlas()
+                                log::trace!("recreate_texture_atlas");
+                                self.recreate_texture_atlas(Some(current_size))
+                            } else {
+                                log::trace!("grow texture atlas to {}", size);
+                                self.recreate_texture_atlas(Some(size))
                             };
+                            self.invalidate_fancy_tab_bar();
+                            self.invalidate_modal();
 
-                            log::info!(
-                                "Not enough texture space ({:#}); \
+                            if let Err(err) = result {
+                                self.allow_images = match self.allow_images {
+                                    AllowImage::Yes => AllowImage::Scale(2),
+                                    AllowImage::Scale(2) => AllowImage::Scale(4),
+                                    AllowImage::Scale(4) => AllowImage::Scale(8),
+                                    AllowImage::Scale(8) => AllowImage::No,
+                                    AllowImage::No | _ => {
+                                        log::error!(
+                                            "Failed to {} texture: {}",
+                                            if pass == 0 { "clear" } else { "resize" },
+                                            err
+                                        );
+                                        break 'pass;
+                                    }
+                                };
+
+                                log::info!(
+                                    "Not enough texture space ({:#}); \
                                      will retry render with {:?}",
-                                err,
-                                self.allow_images,
-                            );
+                                    err,
+                                    self.allow_images,
+                                );
+                            }
+                        } else if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
+                            self.invalidate_fancy_tab_bar();
+                            self.invalidate_modal();
+                            self.shape_generation += 1;
+                            self.shape_cache.borrow_mut().clear();
+                            self.line_to_ele_shape_cache.borrow_mut().clear();
+                        } else {
+                            log::error!("paint_pass failed: {:#}", err);
+                            break 'pass;
                         }
-                    } else if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
-                        self.invalidate_fancy_tab_bar();
-                        self.invalidate_modal();
-                        self.shape_generation += 1;
-                        self.shape_cache.borrow_mut().clear();
-                        self.line_to_ele_shape_cache.borrow_mut().clear();
-                    } else {
-                        log::error!("paint_pass failed: {:#}", err);
-                        break 'pass;
                     }
                 }
-            }
             }
         } else {
             let next_due = self
@@ -183,9 +183,7 @@ impl crate::TermWindow {
                             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                                 tw.sidebar_animation_scheduled.borrow_mut().take();
                                 let due = tw.sidebar_animation_due.borrow_mut().take();
-                                let due_now = due
-                                    .map(|due| due <= Instant::now())
-                                    .unwrap_or(false);
+                                let due_now = due.map(|due| due <= Instant::now()).unwrap_or(false);
                                 if due_now {
                                     let generic_due = tw
                                         .has_animation

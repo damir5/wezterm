@@ -33,6 +33,11 @@ pub struct GuiFrontEnd {
 struct PaneInputStack {
     queued: Vec<String>,
     draft: String,
+    auto_delivery: Option<AutoDelivery>,
+}
+
+struct AutoDelivery {
+    index: usize,
 }
 
 #[derive(Default)]
@@ -155,11 +160,23 @@ impl GuiFrontEnd {
     ) {
         enum Action {
             Deliver(PaneId, usize, String),
+            DeliverWhenReady(PaneId, usize),
+            CancelAutoDelivery(PaneId),
             Queue(PaneId, String),
             Collapse(PaneId),
         }
 
+        self.advance_auto_deliveries(window_id, panes);
+        if self
+            .input_stacks
+            .borrow()
+            .values()
+            .any(|stack| stack.auto_delivery.is_some())
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         let mut action = None;
+        let pending_outline = egui::Color32::from_rgb(240, 162, 90);
         let mut windows = self.input_stack_windows.borrow_mut();
         let window_ui = windows.entry(window_id).or_default();
         let visible = panes
@@ -195,8 +212,13 @@ impl GuiFrontEnd {
                     .fixed_pos(pos)
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
-                        if ui
-                            .button(format!("Queued {count}"))
+                        if egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(54, 43, 34))
+                            .stroke(egui::Stroke::new(1.5_f32, pending_outline))
+                            .corner_radius(5.0)
+                            .inner_margin(1.0)
+                            .show(ui, |ui| ui.button(format!("Queued {count}")))
+                            .inner
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
@@ -223,8 +245,8 @@ impl GuiFrontEnd {
                     egui::Frame::new()
                         .fill(egui::Color32::from_rgb(31, 34, 40))
                         .stroke(egui::Stroke::new(
-                            1.0_f32,
-                            egui::Color32::from_rgb(67, 72, 82),
+                            1.5_f32,
+                            pending_outline,
                         ))
                         .corner_radius(6.0)
                         .inner_margin(8.0)
@@ -264,24 +286,59 @@ impl GuiFrontEnd {
                             });
 
                             if let Some(stack) = stacks.get(&pane.pane_id) {
+                                let auto_index = stack.auto_delivery.as_ref().map(|auto| auto.index);
                                 egui::ScrollArea::vertical()
                                     .max_height(150.0)
                                     .show(ui, |ui| {
                                         for (index, item) in stack.queued.iter().enumerate() {
-                                            if ui
-                                                .add_sized(
-                                                    [ui.available_width(), 31.0],
-                                                    egui::Button::new(item).frame(false),
-                                                )
-                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                .clicked()
-                                            {
-                                                action = Some(Action::Deliver(
-                                                    pane.pane_id,
-                                                    index,
-                                                    item.clone(),
-                                                ));
-                                            }
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                        let enabled = auto_index.is_none();
+                                                        if auto_index == Some(index) {
+                                                            if ui
+                                                                .button("Cancel")
+                                                                .on_hover_cursor(
+                                                                    egui::CursorIcon::PointingHand,
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                action = Some(
+                                                                    Action::CancelAutoDelivery(
+                                                                        pane.pane_id,
+                                                                    ),
+                                                                );
+                                                            }
+                                                            ui.label("Waiting…");
+                                                        } else {
+                                                            if ui
+                                                                .add_enabled(
+                                                                    enabled,
+                                                                    egui::Button::new(
+                                                                        "Send when ready",
+                                                                    ),
+                                                                )
+                                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                                .on_hover_text("Paste and submit when the agent composer is ready")
+                                                                .clicked()
+                                                            {
+                                                                action = Some(Action::DeliverWhenReady(pane.pane_id, index));
+                                                            }
+                                                            if ui.add_enabled(enabled, egui::Button::new("Paste"))
+                                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                                .on_hover_text("Paste now without submitting")
+                                                                .clicked()
+                                                            {
+                                                                action = Some(Action::Deliver(
+                                                                    pane.pane_id,
+                                                                    index,
+                                                                    item.clone(),
+                                                                ));
+                                                            }
+                                                        }
+                                                        ui.add(egui::Label::new(item).truncate());
+                                                },
+                                            );
                                         }
                                     });
                             }
@@ -376,6 +433,26 @@ impl GuiFrontEnd {
                     }
                 }
             }
+            Some(Action::DeliverWhenReady(pane_id, index)) => {
+                if let Some(stack) = self.input_stacks.borrow_mut().get_mut(&pane_id) {
+                    if stack.auto_delivery.is_none() && index < stack.queued.len() {
+                        stack.auto_delivery = Some(AutoDelivery { index });
+                        self.input_stack_windows
+                            .borrow_mut()
+                            .entry(window_id)
+                            .or_default()
+                            .errors
+                            .remove(&pane_id);
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            Some(Action::CancelAutoDelivery(pane_id)) => {
+                if let Some(stack) = self.input_stacks.borrow_mut().get_mut(&pane_id) {
+                    stack.auto_delivery = None;
+                    ctx.request_repaint();
+                }
+            }
             Some(Action::Collapse(pane_id)) => {
                 let mut windows = self.input_stack_windows.borrow_mut();
                 let ui = windows.entry(window_id).or_default();
@@ -385,6 +462,67 @@ impl GuiFrontEnd {
                 }
             }
             None => {}
+        }
+    }
+
+    fn advance_auto_deliveries(&self, window_id: MuxWindowId, panes: &[InputStackPaneRect]) {
+        for pane_rect in panes {
+            let pane_id = pane_rect.pane_id;
+            let Some(pane) = Mux::get().get_pane(pane_id) else {
+                continue;
+            };
+            let readiness = crate::delivery_readiness::detect_pane(pane.as_ref());
+            let mut stacks = self.input_stacks.borrow_mut();
+            let Some(stack) = stacks.get_mut(&pane_id) else {
+                continue;
+            };
+            let Some(auto) = stack.auto_delivery.as_mut() else {
+                continue;
+            };
+            if readiness != crate::delivery_readiness::DeliveryReadiness::Ready {
+                continue;
+            }
+            let index = auto.index;
+            let Some(input) = stack.queued.get(index).cloned() else {
+                stack.auto_delivery = None;
+                continue;
+            };
+            drop(stacks);
+            if let Err(error) = pane.send_paste(&input) {
+                if let Some(stack) = self.input_stacks.borrow_mut().get_mut(&pane_id) {
+                    stack.auto_delivery = None;
+                }
+                self.input_stack_windows
+                    .borrow_mut()
+                    .entry(window_id)
+                    .or_default()
+                    .errors
+                    .insert(pane_id, format!("Paste failed: {error:#}"));
+            } else if let Err(error) = pane.send_composed_text("\r") {
+                if let Some(stack) = self.input_stacks.borrow_mut().get_mut(&pane_id) {
+                    stack.auto_delivery = None;
+                }
+                self.input_stack_windows
+                    .borrow_mut()
+                    .entry(window_id)
+                    .or_default()
+                    .errors
+                    .insert(
+                        pane_id,
+                        format!("Submit failed; text was pasted: {error:#}"),
+                    );
+            } else {
+                if let Some(stack) = self.input_stacks.borrow_mut().get_mut(&pane_id) {
+                    stack.auto_delivery = None;
+                }
+                self.input_stack_windows
+                    .borrow_mut()
+                    .entry(window_id)
+                    .or_default()
+                    .errors
+                    .remove(&pane_id);
+                self.remove_queued_input(pane_id, index);
+            }
         }
     }
 

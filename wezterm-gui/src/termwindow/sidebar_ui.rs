@@ -200,12 +200,7 @@ pub struct UiLayout {
 }
 
 impl UiLayout {
-    fn node_contains(
-        node: &LayoutNode,
-        x: f32,
-        y: f32,
-        scroll_offset: f32,
-    ) -> bool {
+    fn node_contains(node: &LayoutNode, x: f32, y: f32, scroll_offset: f32) -> bool {
         let mut rect = node.rect;
         if node.scrollable {
             rect.y -= scroll_offset;
@@ -225,9 +220,10 @@ impl UiLayout {
     }
 
     pub fn clickable_at(&self, x: f32, y: f32, scroll_offset: f32) -> Option<&LayoutNode> {
-        self.nodes.iter().rev().find(|node| {
-            node.on_click.is_some() && Self::node_contains(node, x, y, scroll_offset)
-        })
+        self.nodes
+            .iter()
+            .rev()
+            .find(|node| node.on_click.is_some() && Self::node_contains(node, x, y, scroll_offset))
     }
 
     pub fn interactive_at(&self, x: f32, y: f32, scroll_offset: f32) -> Option<&LayoutNode> {
@@ -364,12 +360,14 @@ fn align(table: &Table, name: &str) -> anyhow::Result<Option<Align>> {
 }
 
 fn text_align(table: &Table) -> anyhow::Result<TextAlign> {
-    Ok(match table.get::<_, Option<String>>("text_align")?.as_deref() {
-        None | Some("left") => TextAlign::Left,
-        Some("center") => TextAlign::Center,
-        Some("right") => TextAlign::Right,
-        Some(other) => bail!("text_align must be left, center or right, not {other:?}"),
-    })
+    Ok(
+        match table.get::<_, Option<String>>("text_align")?.as_deref() {
+            None | Some("left") => TextAlign::Left,
+            Some("center") => TextAlign::Center,
+            Some("right") => TextAlign::Right,
+            Some(other) => bail!("text_align must be left, center or right, not {other:?}"),
+        },
+    )
 }
 
 fn shape_kind(table: &Table) -> anyhow::Result<Option<ShapeKind>> {
@@ -869,9 +867,7 @@ pub fn interpolate(from: Option<&UiLayout>, to: &UiLayout, progress: f32) -> UiL
     };
     for node in &mut layout.nodes {
         let Some(previous) = from.nodes.iter().find(|item| {
-            item.id == node.id
-                && item.on_click == node.on_click
-                && item.on_hover == node.on_hover
+            item.id == node.id && item.on_click == node.on_click && item.on_hover == node.on_hover
         }) else {
             continue;
         };
@@ -1008,10 +1004,7 @@ fn paint_shape(
                     )
                 })
                 .collect::<Vec<_>>();
-            painter.add(egui::Shape::line(
-                points,
-                egui::Stroke::new(width, color),
-            ));
+            painter.add(egui::Shape::line(points, egui::Stroke::new(width, color)));
         }
         ShapeKind::Bars => {
             let bar = egui::vec2(size * 0.2, size * 0.64);
@@ -1437,7 +1430,10 @@ pub fn register_fonts(ctx: &egui::Context) {
 
     for (family, faces) in [
         (egui::FontFamily::Proportional, vec!["Roboto"]),
-        (egui::FontFamily::Name("medium".into()), vec!["Roboto-Medium"]),
+        (
+            egui::FontFamily::Name("medium".into()),
+            vec!["Roboto-Medium"],
+        ),
         (egui::FontFamily::Name("bold".into()), vec!["Roboto-Bold"]),
         (egui::FontFamily::Monospace, vec!["JetBrainsMono"]),
         (

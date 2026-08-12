@@ -83,7 +83,9 @@ fn run_request(request: Request) -> anyhow::Result<serde_json::Value> {
                     .gui_window_for_mux_window(window_id)
                     .ok_or_else(|| anyhow!("no GUI window for mux window {window_id}"))?;
                 let event = crate::scripting::guiwin::synthetic_key_event(&key, mods.as_deref())?;
-                window.window.notify(TermWindowNotif::SyntheticKeyEvent(event));
+                window
+                    .window
+                    .notify(TermWindowNotif::SyntheticKeyEvent(event));
                 Ok(json!({}))
             }
             Request::ScreenshotSidebar { window_id, path } => {
