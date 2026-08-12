@@ -9,6 +9,7 @@ use ::window::glium::uniforms::{
     MagnifySamplerFilter, MinifySamplerFilter, Sampler, SamplerWrapFunction,
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
+use ::window::WindowOps;
 use anyhow::Context;
 use config::FreeTypeLoadTarget;
 use std::collections::HashMap;
@@ -120,6 +121,40 @@ impl crate::TermWindow {
     fn call_draw_webgpu(&mut self, sidebar_only: bool) -> anyhow::Result<()> {
         use crate::termwindow::webgpu::WebGpuTexture;
 
+        let pixels_per_point = (self.dimensions.dpi as f32 / 96.0).max(1.0);
+        let (padding_left, padding_top) = self.padding_left_top();
+        let border = self.get_os_border();
+        let top_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let pane_origin_y = top_bar_height + padding_top + border.top.get() as f32;
+        let pane_rects = self
+            .get_panes_to_render()
+            .into_iter()
+            .map(|pane| {
+                let min = egui::pos2(
+                    (padding_left
+                        + border.left.get() as f32
+                        + pane.left as f32 * self.render_metrics.cell_size.width as f32)
+                        / pixels_per_point,
+                    (pane_origin_y
+                        + pane.top as f32 * self.render_metrics.cell_size.height as f32)
+                        / pixels_per_point,
+                );
+                crate::frontend::InputStackPaneRect {
+                    pane_id: pane.pane.pane_id(),
+                    rect: egui::Rect::from_min_size(
+                        min,
+                        egui::vec2(
+                            pane.pixel_width as f32 / pixels_per_point,
+                            pane.pixel_height as f32 / pixels_per_point,
+                        ),
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
         let pending_capture = self.sidebar_capture_spec();
         let screenshot_hover = self
             .sidebar_screenshot
@@ -392,6 +427,39 @@ impl crate::TermWindow {
                     PaintMode::All
                 },
                 !cache_frame,
+            )?);
+        }
+
+        let front_end = crate::frontend::front_end();
+        if front_end.input_stack_ui_is_active(self.mux_window_id)
+            || front_end.has_input_stack_for_panes(&pane_rects)
+        {
+            let config = webgpu.config.borrow();
+            let linear_format = config.format.remove_srgb_suffix();
+            let egui_format = if config.view_formats.contains(&linear_format) {
+                linear_format
+            } else {
+                config.format
+            };
+            drop(config);
+            let egui_view = output.texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(egui_format),
+                ..Default::default()
+            });
+            egui_cmd_bufs.extend(composite_input_stack(
+                &mut self.input_stack_egui_ctx,
+                &mut self.input_stack_egui_renderer,
+                self.mux_window_id,
+                &pane_rects,
+                self.window.as_ref().unwrap(),
+                self.dimensions.pixel_width as u32,
+                self.dimensions.pixel_height as u32,
+                pixels_per_point,
+                &webgpu.device,
+                &webgpu.queue,
+                egui_format,
+                &egui_view,
+                &mut encoder,
             )?);
         }
 
@@ -687,6 +755,81 @@ fn screenshot_path(base: &Path, index: usize, offset_ms: u64) -> PathBuf {
         None => format!("{stem}{suffix}"),
     };
     base.with_file_name(filename)
+}
+
+fn composite_input_stack(
+    egui_ctx: &mut Option<egui::Context>,
+    egui_renderer: &mut Option<egui_wgpu::Renderer>,
+    mux_window_id: mux::window::WindowId,
+    panes: &[crate::frontend::InputStackPaneRect],
+    os_window: &window::Window,
+    pixel_w: u32,
+    pixel_h: u32,
+    pixels_per_point: f32,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    view: &wgpu::TextureView,
+    encoder: &mut wgpu::CommandEncoder,
+) -> anyhow::Result<Vec<wgpu::CommandBuffer>> {
+    let ctx = sidebar_ui::context(egui_ctx);
+    if egui_renderer.is_none() {
+        *egui_renderer = Some(egui_wgpu::Renderer::new(device, format, None, 1, false));
+    }
+    let renderer = egui_renderer.as_mut().unwrap();
+    ctx.set_pixels_per_point(pixels_per_point);
+    let front_end = crate::frontend::front_end();
+    ctx.begin_pass(egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(
+                pixel_w as f32 / pixels_per_point,
+                pixel_h as f32 / pixels_per_point,
+            ),
+        )),
+        events: front_end.take_input_stack_events(mux_window_id),
+        ..Default::default()
+    });
+    front_end.paint_input_stack(&ctx, mux_window_id, panes, os_window);
+    let full_output = ctx.end_pass();
+    for command in &full_output.platform_output.commands {
+        if let egui::OutputCommand::CopyText(text) = command {
+            os_window.set_clipboard(window::Clipboard::Clipboard, text.clone());
+        }
+    }
+    let textures_delta = full_output.textures_delta;
+    let paint_jobs = ctx.tessellate(full_output.shapes, pixels_per_point);
+    let screen_descriptor = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [pixel_w, pixel_h],
+        pixels_per_point,
+    };
+    for (id, delta) in &textures_delta.set {
+        renderer.update_texture(device, queue, *id, delta);
+    }
+    let command_buffers =
+        renderer.update_buffers(device, queue, encoder, &paint_jobs, &screen_descriptor);
+    for id in &textures_delta.free {
+        renderer.free_texture(id);
+    }
+    {
+        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("input stack egui"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        let mut pass = pass.forget_lifetime();
+        renderer.render(&mut pass, &paint_jobs, &screen_descriptor);
+    }
+    Ok(command_buffers)
 }
 
 /// Paint the cached, per-window sidebar into the same surface view as the

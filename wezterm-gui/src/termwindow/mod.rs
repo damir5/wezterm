@@ -474,6 +474,8 @@ pub struct TermWindow {
     /// Window-owned sidebar renderer, lazy-initialized in the WebGpu draw path.
     egui_ctx: Option<egui::Context>,
     egui_renderer: Option<egui_wgpu::Renderer>,
+    input_stack_egui_ctx: Option<egui::Context>,
+    input_stack_egui_renderer: Option<egui_wgpu::Renderer>,
     egui_animation_ctx: Option<egui::Context>,
     egui_animation_renderer: Option<egui_wgpu::Renderer>,
     sidebar_images: HashMap<String, egui::TextureHandle>,
@@ -736,6 +738,8 @@ impl TermWindow {
             webgpu: None,
             egui_ctx: None,
             egui_renderer: None,
+            input_stack_egui_ctx: None,
+            input_stack_egui_renderer: None,
             egui_animation_ctx: None,
             egui_animation_renderer: None,
             sidebar_images: HashMap::new(),
@@ -1059,6 +1063,16 @@ impl TermWindow {
                     log::info!("DeadKeyStatus now: {:?}", status);
                 } else {
                     log::trace!("DeadKeyStatus now: {:?}", status);
+                }
+                if crate::frontend::front_end().input_stack_editor_is_active(self.mux_window_id) {
+                    let event = match &status {
+                        DeadKeyStatus::Composing(text) => {
+                            egui::Event::Ime(egui::ImeEvent::Preedit(text.clone()))
+                        }
+                        DeadKeyStatus::None => egui::Event::Ime(egui::ImeEvent::Disabled),
+                    };
+                    crate::frontend::front_end()
+                        .push_input_stack_event(self.mux_window_id, event);
                 }
                 self.dead_key_status = status;
                 self.update_title();
@@ -3331,6 +3345,15 @@ impl TermWindow {
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);
                 self.set_modal(Rc::new(modal));
+            }
+            AddToInputStack => {
+                if self.webgpu.is_some() {
+                    crate::frontend::front_end()
+                        .open_input_stack_editor(self.mux_window_id, pane.pane_id());
+                    self.request_terminal_repaint();
+                } else {
+                    log::error!("AddToInputStack requires the WebGpu frontend");
+                }
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),

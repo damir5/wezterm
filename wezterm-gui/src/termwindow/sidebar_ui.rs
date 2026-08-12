@@ -88,6 +88,9 @@ pub enum ShapeKind {
     Hexagon,
     Asterisk,
     Chevron,
+    Diamond,
+    Hourglass,
+    Gate,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -381,6 +384,9 @@ fn shape_kind(table: &Table) -> anyhow::Result<Option<ShapeKind>> {
         Some("hexagon") => Some(ShapeKind::Hexagon),
         Some("asterisk") => Some(ShapeKind::Asterisk),
         Some("chevron") => Some(ShapeKind::Chevron),
+        Some("diamond") => Some(ShapeKind::Diamond),
+        Some("hourglass") => Some(ShapeKind::Hourglass),
+        Some("gate") => Some(ShapeKind::Gate),
         Some(other) => bail!("unknown shape {other:?}"),
     })
 }
@@ -1035,12 +1041,12 @@ fn paint_shape(
                 painter.circle_stroke(center, radius, stroke);
             }
         }
-        ShapeKind::Triangle | ShapeKind::Hexagon => {
-            let sides = if kind == ShapeKind::Triangle { 3 } else { 6 };
-            let start = if kind == ShapeKind::Triangle {
-                -std::f32::consts::FRAC_PI_2
-            } else {
-                0.0
+        ShapeKind::Triangle | ShapeKind::Hexagon | ShapeKind::Diamond => {
+            let (sides, start) = match kind {
+                ShapeKind::Triangle => (3, -std::f32::consts::FRAC_PI_2),
+                ShapeKind::Hexagon => (6, 0.0),
+                ShapeKind::Diamond => (4, 0.0),
+                _ => unreachable!(),
             };
             let points = polygon(sides, start);
             painter.add(if fill {
@@ -1068,6 +1074,40 @@ fn paint_shape(
                 ],
                 stroke,
             ));
+        }
+        ShapeKind::Hourglass => {
+            let point = |x: f32, y: f32| {
+                center
+                    + egui::vec2(
+                        (x * angle.cos() - y * angle.sin()) * size,
+                        (x * angle.sin() + y * angle.cos()) * size,
+                    )
+            };
+            for points in [
+                vec![point(-0.4, -0.37), point(0.4, -0.37), point(0.0, 0.0)],
+                vec![point(-0.4, 0.37), point(0.4, 0.37), point(0.0, 0.0)],
+            ] {
+                painter.add(egui::Shape::closed_line(points, stroke));
+            }
+        }
+        ShapeKind::Gate => {
+            let point = |x: f32, y: f32| {
+                center
+                    + egui::vec2(
+                        (x * angle.cos() - y * angle.sin()) * size,
+                        (x * angle.sin() + y * angle.cos()) * size,
+                    )
+            };
+            painter.add(egui::Shape::line_segment(
+                [point(-0.43, -0.37), point(0.43, -0.37)],
+                stroke,
+            ));
+            for x in [-0.3, 0.3] {
+                painter.add(egui::Shape::line_segment(
+                    [point(x, -0.37), point(x, 0.4)],
+                    stroke,
+                ));
+            }
         }
     }
 }
@@ -1457,6 +1497,22 @@ return { type = 'row', width = 100, height = 40, padding = 10,
         assert_eq!(layout.nodes[1].rect.x, 10.0);
         assert_eq!(layout.nodes[2].rect.x, 30.0);
         assert_eq!(layout.nodes[1].rect.y, 10.0);
+    }
+
+    #[test]
+    fn decodes_harness_shapes() {
+        let lua = mlua::Lua::new();
+        for (name, expected) in [
+            ("diamond", ShapeKind::Diamond),
+            ("hourglass", ShapeKind::Hourglass),
+            ("gate", ShapeKind::Gate),
+        ] {
+            let table = lua
+                .load(format!("return {{ shape = {name:?} }}"))
+                .eval::<Table>()
+                .unwrap();
+            assert_eq!(shape_kind(&table).unwrap(), Some(expected));
+        }
     }
 
     #[test]

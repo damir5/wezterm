@@ -24,6 +24,116 @@ use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
 impl super::TermWindow {
+    fn input_stack_mouse_event(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
+        let front_end = crate::frontend::front_end();
+        let pixels_per_point = (self.dimensions.dpi as f32 / 96.0).max(1.0);
+        let pos = egui::pos2(
+            event.coords.x as f32 / pixels_per_point,
+            event.coords.y as f32 / pixels_per_point,
+        );
+        let active = front_end.input_stack_ui_is_active(self.mux_window_id);
+        let (padding_left, padding_top) = self.padding_left_top();
+        let border = self.get_os_border();
+        let top_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let origin_y = top_bar_height + padding_top + border.top.get() as f32;
+        let mut editor_open = false;
+        let over_overlay = self.get_panes_to_render().into_iter().any(|pane| {
+            let pane_id = pane.pane.pane_id();
+            let count = front_end.input_stack_count(pane_id);
+            let (expanded, editing) = front_end.input_stack_pane_ui(self.mux_window_id, pane_id);
+            editor_open |= editing;
+            if count == 0 && !editing {
+                return false;
+            }
+            let pane_width = pane.pixel_width as f32 / pixels_per_point;
+            let right = (padding_left
+                + border.left.get() as f32
+                + (pane.left + pane.width) as f32 * self.render_metrics.cell_size.width as f32)
+                / pixels_per_point;
+            let top = (origin_y + pane.top as f32 * self.render_metrics.cell_size.height as f32)
+                / pixels_per_point;
+            let bottom = (origin_y
+                + (pane.top + pane.height) as f32 * self.render_metrics.cell_size.height as f32)
+                / pixels_per_point;
+            if expanded {
+                let width = pane_width.min(420.0);
+                let height = if editing {
+                    156.0
+                } else {
+                    52.0 + 30.0 * count.min(5) as f32
+                };
+                egui::Rect::from_min_size(
+                    egui::pos2(right - width - 8.0, (bottom - height - 8.0).max(top + 8.0)),
+                    egui::vec2(width, height),
+                )
+                .contains(pos)
+            } else {
+                egui::Rect::from_min_max(
+                    egui::pos2(right - 94.0, bottom - 42.0),
+                    egui::pos2(right, bottom),
+                )
+                .contains(pos)
+            }
+        });
+        if !active && !over_overlay {
+            return false;
+        }
+        let modifiers = egui::Modifiers {
+            alt: event.modifiers.contains(window::Modifiers::ALT),
+            ctrl: event.modifiers.contains(window::Modifiers::CTRL),
+            shift: event.modifiers.contains(window::Modifiers::SHIFT),
+            mac_cmd: event.modifiers.contains(window::Modifiers::SUPER),
+            command: if cfg!(target_os = "macos") {
+                event.modifiers.contains(window::Modifiers::SUPER)
+            } else {
+                event.modifiers.contains(window::Modifiers::CTRL)
+            },
+        };
+        front_end.push_input_stack_event(self.mux_window_id, egui::Event::PointerMoved(pos));
+        match event.kind {
+            WMEK::Press(MousePress::Left) | WMEK::Release(MousePress::Left) => {
+                front_end.push_input_stack_event(
+                    self.mux_window_id,
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: matches!(event.kind, WMEK::Press(_)),
+                        modifiers,
+                    },
+                );
+            }
+            WMEK::VertWheel(delta) => front_end.push_input_stack_event(
+                self.mux_window_id,
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, delta as f32),
+                    modifiers,
+                },
+            ),
+            WMEK::HorzWheel(delta) => front_end.push_input_stack_event(
+                self.mux_window_id,
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(delta as f32, 0.0),
+                    modifiers,
+                },
+            ),
+            _ => {}
+        }
+        context.invalidate();
+        over_overlay
+            || (editor_open
+                && matches!(
+                    event.kind,
+                    WMEK::Press(MousePress::Left) | WMEK::Release(MousePress::Left)
+                ))
+            || (editor_open && event.mouse_buttons.contains(WMB::LEFT))
+    }
+
     pub(super) fn activate_sidebar_tab(&mut self, tab_id: mux::tab::TabId) {
         // Keep the read guard in this scope. activate_tab takes the write
         // guard for the same mux window and would deadlock if both overlapped.
@@ -80,6 +190,9 @@ impl super::TermWindow {
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
 
+        if self.input_stack_mouse_event(&event, context) {
+            return;
+        }
         if self.handle_tab_sidebar_mouse_event(&event, context) {
             return;
         }

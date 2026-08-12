@@ -92,6 +92,7 @@ pub struct TabSidebar {
     pub ui_scroll_max: f32,
     pub dirty: bool,
     pub width_cells_override: Option<usize>,
+    pub expanded_width_cells: Option<usize>,
     pub(super) hovered: Option<SidebarHover>,
     pub(super) resize: Option<SidebarResize>,
     pub(super) refresh_generation: u64,
@@ -130,6 +131,26 @@ pub fn responsive_width_cells(requested: usize, cell_width: f32, dpi: u32) -> us
             (COMPACT_WIDTH_CELLS + 1) as f32,
             MAX_SIDEBAR_WIDTH_CELLS as f32,
         ) as usize
+}
+
+fn toggled_sidebar_width(
+    compact: bool,
+    current: usize,
+    expanded: Option<usize>,
+    configured: usize,
+    cell_width: f32,
+    dpi: u32,
+) -> (usize, Option<usize>) {
+    if compact {
+        let first_regular_cell =
+            (COMPACT_MAX_WIDTH_PT * dpi.max(1) as f32 / 96.0 / cell_width.max(1.0)).floor()
+                as usize
+                + 1;
+        let requested = expanded.unwrap_or(configured).max(first_regular_cell);
+        (responsive_width_cells(requested, cell_width, dpi), expanded)
+    } else {
+        (COMPACT_WIDTH_CELLS, Some(current))
+    }
 }
 impl TermWindow {
     pub fn sidebar_relative_tab_id(&self, delta: isize, wrap: bool) -> Option<TabId> {
@@ -351,6 +372,33 @@ impl TermWindow {
             .and_then(|layout| layout.nodes.iter().find(|node| node.id == id))
             .and_then(|node| node.on_click.clone());
         let Some(action) = action else { return };
+        if matches!(
+            &action,
+            DynamicValue::Object(object)
+                if matches!(object.get_by_str("action"),
+                    Some(DynamicValue::String(name)) if name == "toggle-sidebar-width")
+        ) {
+            let cell_width = self.render_metrics.cell_size.width as f32;
+            let dpi = self.dimensions.dpi as u32;
+            let current = self.tab_sidebar.width_cells(&self.config, cell_width, dpi);
+            let compact = self.tab_sidebar.is_compact(&self.config, cell_width, dpi);
+            let (width, expanded) = toggled_sidebar_width(
+                compact,
+                current,
+                self.tab_sidebar.expanded_width_cells,
+                self.config.tab_sidebar_width,
+                cell_width,
+                dpi,
+            );
+            self.tab_sidebar.width_cells_override = Some(width);
+            self.tab_sidebar.expanded_width_cells = expanded;
+            if let Some(window) = self.window.clone() {
+                let dimensions = self.dimensions;
+                self.apply_dimensions(&dimensions, None, &window);
+            }
+            self.mark_tab_sidebar_dirty();
+            return;
+        }
         if let Some(tab_id) = activate_tab_id(&action) {
             self.activate_sidebar_tab(tab_id);
             return;
@@ -677,6 +725,22 @@ mod tests {
         assert_eq!(responsive_width_cells(6, 10.0, 96), 6);
         assert_eq!(responsive_width_cells(13, 10.0, 96), 24);
         assert_eq!(responsive_width_cells(60, 10.0, 96), 52);
+    }
+
+    #[test]
+    fn sidebar_button_collapses_and_restores_regular_width() {
+        assert_eq!(
+            toggled_sidebar_width(false, 32, None, 32, 10.0, 96),
+            (COMPACT_WIDTH_CELLS, Some(32))
+        );
+        assert_eq!(
+            toggled_sidebar_width(true, COMPACT_WIDTH_CELLS, Some(32), 32, 10.0, 96),
+            (32, Some(32))
+        );
+        assert_eq!(
+            toggled_sidebar_width(true, COMPACT_WIDTH_CELLS, None, 6, 10.0, 96),
+            (24, None)
+        );
     }
 
     #[test]

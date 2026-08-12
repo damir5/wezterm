@@ -7,11 +7,12 @@ use anyhow::{Context, Error};
 use config::keyassignment::{KeyAssignment, SpawnCommand};
 use config::{ConfigSubscription, NotificationHandling};
 use mux::client::ClientId;
+use mux::pane::PaneId;
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use promise::{Future, Promise};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
@@ -24,6 +25,54 @@ pub struct GuiFrontEnd {
     known_windows: RefCell<BTreeMap<Window, MuxWindowId>>,
     client_id: Arc<ClientId>,
     config_subscription: RefCell<Option<ConfigSubscription>>,
+    input_stacks: RefCell<HashMap<PaneId, PaneInputStack>>,
+    input_stack_windows: RefCell<HashMap<MuxWindowId, InputStackWindowUi>>,
+}
+
+#[derive(Default)]
+struct PaneInputStack {
+    queued: Vec<String>,
+    draft: String,
+}
+
+#[derive(Default)]
+pub(crate) struct InputStackWindowUi {
+    pub editor: Option<PaneId>,
+    pub expanded: HashSet<PaneId>,
+    pub events: Vec<egui::Event>,
+    pub errors: HashMap<PaneId, String>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InputStackPaneRect {
+    pub pane_id: PaneId,
+    pub rect: egui::Rect,
+}
+
+pub(crate) fn normalize_input_stack_item(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut in_newline = false;
+    for ch in text.chars() {
+        if ch == '\r' || ch == '\n' {
+            if !in_newline {
+                normalized.push(' ');
+                in_newline = true;
+            }
+        } else {
+            normalized.push(ch);
+            in_newline = false;
+        }
+    }
+    normalized
+}
+
+fn serialize_input_stack(items: &[String]) -> String {
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| format!("{}. {item}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl Drop for GuiFrontEnd {
@@ -33,6 +82,345 @@ impl Drop for GuiFrontEnd {
 }
 
 impl GuiFrontEnd {
+    pub(crate) fn open_input_stack_editor(&self, window_id: MuxWindowId, pane_id: PaneId) {
+        let mut windows = self.input_stack_windows.borrow_mut();
+        let ui = windows.entry(window_id).or_default();
+        ui.editor = Some(pane_id);
+        ui.expanded.insert(pane_id);
+    }
+
+    pub(crate) fn input_stack_ui_is_active(&self, window_id: MuxWindowId) -> bool {
+        self.input_stack_windows
+            .borrow()
+            .get(&window_id)
+            .map(|ui| ui.editor.is_some() || !ui.expanded.is_empty())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn input_stack_editor_is_active(&self, window_id: MuxWindowId) -> bool {
+        self.input_stack_windows
+            .borrow()
+            .get(&window_id)
+            .and_then(|ui| ui.editor)
+            .is_some()
+    }
+
+    pub(crate) fn input_stack_pane_ui(
+        &self,
+        window_id: MuxWindowId,
+        pane_id: PaneId,
+    ) -> (bool, bool) {
+        self.input_stack_windows
+            .borrow()
+            .get(&window_id)
+            .map(|ui| (ui.expanded.contains(&pane_id), ui.editor == Some(pane_id)))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn has_input_stack_for_panes(&self, panes: &[InputStackPaneRect]) -> bool {
+        let stacks = self.input_stacks.borrow();
+        panes.iter().any(|pane| {
+            stacks
+                .get(&pane.pane_id)
+                .map(|stack| !stack.queued.is_empty() || !stack.draft.is_empty())
+                .unwrap_or(false)
+        })
+    }
+
+    pub(crate) fn push_input_stack_event(&self, window_id: MuxWindowId, event: egui::Event) {
+        self.input_stack_windows
+            .borrow_mut()
+            .entry(window_id)
+            .or_default()
+            .events
+            .push(event);
+    }
+
+    pub(crate) fn take_input_stack_events(&self, window_id: MuxWindowId) -> Vec<egui::Event> {
+        self.input_stack_windows
+            .borrow_mut()
+            .entry(window_id)
+            .or_default()
+            .events
+            .drain(..)
+            .collect()
+    }
+
+    pub(crate) fn paint_input_stack(
+        &self,
+        ctx: &egui::Context,
+        window_id: MuxWindowId,
+        panes: &[InputStackPaneRect],
+        os_window: &Window,
+    ) {
+        enum Action {
+            Deliver(PaneId, usize, String),
+            Queue(PaneId, String),
+            Collapse(PaneId),
+        }
+
+        let mut action = None;
+        let mut windows = self.input_stack_windows.borrow_mut();
+        let window_ui = windows.entry(window_id).or_default();
+        let visible = panes
+            .iter()
+            .map(|pane| pane.pane_id)
+            .collect::<HashSet<_>>();
+        window_ui
+            .expanded
+            .retain(|pane_id| visible.contains(pane_id));
+        if window_ui
+            .editor
+            .map(|pane_id| !visible.contains(&pane_id))
+            .unwrap_or(false)
+        {
+            window_ui.editor = None;
+        }
+        let mut stacks = self.input_stacks.borrow_mut();
+
+        for pane in panes {
+            let count = stacks
+                .get(&pane.pane_id)
+                .map(|stack| stack.queued.len())
+                .unwrap_or(0);
+            let expanded = window_ui.expanded.contains(&pane.pane_id);
+            let editing = window_ui.editor == Some(pane.pane_id);
+            if count == 0 && !editing {
+                continue;
+            }
+
+            if !expanded {
+                let pos = pane.rect.right_bottom() - egui::vec2(86.0, 34.0);
+                egui::Area::new(egui::Id::new(("input-stack-badge", pane.pane_id)))
+                    .fixed_pos(pos)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        if ui
+                            .button(format!("Queued {count}"))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            window_ui.expanded.insert(pane.pane_id);
+                        }
+                    });
+                continue;
+            }
+
+            let width = pane.rect.width().min(420.0);
+            let estimated_height = if editing {
+                178.0
+            } else {
+                62.0 + 36.0 * count.min(5) as f32
+            };
+            let pos = egui::pos2(
+                pane.rect.right() - width - 8.0,
+                (pane.rect.bottom() - estimated_height - 8.0).max(pane.rect.top() + 8.0),
+            );
+            let response = egui::Area::new(egui::Id::new(("input-stack", pane.pane_id)))
+                .fixed_pos(pos)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(31, 34, 40))
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgb(67, 72, 82),
+                        ))
+                        .corner_radius(6.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            let font = egui::FontId::proportional(16.8);
+                            ui.style_mut()
+                                .text_styles
+                                .insert(egui::TextStyle::Body, font.clone());
+                            ui.style_mut()
+                                .text_styles
+                                .insert(egui::TextStyle::Button, font.clone());
+                            ui.style_mut()
+                                .text_styles
+                                .insert(egui::TextStyle::Small, font);
+                            ui.set_width(width - 16.0);
+                            ui.horizontal(|ui| {
+                                ui.strong(format!("Input stack · {count}"));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .button("×")
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                            .clicked()
+                                        {
+                                            action = Some(Action::Collapse(pane.pane_id));
+                                        }
+                                        if ui
+                                            .button("+ Add")
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                            .clicked()
+                                        {
+                                            window_ui.editor = Some(pane.pane_id);
+                                        }
+                                    },
+                                );
+                            });
+
+                            if let Some(stack) = stacks.get(&pane.pane_id) {
+                                egui::ScrollArea::vertical()
+                                    .max_height(150.0)
+                                    .show(ui, |ui| {
+                                        for (index, item) in stack.queued.iter().enumerate() {
+                                            if ui
+                                                .add_sized(
+                                                    [ui.available_width(), 31.0],
+                                                    egui::Button::new(item).frame(false),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .clicked()
+                                            {
+                                                action = Some(Action::Deliver(
+                                                    pane.pane_id,
+                                                    index,
+                                                    item.clone(),
+                                                ));
+                                            }
+                                        }
+                                    });
+                            }
+                            if let Some(error) = window_ui.errors.get(&pane.pane_id) {
+                                ui.colored_label(egui::Color32::from_rgb(235, 95, 110), error);
+                            }
+
+                            if window_ui.editor == Some(pane.pane_id) {
+                                let stack = stacks.entry(pane.pane_id).or_default();
+                                let edit = ui.add(
+                                    egui::TextEdit::singleline(&mut stack.draft)
+                                        .code_editor()
+                                        .font(egui::FontId::monospace(18.2))
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("Input for later"),
+                                );
+                                edit.request_focus();
+                                // A single-line TextEdit normally loses focus on Enter, but we
+                                // immediately retain focus for fast consecutive additions.
+                                // Submit from the key event itself instead of relying on focus.
+                                let queue = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                                ui.horizontal(|ui| {
+                                    ui.label("Esc keeps draft · Enter queues");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    !stack.draft.trim().is_empty(),
+                                                    egui::Button::new("Queue"),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .clicked()
+                                                || queue
+                                            {
+                                                action = Some(Action::Queue(
+                                                    pane.pane_id,
+                                                    stack.draft.clone(),
+                                                ));
+                                            }
+                                        },
+                                    );
+                                });
+                                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                                    window_ui.editor = None;
+                                    action = Some(Action::Collapse(pane.pane_id));
+                                }
+                            }
+                        });
+                });
+
+            if ctx.input(|input| input.pointer.any_click())
+                && !response
+                    .response
+                    .rect
+                    .contains(ctx.input(|input| input.pointer.interact_pos().unwrap_or_default()))
+            {
+                window_ui.editor = None;
+            }
+        }
+        drop(stacks);
+        drop(windows);
+
+        match action {
+            Some(Action::Queue(pane_id, input)) => {
+                if let Some(backup) = self.queue_input(pane_id, &input) {
+                    os_window.set_clipboard(Clipboard::Clipboard, backup);
+                    self.input_stack_windows
+                        .borrow_mut()
+                        .entry(window_id)
+                        .or_default()
+                        .editor = None;
+                }
+            }
+            Some(Action::Deliver(pane_id, index, input)) => {
+                os_window.set_clipboard(Clipboard::Clipboard, input.clone());
+                let result = Mux::get()
+                    .get_pane(pane_id)
+                    .ok_or_else(|| anyhow::anyhow!("pane no longer exists"))
+                    .and_then(|pane| pane.send_paste(&input));
+                let mut windows = self.input_stack_windows.borrow_mut();
+                let ui = windows.entry(window_id).or_default();
+                match result {
+                    Ok(()) => {
+                        ui.errors.remove(&pane_id);
+                        drop(windows);
+                        self.remove_queued_input(pane_id, index);
+                    }
+                    Err(error) => {
+                        ui.errors
+                            .insert(pane_id, format!("Paste failed: {error:#}"));
+                    }
+                }
+            }
+            Some(Action::Collapse(pane_id)) => {
+                let mut windows = self.input_stack_windows.borrow_mut();
+                let ui = windows.entry(window_id).or_default();
+                ui.expanded.remove(&pane_id);
+                if ui.editor == Some(pane_id) {
+                    ui.editor = None;
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub(crate) fn queue_input(&self, pane_id: PaneId, input: &str) -> Option<String> {
+        let input = normalize_input_stack_item(input);
+        if input.trim().is_empty() {
+            return None;
+        }
+        let mut stacks = self.input_stacks.borrow_mut();
+        let stack = stacks.entry(pane_id).or_default();
+        stack.draft.clear();
+        stack.queued.push(input);
+        Some(serialize_input_stack(&stack.queued))
+    }
+
+    pub(crate) fn input_stack_count(&self, pane_id: PaneId) -> usize {
+        self.input_stacks
+            .borrow()
+            .get(&pane_id)
+            .map(|stack| stack.queued.len())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn remove_queued_input(&self, pane_id: PaneId, index: usize) {
+        let mut stacks = self.input_stacks.borrow_mut();
+        let Some(stack) = stacks.get_mut(&pane_id) else {
+            return;
+        };
+        if index < stack.queued.len() {
+            stack.queued.remove(index);
+        }
+        if stack.queued.is_empty() && stack.draft.is_empty() {
+            stacks.remove(&pane_id);
+        }
+    }
+
     pub fn try_new() -> anyhow::Result<Rc<GuiFrontEnd>> {
         let connection = Connection::init()?;
         connection.set_event_handler(Self::app_event_handler);
@@ -47,6 +435,8 @@ impl GuiFrontEnd {
             known_windows: RefCell::new(BTreeMap::new()),
             client_id: client_id.clone(),
             config_subscription: RefCell::new(None),
+            input_stacks: RefCell::new(HashMap::new()),
+            input_stack_windows: RefCell::new(HashMap::new()),
         });
 
         mux.subscribe(move |n| {
@@ -90,7 +480,20 @@ impl GuiFrontEnd {
                 MuxNotification::WindowTitleChanged { .. } => {}
                 MuxNotification::TabResized(_) => {}
                 MuxNotification::TabAddedToWindow { .. } => {}
-                MuxNotification::PaneRemoved(_) => {}
+                MuxNotification::PaneRemoved(pane_id) => {
+                    promise::spawn::spawn_into_main_thread(async move {
+                        let front_end = crate::frontend::front_end();
+                        front_end.input_stacks.borrow_mut().remove(&pane_id);
+                        for ui in front_end.input_stack_windows.borrow_mut().values_mut() {
+                            ui.expanded.remove(&pane_id);
+                            ui.errors.remove(&pane_id);
+                            if ui.editor == Some(pane_id) {
+                                ui.editor = None;
+                            }
+                        }
+                    })
+                    .detach();
+                }
                 MuxNotification::WindowInvalidated(_) => {}
                 MuxNotification::PaneOutput(_) => {}
                 MuxNotification::PaneAdded(_) => {}
@@ -520,6 +923,28 @@ impl WorkspaceSwitcher {
 impl Drop for WorkspaceSwitcher {
     fn drop(&mut self) {
         front_end().switch_workspace(&self.new_name);
+    }
+}
+
+#[cfg(test)]
+mod input_stack_tests {
+    use super::{normalize_input_stack_item, serialize_input_stack};
+
+    #[test]
+    fn input_stack_normalizes_newline_runs_without_trimming_spaces() {
+        assert_eq!(
+            normalize_input_stack_item("  first\r\n\nsecond  "),
+            "  first second  "
+        );
+        assert_eq!(normalize_input_stack_item("a\r\r\nb"), "a b");
+    }
+
+    #[test]
+    fn input_stack_clipboard_backup_is_numbered() {
+        assert_eq!(
+            serialize_input_stack(&["first".to_string(), "second".to_string()]),
+            "1. first\n2. second"
+        );
     }
 }
 

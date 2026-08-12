@@ -188,6 +188,101 @@ enum OnlyKeyBindings {
 }
 
 impl super::TermWindow {
+    fn input_stack_key_event(&self, event: &KeyEvent, context: &dyn WindowOps) -> bool {
+        let front_end = crate::frontend::front_end();
+        if !front_end.input_stack_editor_is_active(self.mux_window_id) {
+            return false;
+        }
+        let modifiers = egui::Modifiers {
+            alt: event.modifiers.contains(Modifiers::ALT),
+            ctrl: event.modifiers.contains(Modifiers::CTRL),
+            shift: event.modifiers.contains(Modifiers::SHIFT),
+            mac_cmd: event.modifiers.contains(Modifiers::SUPER),
+            command: if cfg!(target_os = "macos") {
+                event.modifiers.contains(Modifiers::SUPER)
+            } else {
+                event.modifiers.contains(Modifiers::CTRL)
+            },
+        };
+        let key_name = match &event.key {
+            KeyCode::Char('\r') => Some("Enter".to_string()),
+            KeyCode::Char('\t') => Some("Tab".to_string()),
+            KeyCode::Char('\u{8}') => Some("Backspace".to_string()),
+            KeyCode::Char('\u{7f}') => Some("Delete".to_string()),
+            KeyCode::Char('\u{1b}') => Some("Escape".to_string()),
+            KeyCode::Char(ch) => Some(ch.to_ascii_uppercase().to_string()),
+            KeyCode::Composed(text) => {
+                if event.key_is_down {
+                    front_end.push_input_stack_event(
+                        self.mux_window_id,
+                        egui::Event::Text(text.clone()),
+                    );
+                }
+                context.invalidate();
+                return true;
+            }
+            KeyCode::LeftArrow => Some("ArrowLeft".to_string()),
+            KeyCode::RightArrow => Some("ArrowRight".to_string()),
+            KeyCode::UpArrow => Some("ArrowUp".to_string()),
+            KeyCode::DownArrow => Some("ArrowDown".to_string()),
+            KeyCode::Home => Some("Home".to_string()),
+            KeyCode::End => Some("End".to_string()),
+            KeyCode::PageUp => Some("PageUp".to_string()),
+            KeyCode::PageDown => Some("PageDown".to_string()),
+            _ => None,
+        };
+        if let Some(key) = key_name.as_deref().and_then(egui::Key::from_name) {
+            front_end.push_input_stack_event(
+                self.mux_window_id,
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: event.key_is_down,
+                    repeat: event.repeat_count > 1,
+                    modifiers,
+                },
+            );
+        }
+        if event.key_is_down && !modifiers.command && !modifiers.ctrl && !modifiers.alt {
+            match &event.key {
+                KeyCode::Char(ch) if !ch.is_control() => front_end
+                    .push_input_stack_event(self.mux_window_id, egui::Event::Text(ch.to_string())),
+                _ => {}
+            }
+        }
+        if event.key_is_down && modifiers.command && matches!(&event.key, KeyCode::Char('v' | 'V'))
+        {
+            let window = self.window.as_ref().unwrap().clone();
+            let mux_window_id = self.mux_window_id;
+            let clipboard = window.get_clipboard(window::Clipboard::Clipboard);
+            promise::spawn::spawn(async move {
+                if let Ok(text) = clipboard.await {
+                    window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                        move |term_window| {
+                            crate::frontend::front_end()
+                                .push_input_stack_event(mux_window_id, egui::Event::Paste(text));
+                            term_window.request_terminal_repaint();
+                        },
+                    )));
+                }
+            })
+            .detach();
+        }
+        if event.key_is_down && modifiers.command {
+            match &event.key {
+                KeyCode::Char('c' | 'C') => {
+                    front_end.push_input_stack_event(self.mux_window_id, egui::Event::Copy)
+                }
+                KeyCode::Char('x' | 'X') => {
+                    front_end.push_input_stack_event(self.mux_window_id, egui::Event::Cut)
+                }
+                _ => {}
+            }
+        }
+        context.invalidate();
+        true
+    }
+
     fn encode_win32_input(&self, pane: &Arc<dyn Pane>, key: &KeyEvent) -> Option<String> {
         if !self.config.allow_win32_input_mode
             || pane.get_keyboard_encoding() != KeyboardEncoding::Win32
@@ -599,6 +694,9 @@ impl super::TermWindow {
     }
 
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
+        if self.input_stack_key_event(&window_key, context) {
+            return;
+        }
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
@@ -872,5 +970,4 @@ impl super::TermWindow {
         };
         Key::Code(code)
     }
-
 }

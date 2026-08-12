@@ -2011,6 +2011,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit"],
             icon: None,
         },
+        AddToInputStack => CommandDef {
+            brief: "Input stack: add input".into(),
+            doc: "Queues input for the active pane without sending it".into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &[],
+            icon: None,
+        },
     })
 }
 
@@ -2054,6 +2062,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateCopyMode,
         ClearKeyTableStack,
         ActivateCommandPalette,
+        AddToInputStack,
         // ----------------- View
         DecreaseFontSize,
         IncreaseFontSize,
