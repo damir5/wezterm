@@ -13,7 +13,10 @@ use std::convert::TryFrom;
 use termwiz_funcs::lines_to_escapes;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_toast_notification::ToastNotification;
-use window::{Connection, ConnectionOps, DeadKeyStatus, WindowOps, WindowState};
+use window::{
+    Connection, ConnectionOps, DeadKeyStatus, KeyCode, KeyEvent, KeyboardLedStatus, Modifiers,
+    WindowOps, WindowState,
+};
 
 #[derive(Clone)]
 pub struct GuiWin {
@@ -32,6 +35,20 @@ impl GuiWin {
     }
 }
 
+pub(crate) fn synthetic_key_event(key: &str, mods: Option<&str>) -> anyhow::Result<KeyEvent> {
+    Ok(KeyEvent {
+        key: KeyCode::try_from(key).map_err(anyhow::Error::msg)?,
+        modifiers: Modifiers::try_from(mods.unwrap_or_default().to_string())
+            .map_err(anyhow::Error::msg)?,
+        leds: KeyboardLedStatus::default(),
+        repeat_count: 1,
+        key_is_down: true,
+        raw: None,
+        #[cfg(windows)]
+        win32_uni_char: None,
+    })
+}
+
 impl UserData for GuiWin {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
         methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, _: ()| {
@@ -43,6 +60,15 @@ impl UserData for GuiWin {
         });
 
         methods.add_method("window_id", |_, this, _: ()| Ok(this.mux_window_id));
+        methods.add_method("dispatch_key", |_, this, input: mlua::Table| {
+            let key = input.get::<_, String>("key")?;
+            let mods = input.get::<_, Option<String>>("mods")?;
+            let event =
+                synthetic_key_event(&key, mods.as_deref()).map_err(mlua::Error::external)?;
+            this.window
+                .notify(TermWindowNotif::SyntheticKeyEvent(event));
+            Ok(())
+        });
         methods.add_method("mux_window", |_, this, _: ()| {
             Ok(mux_lua::MuxWindow(this.mux_window_id))
         });
@@ -387,5 +413,24 @@ impl UserData for GuiWin {
                 Ok(result)
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_key_event_parses_config_key_names_and_modifiers() {
+        let event = synthetic_key_event("UpArrow", Some("CMD|OPT")).unwrap();
+        assert_eq!(event.key, KeyCode::UpArrow);
+        assert_eq!(event.modifiers, Modifiers::SUPER | Modifiers::ALT);
+        assert!(event.key_is_down);
+    }
+
+    #[test]
+    fn synthetic_key_event_rejects_invalid_input() {
+        assert!(synthetic_key_event("not-a-key", None).is_err());
+        assert!(synthetic_key_event("UpArrow", Some("not-a-modifier")).is_err());
     }
 }

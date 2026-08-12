@@ -158,6 +158,9 @@ pub enum TermWindowNotif {
         offsets_ms: Vec<u64>,
         tx: smol::channel::Sender<anyhow::Result<Vec<String>>>,
     },
+    /// Debug-only Lua key injection.  This intentionally takes the normal
+    /// key-event path so configured key bindings and callbacks are exercised.
+    SyntheticKeyEvent(KeyEvent),
 }
 
 pub(crate) struct SidebarScreenshotRequest {
@@ -1471,6 +1474,9 @@ impl TermWindow {
                     self.schedule_sidebar_screenshot();
                     window.invalidate();
                 }
+            }
+            TermWindowNotif::SyntheticKeyEvent(event) => {
+                self.key_event_impl(event, window);
             }
         }
 

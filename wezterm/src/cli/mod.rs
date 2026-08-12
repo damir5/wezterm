@@ -9,6 +9,8 @@ mod activate_tab;
 mod adjust_pane_size;
 mod get_pane_direction;
 mod get_text;
+#[cfg(unix)]
+mod gui_test;
 mod kill_pane;
 mod list;
 mod list_clients;
@@ -163,9 +165,19 @@ Outputs the pane-id for the newly created pane on success"
     /// Zoom, unzoom, or toggle zoom state
     #[command(name = "zoom-pane", rename_all = "kebab")]
     ZoomPane(zoom_pane::ZoomPane),
+
+    /// Local GUI screenshot and key-binding test controls.
+    #[cfg(unix)]
+    #[command(name = "gui-test", rename_all = "kebab")]
+    GuiTest(gui_test::GuiTestCommand),
 }
 
 async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if let CliSubCommand::GuiTest(cmd) = &cli.sub {
+        return cmd.run().await;
+    }
+
     let mut ui = mux::connui::ConnectionUI::new_headless();
     let initial = true;
 
@@ -199,6 +211,8 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::SetWindowTitle(cmd) => cmd.run(client).await,
         CliSubCommand::RenameWorkspace(cmd) => cmd.run(client).await,
         CliSubCommand::ZoomPane(cmd) => cmd.run(client).await,
+        #[cfg(unix)]
+        CliSubCommand::GuiTest(cmd) => cmd.run().await,
     }
 }
 

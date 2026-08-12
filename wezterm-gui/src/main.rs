@@ -40,6 +40,8 @@ mod customglyph;
 mod download;
 mod frontend;
 mod glyphcache;
+#[cfg(unix)]
+mod gui_test;
 mod inputmap;
 mod overlay;
 mod quad;
@@ -654,6 +656,9 @@ impl Publish {
 }
 
 fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    crate::gui_test::spawn(&unix_socket_path)?;
+
     let mut listener =
         wezterm_mux_server_impl::local::LocalListener::with_domain(&config::UnixDomain {
             socket_path: Some(unix_socket_path.clone()),
