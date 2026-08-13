@@ -3,9 +3,9 @@ use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource}
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
-    ListAllPanes, ListAllWindows, ListCommands, NewWindow, Resize, SplitPane, SubscribePaneCommand,
-    SubscribePaneCwd, SwapWindow, TmuxCommand, PANE_COMMAND_SUBSCRIPTION, PANE_CWD_SUBSCRIPTION,
-    PANE_TITLE_SUBSCRIPTION,
+    KillPane, ListAllPanes, ListAllWindows, ListCommands, NewWindow, Resize, SplitPane,
+    SubscribePaneCommand, SubscribePaneCwd, SwapWindow, TmuxCommand, PANE_COMMAND_SUBSCRIPTION,
+    PANE_CWD_SUBSCRIPTION, PANE_TITLE_SUBSCRIPTION,
 };
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
@@ -463,6 +463,21 @@ pub struct TmuxDomain {
 }
 
 impl TmuxDomainState {
+    /// Queue a remote kill only for an explicit local close. Remote-driven
+    /// removal and control-mode disconnect must leave the tmux session alone.
+    /// @fdb:remote-tmux-close-lifecycle
+    pub(crate) fn request_pane_close(&self, local_pane_id: PaneId) {
+        let remote_pane_id = self.remote_panes.lock().values().find_map(|pane| {
+            let pane = pane.lock();
+            (pane.local_pane_id == local_pane_id).then_some(pane.pane_id)
+        });
+        let Some(pane) = remote_pane_id else {
+            return;
+        };
+        self.cmd_queue.lock().push_back(Box::new(KillPane { pane }));
+        TmuxDomainState::schedule_send_next_command(self.domain_id);
+    }
+
     pub fn remember_resize(&self, pane_id: TmuxPaneId, size: PtySize) -> u64 {
         let mut pending = self.pending_resizes.lock();
         if let Some((pending_size, request_id)) = pending.get(&pane_id) {

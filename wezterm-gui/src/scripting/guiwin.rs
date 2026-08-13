@@ -182,6 +182,12 @@ impl UserData for GuiWin {
             this.window.notify(TermWindowNotif::SetLeftStatus(status));
             Ok(())
         });
+        methods.add_method("invalidate_tab_sidebar", |_, this, _: ()| {
+            this.window.notify(TermWindowNotif::Apply(Box::new(|term| {
+                term.mark_tab_sidebar_dirty();
+            })));
+            Ok(())
+        });
         methods.add_async_method("get_dimensions", |_, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);
             this.window.notify(TermWindowNotif::GetDimensions(tx));

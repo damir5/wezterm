@@ -167,39 +167,39 @@ impl crate::TermWindow {
                     }
                 }
             }
+        }
 
-            if let Some(next_due) = *self.sidebar_animation_due.borrow() {
-                let prior = self.sidebar_animation_scheduled.borrow_mut().take();
-                match prior {
-                    Some(prior) if prior <= next_due => {}
-                    _ => {
-                        self.sidebar_animation_scheduled
-                            .borrow_mut()
-                            .replace(next_due);
-                        let window = self.window.clone().take().unwrap();
-                        promise::spawn::spawn(async move {
-                            Timer::at(next_due).await;
-                            let win = window.clone();
-                            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
-                                tw.sidebar_animation_scheduled.borrow_mut().take();
-                                let due = tw.sidebar_animation_due.borrow_mut().take();
-                                let due_now = due.map(|due| due <= Instant::now()).unwrap_or(false);
-                                if due_now {
-                                    let generic_due = tw
-                                        .has_animation
-                                        .borrow()
-                                        .map(|due| due <= Instant::now())
-                                        .unwrap_or(false);
-                                    tw.sidebar_only_repaint = tw.webgpu.is_some()
-                                        && !generic_due
-                                        && !tw.terminal_repaint_pending
-                                        && tw.tab_sidebar.ui_animation_started.is_none();
-                                    win.invalidate();
-                                }
-                            })));
-                        })
-                        .detach();
-                    }
+        if let Some(next_due) = *self.sidebar_animation_due.borrow() {
+            let prior = self.sidebar_animation_scheduled.borrow_mut().take();
+            match prior {
+                Some(prior) if prior <= next_due => {}
+                _ => {
+                    self.sidebar_animation_scheduled
+                        .borrow_mut()
+                        .replace(next_due);
+                    let window = self.window.clone().take().unwrap();
+                    promise::spawn::spawn(async move {
+                        Timer::at(next_due).await;
+                        let win = window.clone();
+                        window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                            tw.sidebar_animation_scheduled.borrow_mut().take();
+                            let due = tw.sidebar_animation_due.borrow_mut().take();
+                            let due_now = due.map(|due| due <= Instant::now()).unwrap_or(false);
+                            if due_now {
+                                let generic_due = tw
+                                    .has_animation
+                                    .borrow()
+                                    .map(|due| due <= Instant::now())
+                                    .unwrap_or(false);
+                                tw.sidebar_only_repaint = tw.webgpu.is_some()
+                                    && !generic_due
+                                    && !tw.terminal_repaint_pending
+                                    && tw.tab_sidebar.ui_animation_started.is_none();
+                                win.invalidate();
+                            }
+                        })));
+                    })
+                    .detach();
                 }
             }
         }

@@ -1262,6 +1262,26 @@ impl TmuxCommand for SendKeys {
 }
 
 #[derive(Debug)]
+pub(crate) struct KillPane {
+    pub pane: TmuxPaneId,
+}
+
+impl TmuxCommand for KillPane {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!("kill-pane -t %{}\n", self.pane)
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            let error = format!("kill-pane in domain={domain_id} failed: {result:#?}");
+            log::error!("{error}");
+            anyhow::bail!(error);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct NewWindow {
     pub command_dir: Option<String>,
     pub resize: Option<TerminalSize>,
@@ -1655,6 +1675,48 @@ mod test {
         assert_eq!(
             SubscribePaneTitle.get_command(0),
             "refresh-client -B 'wezterm-pane-title:%*:#{pane_title}'\n"
+        );
+    }
+
+    // @fdb:remote-tmux-close-lifecycle-test
+    #[test]
+    fn explicit_close_queues_remote_tmux_pane_kill() {
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let domain = TmuxDomain::new(1);
+        let pane = domain
+            .inner
+            .create_pane(&PaneItem {
+                session_id: 1,
+                window_id: 2,
+                pane_id: 3,
+                _pane_index: 0,
+                cursor_x: 0,
+                cursor_y: 0,
+                pane_width: 80,
+                pane_height: 24,
+                pane_left: 0,
+                pane_top: 0,
+                pane_active: true,
+                mouse_standard: false,
+                mouse_button: false,
+                mouse_all: false,
+                mouse_utf8: false,
+                mouse_sgr: false,
+                current_command: None,
+                current_path: None,
+            })
+            .unwrap();
+
+        pane.kill();
+        assert!(
+            domain.inner.cmd_queue.lock().is_empty(),
+            "passive local removal must preserve the remote tmux pane"
+        );
+        domain.inner.request_pane_close(pane.pane_id());
+        let command = domain.inner.cmd_queue.lock().pop_front().unwrap();
+        assert_eq!(
+            command.get_command(domain.inner.domain_id),
+            "kill-pane -t %3\n"
         );
     }
 

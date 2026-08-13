@@ -3438,7 +3438,7 @@ impl TermWindow {
             self.assign_overlay_for_pane(pane_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
-            mux.remove_pane(pane_id);
+            mux.kill_pane(pane_id);
         }
     }
 
@@ -3469,7 +3469,7 @@ impl TermWindow {
             self.assign_overlay(tab_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
-            mux.remove_tab(tab_id);
+            mux.kill_tab(tab_id);
         }
     }
 
@@ -3489,7 +3489,7 @@ impl TermWindow {
             self.assign_overlay(tab_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
-            mux.remove_tab(tab_id);
+            mux.kill_tab(tab_id);
         }
     }
 

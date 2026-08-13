@@ -920,10 +920,36 @@ impl Mux {
         self.prune_dead_windows();
     }
 
+    fn request_remote_pane_close(&self, pane_id: PaneId) {
+        let Some(pane) = self.get_pane(pane_id) else {
+            return;
+        };
+        let Some(domain) = self.get_domain(pane.domain_id()) else {
+            return;
+        };
+        if let Some(tmux) = domain.downcast_ref::<crate::tmux::TmuxDomain>() {
+            tmux.inner.request_pane_close(pane_id);
+        }
+    }
+
+    pub fn kill_pane(&self, pane_id: PaneId) {
+        self.request_remote_pane_close(pane_id);
+        self.remove_pane(pane_id);
+    }
+
     pub fn remove_tab(&self, tab_id: TabId) -> Option<Arc<Tab>> {
         let tab = self.remove_tab_internal(tab_id);
         self.prune_dead_windows();
         tab
+    }
+
+    pub fn kill_tab(&self, tab_id: TabId) -> Option<Arc<Tab>> {
+        if let Some(tab) = self.get_tab(tab_id) {
+            for pane in tab.iter_panes_ignoring_zoom() {
+                self.request_remote_pane_close(pane.pane.pane_id());
+            }
+        }
+        self.remove_tab(tab_id)
     }
 
     pub fn prune_dead_windows(&self) {

@@ -29,6 +29,16 @@ fn activate_tab_id(action: &DynamicValue) -> Option<TabId> {
         .map(|tab_id| tab_id as TabId)
 }
 
+fn activate_pane_id(action: &DynamicValue) -> Option<PaneId> {
+    let DynamicValue::Object(object) = action else {
+        return None;
+    };
+    matches!(object.get_by_str("action"), Some(DynamicValue::String(action)) if action == "activate-pane")
+        .then(|| object.get_by_str("pane_id").and_then(DynamicValue::coerce_unsigned))
+        .flatten()
+        .map(|pane_id| pane_id as PaneId)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SpawnHostTabTarget {
     DefaultDomain,
@@ -231,9 +241,7 @@ impl TermWindow {
         }
 
         let started = std::time::Instant::now();
-        let mut ui_tree = None;
-        let mut tab_ids = vec![];
-        let refresh_after = match callback_entries(
+        let result = callback_entries(
             tabs,
             self.tab_sidebar.is_compact(
                 &self.config,
@@ -243,32 +251,24 @@ impl TermWindow {
             self.tab_sidebar_width_pixels(),
             self.dimensions.pixel_height,
             self.dimensions.dpi as u32,
-        ) {
-            Ok(callback) => {
-                ui_tree = callback.ui_tree;
-                let valid_tabs = tabs
-                    .iter()
-                    .map(|tab| tab.tab_id)
-                    .collect::<std::collections::HashSet<_>>();
-                if let Err(err) = validate_callback_entries(&valid_tabs, &callback.entries) {
-                    log::warn!("format-tab-sidebar: ignoring all callback output: {err:#}");
-                    None
-                } else {
-                    tab_ids = callback.tab_ids;
-                    callback.refresh_after
-                }
+        )
+        .and_then(|callback| {
+            let valid_tabs = tabs
+                .iter()
+                .map(|tab| tab.tab_id)
+                .collect::<std::collections::HashSet<_>>();
+            install_callback(&mut self.tab_sidebar, &valid_tabs, callback)
+        });
+        let refresh_after = match result {
+            Ok(refresh_after) => {
+                self.sidebar_images.clear();
+                refresh_after
             }
             Err(err) => {
-                log::warn!("format-tab-sidebar: {err:#}");
-                None
+                log::warn!("format-tab-sidebar: keeping last good output: {err:#}");
+                Some(Duration::from_secs(1))
             }
         };
-
-        self.tab_sidebar.ui_tree = ui_tree;
-        self.tab_sidebar.tab_ids = tab_ids;
-        self.tab_sidebar.ui_target_layout = None;
-        self.tab_sidebar.ui_layout_size = None;
-        self.sidebar_images.clear();
         self.tab_sidebar.dirty = false;
         self.tab_sidebar.refresh_generation = self.tab_sidebar.refresh_generation.wrapping_add(1);
         if let Some(refresh_after) = refresh_after {
@@ -426,6 +426,16 @@ impl TermWindow {
             self.activate_sidebar_tab(tab_id);
             return;
         }
+        if let Some(pane_id) = activate_pane_id(&action) {
+            if let Err(err) = Mux::get().focus_pane_and_containing_tab(pane_id) {
+                log::warn!("activate-pane {pane_id}: {err:#}");
+                return;
+            }
+            self.request_terminal_repaint();
+            self.mark_tab_sidebar_dirty();
+            self.emit_status_event();
+            return;
+        }
         if let Some(target) = spawn_host_tab_target(&action) {
             let domain = match target {
                 SpawnHostTabTarget::DefaultDomain => {
@@ -572,6 +582,19 @@ fn validate_callback_entries(
         anyhow::bail!("unknown tab_id {unknown}");
     }
     Ok(())
+}
+
+fn install_callback(
+    sidebar: &mut TabSidebar,
+    valid_tabs: &std::collections::HashSet<TabId>,
+    callback: CallbackResult,
+) -> anyhow::Result<Option<Duration>> {
+    validate_callback_entries(valid_tabs, &callback.entries)?;
+    sidebar.ui_tree = callback.ui_tree;
+    sidebar.tab_ids = callback.tab_ids;
+    sidebar.ui_target_layout = None;
+    sidebar.ui_layout_size = None;
+    Ok(callback.refresh_after)
 }
 
 fn callback_entries(
@@ -766,6 +789,26 @@ mod tests {
     }
 
     #[test]
+    fn invalid_callback_keeps_last_good_sidebar_state() {
+        let lua = mlua::Lua::new();
+        let value = lua
+            .load("return { entries = {{tab_id=2}} }")
+            .eval()
+            .unwrap();
+        let callback = decode_callback(&lua, value).unwrap();
+        let valid = [1usize]
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut sidebar = TabSidebar {
+            tab_ids: vec![1],
+            ..Default::default()
+        };
+        assert!(install_callback(&mut sidebar, &valid, callback).is_err());
+        assert_eq!(sidebar.tab_ids, vec![1]);
+    }
+
+    #[test]
     fn responsive_width_uses_compact_and_regular_breakpoints() {
         assert_eq!(responsive_width_cells(6, 10.0, 96), 6);
         assert_eq!(responsive_width_cells(13, 10.0, 96), 24);
@@ -837,6 +880,19 @@ mod tests {
         assert_eq!(
             spawn_host_tab_target(&luahelper::lua_value_to_dynamic(remote).unwrap()),
             Some(SpawnHostTabTarget::Pane(42))
+        );
+    }
+
+    #[test]
+    fn pane_action_targets_the_exact_split() {
+        let lua = mlua::Lua::new();
+        let action = lua
+            .load("return {action='activate-pane', pane_id=42}")
+            .eval::<Value>()
+            .unwrap();
+        assert_eq!(
+            activate_pane_id(&luahelper::lua_value_to_dynamic(action).unwrap()),
+            Some(42)
         );
     }
 }

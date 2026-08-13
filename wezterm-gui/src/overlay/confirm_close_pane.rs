@@ -9,17 +9,13 @@ use mux::Mux;
 pub fn confirm_close_pane(
     pane_id: PaneId,
     mut term: TermWizTerminal,
-    mux_window_id: WindowId,
+    _mux_window_id: WindowId,
     window: ::window::Window,
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation("🛑 Really kill this pane?", &mut term)? {
         promise::spawn::spawn_into_main_thread(async move {
             let mux = Mux::get();
-            let tab = match mux.get_active_tab_for_window(mux_window_id) {
-                Some(tab) => tab,
-                None => return,
-            };
-            tab.kill_pane(pane_id);
+            mux.kill_pane(pane_id);
         })
         .detach();
     }
@@ -40,7 +36,7 @@ pub fn confirm_close_tab(
     )? {
         promise::spawn::spawn_into_main_thread(async move {
             let mux = Mux::get();
-            mux.remove_tab(tab_id);
+            mux.kill_tab(tab_id);
         })
         .detach();
     }

@@ -81,6 +81,8 @@ pub enum TextAlign {
 pub enum ShapeKind {
     Ring,
     Arc,
+    PauseRing,
+    DotRing,
     Bars,
     Cross,
     Dot,
@@ -375,6 +377,8 @@ fn shape_kind(table: &Table) -> anyhow::Result<Option<ShapeKind>> {
         None => None,
         Some("ring") => Some(ShapeKind::Ring),
         Some("arc") => Some(ShapeKind::Arc),
+        Some("pause-ring") => Some(ShapeKind::PauseRing),
+        Some("dot-ring") => Some(ShapeKind::DotRing),
         Some("bars") => Some(ShapeKind::Bars),
         Some("cross") => Some(ShapeKind::Cross),
         Some("dot") => Some(ShapeKind::Dot),
@@ -1006,6 +1010,22 @@ fn paint_shape(
                 .collect::<Vec<_>>();
             painter.add(egui::Shape::line(points, egui::Stroke::new(width, color)));
         }
+        ShapeKind::PauseRing => {
+            painter.circle_stroke(center, radius, stroke);
+            let bar = egui::vec2(size * 0.13, size * 0.42);
+            let offset = size * 0.12;
+            for side in [-offset, offset] {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(center + egui::vec2(side, 0.0), bar),
+                    bar.x * 0.5,
+                    color,
+                );
+            }
+        }
+        ShapeKind::DotRing => {
+            painter.circle_stroke(center, radius, stroke);
+            painter.circle_filled(center, size * 0.10, color);
+        }
         ShapeKind::Bars => {
             let bar = egui::vec2(size * 0.2, size * 0.64);
             let offset = size * 0.18;
@@ -1496,12 +1516,14 @@ return { type = 'row', width = 100, height = 40, padding = 10,
     }
 
     #[test]
-    fn decodes_harness_shapes() {
+    fn decodes_vector_shapes() {
         let lua = mlua::Lua::new();
         for (name, expected) in [
             ("diamond", ShapeKind::Diamond),
             ("hourglass", ShapeKind::Hourglass),
             ("gate", ShapeKind::Gate),
+            ("pause-ring", ShapeKind::PauseRing),
+            ("dot-ring", ShapeKind::DotRing),
         ] {
             let table = lua
                 .load(format!("return {{ shape = {name:?} }}"))
