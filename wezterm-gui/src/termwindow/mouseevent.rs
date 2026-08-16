@@ -23,6 +23,102 @@ use wezterm_dynamic::ToDynamic;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
+fn is_file_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | '@' | '+' | '%')
+}
+
+fn file_path_at_wrapped_line(
+    previous: Option<&str>,
+    current: &str,
+    next: Option<&str>,
+    column: usize,
+) -> Option<String> {
+    let chars = current.chars().collect::<Vec<_>>();
+    if !chars.get(column).is_some_and(|c| is_file_path_char(*c)) {
+        return None;
+    }
+
+    let mut start = column;
+    while start > 0 && is_file_path_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = column + 1;
+    while end < chars.len() && is_file_path_char(chars[end]) {
+        end += 1;
+    }
+    let current = chars[start..end].iter().collect::<String>();
+    let at_start = chars[..start].iter().all(|c| c.is_whitespace());
+    let at_end = chars[end..].iter().all(|c| c.is_whitespace());
+
+    let previous = previous.filter(|_| at_start).and_then(|line| {
+        let line = line.trim_end();
+        let start = line
+            .char_indices()
+            .rev()
+            .find_map(|(idx, c)| (!is_file_path_char(c)).then_some(idx + c.len_utf8()))
+            .unwrap_or(0);
+        (start < line.len()).then(|| &line[start..])
+    });
+    let next = next.filter(|_| at_end).and_then(|line| {
+        let line = line.trim_start();
+        let end = line
+            .char_indices()
+            .find_map(|(idx, c)| (!is_file_path_char(c)).then_some(idx))
+            .unwrap_or(line.len());
+        (end > 0).then(|| &line[..end])
+    });
+
+    let joined = if let Some(previous) = previous {
+        format!("{previous}{current}")
+    } else if let Some(next) = next {
+        format!("{current}{next}")
+    } else {
+        return None;
+    };
+    let relative = !joined.starts_with('/') && !joined.starts_with("~/");
+    let looks_like_path = joined.contains('/')
+        && (joined.starts_with('/')
+            || joined.starts_with("~/")
+            || joined
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name.contains('.')));
+    looks_like_path.then(|| {
+        if relative {
+            format!("file://./{joined}")
+        } else {
+            format!("file://{joined}")
+        }
+    })
+}
+
+fn wrapped_file_link_at_mouse(
+    pane: &Arc<dyn Pane>,
+    stable_row: StableRowIndex,
+    column: usize,
+) -> Option<Arc<Hyperlink>> {
+    let start = stable_row.saturating_sub(1);
+    let (first_row, lines) = pane.get_lines(start..stable_row.saturating_add(2));
+    let current_index: usize = stable_row.checked_sub(first_row)?.try_into().ok()?;
+    let current_line = lines.get(current_index)?;
+    let before = current_line.columns_as_str(0..column.min(current_line.len()));
+    let current = current_line.as_str();
+    let uri = file_path_at_wrapped_line(
+        current_index
+            .checked_sub(1)
+            .and_then(|index| lines.get(index))
+            .map(|line| line.as_str())
+            .as_deref(),
+        &current,
+        lines
+            .get(current_index + 1)
+            .map(|line| line.as_str())
+            .as_deref(),
+        before.chars().count(),
+    )?;
+    Some(Arc::new(Hyperlink::new_implicit(uri)))
+}
+
 impl super::TermWindow {
     fn input_stack_mouse_event(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
         let front_end = crate::frontend::front_end();
@@ -955,7 +1051,13 @@ impl super::TermWindow {
             column,
         };
         pane.with_lines_mut(stable_row..stable_row + 1, &mut find_link);
-        let new_highlight = find_link.current;
+        // Formatted output can insert a hard newline inside a file path. The normal
+        // scanner already handles soft terminal wrapping; recover only when it found
+        // no link, using one row on either side of the clicked row.
+        // @fdb:terminal-file-link-resolution
+        let new_highlight = find_link
+            .current
+            .or_else(|| wrapped_file_link_at_mouse(&pane, stable_row, column));
 
         match (self.current_highlight.as_ref(), new_highlight) {
             (Some(old_link), Some(new_link)) if Arc::ptr_eq(&old_link, &new_link) => {
@@ -1193,5 +1295,59 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
         MousePress::Left => TMB::Left,
         MousePress::Right => TMB::Right,
         MousePress::Middle => TMB::Middle,
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::file_path_at_wrapped_line;
+
+    // @fdb:terminal-file-link-resolution
+    #[test]
+    fn reconstructs_a_file_path_split_before_the_clicked_line() {
+        assert_eq!(
+            file_path_at_wrapped_line(
+                Some("See src/termwindow/"),
+                "    mouseevent.rs for details",
+                None,
+                6,
+            ),
+            Some("file://./src/termwindow/mouseevent.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn prefers_the_previous_path_over_unrelated_following_text() {
+        assert_eq!(
+            file_path_at_wrapped_line(
+                Some("See src/termwindow/"),
+                "mouseevent.rs",
+                Some("Next paragraph"),
+                2,
+            ),
+            Some("file://./src/termwindow/mouseevent.rs".to_string())
+        );
+    }
+
+    // @fdb:terminal-file-link-resolution
+    #[test]
+    fn reconstructs_a_file_path_split_after_the_clicked_line() {
+        assert_eq!(
+            file_path_at_wrapped_line(
+                None,
+                "See src/termwindow/",
+                Some("    mouseevent.rs for details"),
+                8,
+            ),
+            Some("file://./src/termwindow/mouseevent.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn does_not_join_ordinary_adjacent_words() {
+        assert_eq!(
+            file_path_at_wrapped_line(Some("ordinary text"), "continued", None, 2),
+            None
+        );
     }
 }

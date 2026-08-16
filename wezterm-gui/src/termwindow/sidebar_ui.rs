@@ -992,7 +992,11 @@ fn paint_shape(
     };
     match kind {
         ShapeKind::Ring => {
-            painter.circle_stroke(center, radius, stroke);
+            if fill {
+                painter.circle_filled(center, radius, color);
+            } else {
+                painter.circle_stroke(center, radius, stroke);
+            }
         }
         ShapeKind::Arc => {
             if let Some(track) = track {
@@ -1519,6 +1523,7 @@ return { type = 'row', width = 100, height = 40, padding = 10,
     fn decodes_vector_shapes() {
         let lua = mlua::Lua::new();
         for (name, expected) in [
+            ("ring", ShapeKind::Ring),
             ("diamond", ShapeKind::Diamond),
             ("hourglass", ShapeKind::Hourglass),
             ("gate", ShapeKind::Gate),
@@ -1531,6 +1536,20 @@ return { type = 'row', width = 100, height = 40, padding = 10,
                 .unwrap();
             assert_eq!(shape_kind(&table).unwrap(), Some(expected));
         }
+    }
+
+    #[test]
+    fn filled_ring_preserves_the_shape_geometry() {
+        let lua = mlua::Lua::new();
+        let table = lua
+            .load("return { shape = 'ring', fill = true, width = 12, height = 12 }")
+            .eval::<Table>()
+            .unwrap();
+        let node = decode(Value::Table(table), &lua).unwrap().unwrap();
+        assert_eq!(node.style.shape, Some(ShapeKind::Ring));
+        assert!(node.style.fill);
+        assert_eq!(node.style.width, Some(12.0));
+        assert_eq!(node.style.height, Some(12.0));
     }
 
     #[test]

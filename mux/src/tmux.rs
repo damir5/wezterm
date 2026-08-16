@@ -4,12 +4,14 @@ use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
     KillPane, ListAllPanes, ListAllWindows, ListCommands, NewWindow, Resize, SplitPane,
-    SubscribePaneCommand, SubscribePaneCwd, SwapWindow, TmuxCommand, PANE_COMMAND_SUBSCRIPTION,
-    PANE_CWD_SUBSCRIPTION, PANE_TITLE_SUBSCRIPTION,
+    SubscribePaneAgentHarness, SubscribePaneAgentVariant, SubscribePaneCommand, SubscribePaneCwd,
+    SwapWindow, TmuxCommand, PANE_AGENT_HARNESS_SUBSCRIPTION, PANE_AGENT_VARIANT_SUBSCRIPTION,
+    PANE_COMMAND_SUBSCRIPTION, PANE_CWD_SUBSCRIPTION, PANE_TITLE_SUBSCRIPTION,
 };
 use crate::window::WindowId;
 use crate::{Mux, MuxWindowBuilder};
 use async_trait::async_trait;
+use base64::Engine;
 use filedescriptor::FileDescriptor;
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{CommandBuilder, PtySize};
@@ -52,6 +54,8 @@ pub(crate) struct TmuxRemotePane {
     pub pane_left: u64,
     pub pane_top: u64,
     pub current_command: Option<String>,
+    pub agent_harness: String,
+    pub agent_variant: String,
     pub(crate) passthrough_pending: Vec<u8>,
 }
 
@@ -62,6 +66,41 @@ impl TmuxRemotePane {
         let data = unwrap_tmux_passthrough(&mut self.passthrough_pending, text);
         self.output_write.write_all(&data)
     }
+
+    pub fn update_agent_identity(&mut self, name: &str, value: &str) -> std::io::Result<()> {
+        match name {
+            "harness" => self.agent_harness = value.to_string(),
+            "variant" => self.agent_variant = value.to_string(),
+            _ => return Ok(()),
+        }
+        self.rehydrate_agent_identity()
+    }
+
+    pub fn rehydrate_agent_identity(&mut self) -> std::io::Result<()> {
+        self.output_write.write_all(
+            agent_identity_osc(
+                self.current_command.as_deref(),
+                &self.agent_harness,
+                &self.agent_variant,
+            )
+            .as_bytes(),
+        )
+    }
+}
+
+fn agent_identity_osc(command: Option<&str>, harness: &str, variant: &str) -> String {
+    let shell = matches!(command, Some("sh" | "bash" | "zsh" | "fish"));
+    let ready = command.is_some() && !shell;
+    [
+        ("AGENT_HARNESS", ready.then_some(harness).unwrap_or("")),
+        ("AGENT_VARIANT", ready.then_some(variant).unwrap_or("")),
+    ]
+    .iter()
+    .map(|&(name, value)| {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+        format!("\x1b]1337;SetUserVar={name}={encoded}\x07")
+    })
+    .collect()
 }
 
 pub(crate) type RefTmuxRemotePane = Arc<Mutex<TmuxRemotePane>>;
@@ -236,15 +275,34 @@ pub(crate) struct TmuxDomainState {
     pub attach_state: Mutex<AttachState>,
     pub pending_resizes: Mutex<HashMap<TmuxPaneId, (PtySize, u64)>>,
     pub pending_titles: Mutex<HashMap<TmuxPaneId, (TmuxWindowId, String)>>,
+    pub pending_agent_identity: Mutex<HashMap<TmuxPaneId, PendingAgentIdentity>>,
     next_resize_request_id: AtomicU64,
     pending_splits: Mutex<VecDeque<promise::Promise<TmuxPaneId>>>,
     pub backlog: Mutex<HashMap<TmuxPaneId, Vec<u8>>>,
+}
+
+#[derive(Default)]
+pub(crate) struct PendingAgentIdentity {
+    pub(crate) window_id: TmuxWindowId,
+    pub(crate) harness: Option<String>,
+    pub(crate) variant: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tmux_commands::SendKeys;
+
+    #[test]
+    fn shell_panes_clear_persisted_agent_identity() {
+        let running = agent_identity_osc(Some("node"), "codex", "");
+        assert!(running.contains("SetUserVar=AGENT_HARNESS=Y29kZXg="));
+        let shell = agent_identity_osc(Some("fish"), "codex", "glm");
+        assert_eq!(
+            shell,
+            "\x1b]1337;SetUserVar=AGENT_HARNESS=\x07\x1b]1337;SetUserVar=AGENT_VARIANT=\x07"
+        );
+    }
 
     #[derive(Debug)]
     struct TwoLineCommand;
@@ -623,6 +681,8 @@ impl TmuxDomainState {
                     cmd_queue.push_back(Box::new(ListCommands));
                     cmd_queue.push_back(Box::new(SubscribePaneCwd));
                     cmd_queue.push_back(Box::new(SubscribePaneCommand));
+                    cmd_queue.push_back(Box::new(SubscribePaneAgentHarness));
+                    cmd_queue.push_back(Box::new(SubscribePaneAgentVariant));
 
                     self.subscribe_notification();
                     log::info!("tmux session changed:{}", session);
@@ -686,6 +746,18 @@ impl TmuxDomainState {
                     } else if name == PANE_TITLE_SUBSCRIPTION {
                         if let (Some(window), Some(pane)) = (window, pane) {
                             self.update_pane_title(*session, *window, *pane, value);
+                        }
+                    } else if name == PANE_AGENT_HARNESS_SUBSCRIPTION {
+                        if let (Some(window), Some(pane)) = (window, pane) {
+                            self.update_pane_agent_identity(
+                                *session, *window, *pane, "harness", value,
+                            );
+                        }
+                    } else if name == PANE_AGENT_VARIANT_SUBSCRIPTION {
+                        if let (Some(window), Some(pane)) = (window, pane) {
+                            self.update_pane_agent_identity(
+                                *session, *window, *pane, "variant", value,
+                            );
                         }
                     }
                 }
@@ -879,6 +951,7 @@ impl TmuxDomain {
             attach_state: Mutex::new(AttachState::Init),
             pending_resizes: Mutex::new(HashMap::default()),
             pending_titles: Mutex::new(HashMap::default()),
+            pending_agent_identity: Mutex::new(HashMap::default()),
             next_resize_request_id: AtomicU64::new(0),
             pending_splits: Mutex::new(VecDeque::default()),
             backlog: Mutex::new(HashMap::default()),

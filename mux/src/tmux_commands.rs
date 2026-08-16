@@ -26,6 +26,8 @@ pub(crate) trait TmuxCommand: Send + Debug {
 pub(crate) const PANE_CWD_SUBSCRIPTION: &str = "wezterm-pane-cwd";
 pub(crate) const PANE_COMMAND_SUBSCRIPTION: &str = "wezterm-pane-command";
 pub(crate) const PANE_TITLE_SUBSCRIPTION: &str = "wezterm-pane-title";
+pub(crate) const PANE_AGENT_HARNESS_SUBSCRIPTION: &str = "wezterm-pane-agent-harness";
+pub(crate) const PANE_AGENT_VARIANT_SUBSCRIPTION: &str = "wezterm-pane-agent-variant";
 
 fn pane_command(command: &str) -> Option<String> {
     (!command.is_empty()).then(|| command.to_owned())
@@ -133,7 +135,43 @@ impl TmuxDomainState {
             let mut pane = pane.lock();
             if pane.window_id == window_id {
                 pane.current_command = pane_command(command);
+                if let Err(err) = pane.rehydrate_agent_identity() {
+                    log::error!("Failed to rehydrate tmux pane identity: {err:#}");
+                }
             }
+        }
+    }
+
+    pub fn update_pane_agent_identity(
+        &self,
+        session_id: TmuxSessionId,
+        window_id: TmuxWindowId,
+        pane_id: TmuxPaneId,
+        name: &str,
+        value: &str,
+    ) {
+        if *self.tmux_session.lock() != Some(session_id) {
+            return;
+        }
+        if let Some(pane) = self.remote_panes.lock().get(&pane_id) {
+            let mut pane = pane.lock();
+            if pane.window_id == window_id {
+                if let Err(err) = pane.update_agent_identity(name, value) {
+                    log::error!("Failed to update tmux pane identity: {err:#}");
+                }
+                return;
+            }
+        }
+        let mut pending = self.pending_agent_identity.lock();
+        let entry = pending.entry(pane_id).or_default();
+        if entry.window_id != window_id {
+            *entry = Default::default();
+            entry.window_id = window_id;
+        }
+        match name {
+            "harness" => entry.harness = Some(value.to_string()),
+            "variant" => entry.variant = Some(value.to_string()),
+            _ => {}
         }
     }
 
@@ -194,6 +232,22 @@ impl TmuxDomainState {
                 );
             if let Some(title) = title {
                 set_tmux_pane_title(pane, &title);
+            }
+            let identity = self.pending_agent_identity.lock().remove(&remote_pane_id);
+            if let Some(identity) = identity.filter(|identity| identity.window_id == window_id) {
+                if let Some(remote) = self.remote_panes.lock().get(&remote_pane_id) {
+                    let mut remote = remote.lock();
+                    if let Err(err) = remote
+                        .update_agent_identity("harness", identity.harness.as_deref().unwrap_or(""))
+                    {
+                        log::error!("Failed to restore tmux pane identity: {err:#}");
+                    }
+                    if let Err(err) = remote
+                        .update_agent_identity("variant", identity.variant.as_deref().unwrap_or(""))
+                    {
+                        log::error!("Failed to restore tmux pane identity: {err:#}");
+                    }
+                }
             }
         }
     }
@@ -331,6 +385,8 @@ impl TmuxDomainState {
             pane_left: pane.pane_left,
             pane_top: pane.pane_top,
             current_command: pane.current_command.clone(),
+            agent_harness: String::new(),
+            agent_variant: String::new(),
             passthrough_pending: Vec::new(),
         }));
 
@@ -1356,6 +1412,44 @@ impl TmuxCommand for SubscribePaneCommand {
 }
 
 #[derive(Debug)]
+pub(crate) struct SubscribePaneAgentHarness;
+
+impl TmuxCommand for SubscribePaneAgentHarness {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!(
+            "refresh-client -B '{}:%*:#{{@wezterm_agent_harness}}'\n",
+            PANE_AGENT_HARNESS_SUBSCRIPTION
+        )
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            anyhow::bail!("pane harness subscription in domain={domain_id} failed: {result:#?}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SubscribePaneAgentVariant;
+
+impl TmuxCommand for SubscribePaneAgentVariant {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        format!(
+            "refresh-client -B '{}:%*:#{{@wezterm_agent_variant}}'\n",
+            PANE_AGENT_VARIANT_SUBSCRIPTION
+        )
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            anyhow::bail!("pane variant subscription in domain={domain_id} failed: {result:#?}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct SubscribePaneTitle;
 
 impl TmuxCommand for SubscribePaneTitle {
@@ -1675,6 +1769,18 @@ mod test {
         assert_eq!(
             SubscribePaneTitle.get_command(0),
             "refresh-client -B 'wezterm-pane-title:%*:#{pane_title}'\n"
+        );
+    }
+
+    #[test]
+    fn pane_agent_identity_subscriptions_use_all_panes() {
+        assert_eq!(
+            SubscribePaneAgentHarness.get_command(0),
+            "refresh-client -B 'wezterm-pane-agent-harness:%*:#{@wezterm_agent_harness}'\n"
+        );
+        assert_eq!(
+            SubscribePaneAgentVariant.get_command(0),
+            "refresh-client -B 'wezterm-pane-agent-variant:%*:#{@wezterm_agent_variant}'\n"
         );
     }
 
