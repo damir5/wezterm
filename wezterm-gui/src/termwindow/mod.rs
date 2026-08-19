@@ -1368,6 +1368,11 @@ impl TermWindow {
                     self.emit_status_event();
                 }
                 MuxNotification::PaneOutput(pane_id) => {
+                    // Coalesced by emit_window_event, so a chatty pane cannot queue
+                    // unbounded Lua callbacks. Hidden tabs belong to this window too.
+                    if self.window_contains_pane(pane_id) {
+                        self.emit_window_event("pane-output", Some(pane_id));
+                    }
                     self.mux_pane_output_event(pane_id);
                 }
                 MuxNotification::WindowInvalidated(_) => {
