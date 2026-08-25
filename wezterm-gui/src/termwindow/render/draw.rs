@@ -906,6 +906,7 @@ fn composite_tab_sidebar(
             scroll_offset,
             animation_time.unwrap_or(0.0),
             mode,
+            rect,
         );
     }
 

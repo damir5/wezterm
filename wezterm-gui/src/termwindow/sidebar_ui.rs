@@ -138,7 +138,13 @@ pub struct UiStyle {
     pub wrap: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tooltip {
+    Text(String),
+    Ui(Box<UiNode>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiNode {
     pub id: String,
     pub kind: String,
@@ -148,6 +154,7 @@ pub struct UiNode {
     pub children: Vec<UiNode>,
     pub on_click: Option<DynamicValue>,
     pub on_hover: Option<DynamicValue>,
+    pub tooltip: Option<Tooltip>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -193,6 +200,17 @@ pub struct LayoutNode {
     pub clip_rect: Option<Rect>,
     pub on_click: Option<DynamicValue>,
     pub on_hover: Option<DynamicValue>,
+    pub tooltip: Option<Tooltip>,
+}
+
+impl LayoutNode {
+    pub fn is_interactive(&self) -> bool {
+        self.on_click.is_some() || self.on_hover.is_some() || self.tooltip.is_some()
+    }
+
+    pub fn is_clickable(&self) -> bool {
+        self.on_click.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -225,14 +243,14 @@ impl UiLayout {
         self.nodes
             .iter()
             .rev()
-            .find(|node| node.on_click.is_some() && Self::node_contains(node, x, y, scroll_offset))
+            .find(|node| node.is_clickable() && Self::node_contains(node, x, y, scroll_offset))
     }
 
     pub fn interactive_at(&self, x: f32, y: f32, scroll_offset: f32) -> Option<&LayoutNode> {
-        self.nodes.iter().rev().find(|node| {
-            (node.on_click.is_some() || node.on_hover.is_some())
-                && Self::node_contains(node, x, y, scroll_offset)
-        })
+        self.nodes
+            .iter()
+            .rev()
+            .find(|node| node.is_interactive() && Self::node_contains(node, x, y, scroll_offset))
     }
 }
 
@@ -536,6 +554,19 @@ fn decode_node(lua: &mlua::Lua, table: Table, path: &str) -> anyhow::Result<UiNo
     if style.animation.is_some() && !children.is_empty() {
         bail!("animated sidebar UI node {path} must not have children")
     }
+    let tooltip = match table.get::<_, Value>("tooltip")? {
+        Value::Nil => None,
+        Value::String(text) => {
+            let text = text.to_str()?.to_string();
+            (!text.is_empty()).then_some(Tooltip::Text(text))
+        }
+        Value::Table(node) => Some(Tooltip::Ui(Box::new(decode_node(
+            lua,
+            node,
+            &format!("{path}.tooltip"),
+        )?))),
+        _ => bail!("sidebar UI node {path} tooltip must be text or a UI node"),
+    };
     Ok(UiNode {
         id,
         kind: kind.clone(),
@@ -548,6 +579,7 @@ fn decode_node(lua: &mlua::Lua, table: Table, path: &str) -> anyhow::Result<UiNo
         children,
         on_click: event(&table, "on_click")?,
         on_hover: event(&table, "on_hover")?,
+        tooltip,
     })
 }
 
@@ -694,6 +726,56 @@ fn galley(
     ctx.fonts(|fonts| fonts.layout_job(job))
 }
 
+fn tooltip_galley(
+    ctx: &egui::Context,
+    text: &str,
+    max_width: f32,
+    max_rows: usize,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_string(),
+        egui::TextFormat {
+            font_id: egui::FontId::new(12.0, egui::FontFamily::Proportional),
+            color: egui::Color32::from_rgb(221, 224, 230),
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width,
+        max_rows,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ctx.fonts(|fonts| fonts.layout_job(job))
+}
+
+fn tooltip_rect(anchor: Rect, size: (f32, f32), viewport: Rect) -> Rect {
+    const MARGIN: f32 = 8.0;
+    const GAP: f32 = 6.0;
+
+    let (width, height) = size;
+    let left = viewport.x + MARGIN;
+    let right = (viewport.x + viewport.width - MARGIN - width).max(left);
+    let x = anchor.x.clamp(left, right);
+    let top = viewport.y + MARGIN;
+    let bottom = viewport.y + viewport.height - MARGIN;
+    let below = anchor.y + anchor.height + GAP;
+    let above = anchor.y - GAP - height;
+    let y = if below + height <= bottom {
+        below
+    } else if above >= top {
+        above
+    } else {
+        below.clamp(top, (bottom - height).max(top))
+    };
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
 fn measure(ctx: &egui::Context, node: &UiNode) -> Measure {
     let size = node.style.font_size.unwrap_or(13.0);
     let text = node.text.as_deref().filter(|text| !text.is_empty());
@@ -771,6 +853,7 @@ fn walk(
         clip_rect,
         on_click: node.on_click.clone(),
         on_hover: node.on_hover.clone(),
+        tooltip: node.tooltip.clone(),
     });
     let next_scrollable = scrollable || node.kind == "scroll";
     let next_clip_rect = if node.kind == "scroll" {
@@ -871,7 +954,10 @@ pub fn interpolate(from: Option<&UiLayout>, to: &UiLayout, progress: f32) -> UiL
     };
     for node in &mut layout.nodes {
         let Some(previous) = from.nodes.iter().find(|item| {
-            item.id == node.id && item.on_click == node.on_click && item.on_hover == node.on_hover
+            item.id == node.id
+                && item.on_click == node.on_click
+                && item.on_hover == node.on_hover
+                && item.tooltip == node.tooltip
         }) else {
             continue;
         };
@@ -924,7 +1010,7 @@ pub fn ui_items_for_layout(
     layout
         .nodes
         .iter()
-        .filter(|node| node.on_click.is_some() || node.on_hover.is_some())
+        .filter(|node| node.is_interactive())
         .filter_map(|node| {
             let mut node_rect = node.rect;
             if node.scrollable {
@@ -1129,6 +1215,115 @@ fn paint_shape(
     }
 }
 
+fn paint_tooltip(
+    painter: &egui::Painter,
+    ctx: &egui::Context,
+    sidebar_layout: &UiLayout,
+    hovered: Option<&str>,
+    images: &mut HashMap<String, egui::TextureHandle>,
+    scroll_offset: f32,
+    time: f64,
+    viewport: egui::Rect,
+) {
+    let Some(node) = hovered.and_then(|id| sidebar_layout.nodes.iter().find(|node| node.id == id))
+    else {
+        return;
+    };
+    let Some(tooltip) = node.tooltip.as_ref() else {
+        return;
+    };
+    let max_box_width = (viewport.width() - 16.0).min(320.0);
+    let max_box_height = viewport.height() - 16.0;
+    if max_box_width <= 16.0 || max_box_height <= 12.0 {
+        return;
+    }
+    const PADDING_X: f32 = 12.0;
+    const PADDING_Y: f32 = 10.0;
+    let (size, galley, content_layout) = match tooltip {
+        Tooltip::Text(text) => {
+            let max_rows = ((max_box_height - PADDING_Y * 2.0) / 16.0).floor().max(1.0) as usize;
+            let galley = tooltip_galley(ctx, text, max_box_width - PADDING_X * 2.0, max_rows);
+            let size = egui::vec2(
+                (galley.size().x + PADDING_X * 2.0).min(max_box_width),
+                (galley.size().y + PADDING_Y * 2.0).min(max_box_height),
+            );
+            (size, Some(galley), None)
+        }
+        Tooltip::Ui(content) => {
+            let width = content
+                .style
+                .width
+                .unwrap_or(max_box_width - PADDING_X * 2.0)
+                .min(max_box_width - PADDING_X * 2.0);
+            let height = content
+                .style
+                .height
+                .unwrap_or(80.0)
+                .min(max_box_height - PADDING_Y * 2.0);
+            let Ok(content_layout) = layout(ctx, content, width, height) else {
+                return;
+            };
+            (
+                egui::vec2(width + PADDING_X * 2.0, height + PADDING_Y * 2.0),
+                None,
+                Some(content_layout),
+            )
+        }
+    };
+    let mut anchor = node.rect;
+    if node.scrollable {
+        anchor.y -= scroll_offset;
+    }
+    let placed = tooltip_rect(
+        anchor,
+        (size.x, size.y),
+        Rect {
+            x: viewport.left(),
+            y: viewport.top(),
+            width: viewport.width(),
+            height: viewport.height(),
+        },
+    );
+    let rect = egui::Rect::from_min_size(egui::pos2(placed.x, placed.y), size);
+    let painter = painter.with_clip_rect(viewport);
+    painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(42, 46, 55));
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(65, 70, 82)),
+        egui::StrokeKind::Inside,
+    );
+    if let Some(galley) = galley {
+        painter.with_clip_rect(rect.intersect(viewport)).galley(
+            rect.left_top() + egui::vec2(PADDING_X, PADDING_Y),
+            galley,
+            egui::Color32::from_rgb(221, 224, 230),
+        );
+    }
+    if let Some(mut content_layout) = content_layout {
+        let offset = rect.left_top() + egui::vec2(PADDING_X, PADDING_Y);
+        for node in &mut content_layout.nodes {
+            node.rect.x += offset.x;
+            node.rect.y += offset.y;
+            if let Some(clip) = &mut node.clip_rect {
+                clip.x += offset.x;
+                clip.y += offset.y;
+            }
+        }
+        paint(
+            &painter.with_clip_rect(rect.intersect(viewport)),
+            ctx,
+            &content_layout,
+            None,
+            images,
+            0.0,
+            time,
+            PaintMode::All,
+            rect,
+        );
+    }
+}
+
 pub fn paint(
     painter: &egui::Painter,
     ctx: &egui::Context,
@@ -1138,6 +1333,7 @@ pub fn paint(
     scroll_offset: f32,
     time: f64,
     mode: PaintMode,
+    viewport: egui::Rect,
 ) {
     for node in &layout.nodes {
         let animated = node.style.animation.is_some();
@@ -1387,6 +1583,18 @@ pub fn paint(
             );
         }
     }
+    if !matches!(mode, PaintMode::Animated) {
+        paint_tooltip(
+            painter,
+            ctx,
+            layout,
+            hovered,
+            images,
+            scroll_offset,
+            time,
+            viewport,
+        );
+    }
 }
 
 fn color32(color: [u8; 4]) -> egui::Color32 {
@@ -1553,6 +1761,54 @@ return { type = 'row', width = 100, height = 40, padding = 10,
     }
 
     #[test]
+    fn decodes_multiline_tooltip_text() {
+        let lua = mlua::Lua::new();
+        let node = lua
+            .load("return { type = 'text', text = '2 forwards', tooltip = '8080 -> 3000\\n5173 <- 5173' }")
+            .eval::<Value>()
+            .unwrap();
+        let node = decode(node, &lua).unwrap().unwrap();
+        assert_eq!(
+            node.tooltip,
+            Some(Tooltip::Text("8080 -> 3000\n5173 <- 5173".into()))
+        );
+    }
+
+    #[test]
+    fn decodes_structured_tooltip_content() {
+        let lua = mlua::Lua::new();
+        let value = lua
+            .load(
+                r#"return {
+  type = 'text', text = 'JACK 2',
+  tooltip = {
+    type = 'column', width = 280, height = 64,
+    children = {
+      { type = 'text', text = 'LOCAL FORWARDS', color = '#e5c07b' },
+      { type = 'text', text = '8080 -> 3000' },
+    },
+  },
+}"#,
+            )
+            .eval::<Value>()
+            .unwrap();
+        assert!(decode(value, &lua).is_ok());
+    }
+
+    #[test]
+    fn tooltip_text_wraps_long_unbroken_values() {
+        let ctx = test_context();
+        let galley = tooltip_galley(
+            &ctx,
+            "127.0.0.1:8080->remote.internal.example:3000",
+            80.0,
+            8,
+        );
+        assert!(galley.size().x <= 80.0);
+        assert!(galley.rows.len() > 1);
+    }
+
+    #[test]
     fn hit_test_prefers_deepest_node() {
         let root = UiNode {
             id: "root".into(),
@@ -1577,9 +1833,11 @@ return { type = 'row', width = 100, height = 40, padding = 10,
                 children: vec![],
                 on_click: None,
                 on_hover: None,
+                tooltip: None,
             }],
             on_click: None,
             on_hover: None,
+            tooltip: None,
         };
         let layout = layout(&test_context(), &root, 20.0, 20.0).unwrap();
         assert_eq!(layout.hit_test_scrolled(1.0, 1.0, 0.0).unwrap().id, "child");
@@ -1616,12 +1874,15 @@ return { type = 'row', width = 100, height = 40, padding = 10,
                     children: vec![],
                     on_click: None,
                     on_hover: None,
+                    tooltip: None,
                 }],
                 on_click: Some(DynamicValue::Null),
                 on_hover: None,
+                tooltip: None,
             }],
             on_click: None,
             on_hover: None,
+            tooltip: None,
         };
         let layout = layout(&test_context(), &root, 20.0, 20.0).unwrap();
         assert_eq!(layout.clickable_at(1.0, 1.0, 0.0).unwrap().id, "action");
@@ -1646,11 +1907,49 @@ return { type = 'row', width = 100, height = 40, padding = 10,
                 clip_rect: None,
                 on_click: None,
                 on_hover: Some(DynamicValue::Null),
+                tooltip: None,
             }],
             scroll_max: 0.0,
         };
         assert!(layout.clickable_at(1.0, 1.0, 0.0).is_none());
         assert_eq!(layout.interactive_at(1.0, 1.0, 0.0).unwrap().id, "hover");
+    }
+
+    #[test]
+    fn interactive_hit_test_includes_tooltip_only_nodes() {
+        let lua = mlua::Lua::new();
+        let root = lua
+            .load("return { id = 'forward-status', width = 20, height = 20, tooltip = '8080 -> 3000' }")
+            .eval::<Value>()
+            .unwrap();
+        let root = decode(root, &lua).unwrap().unwrap();
+        let layout = layout(&test_context(), &root, 20.0, 20.0).unwrap();
+        assert!(layout.clickable_at(1.0, 1.0, 0.0).is_none());
+        assert_eq!(
+            layout.interactive_at(1.0, 1.0, 0.0).unwrap().id,
+            "forward-status"
+        );
+    }
+
+    #[test]
+    fn tooltip_placement_stays_inside_sidebar_and_flips_above_anchor() {
+        let viewport = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 300.0,
+            height: 200.0,
+        };
+        let anchor = Rect {
+            x: 250.0,
+            y: 170.0,
+            width: 40.0,
+            height: 20.0,
+        };
+        let placed = tooltip_rect(anchor, (180.0, 80.0), viewport);
+        assert!(placed.x >= 8.0);
+        assert!(placed.x + placed.width <= 292.0);
+        assert!(placed.y >= 8.0);
+        assert!(placed.y + placed.height < anchor.y);
     }
 
     #[test]
@@ -1671,6 +1970,7 @@ return { type = 'row', width = 100, height = 40, padding = 10,
             clip_rect: None,
             on_click: Some(DynamicValue::String(action.into())),
             on_hover: None,
+            tooltip: None,
         };
         let from = UiLayout {
             nodes: vec![node(0.0, "toggle-group")],

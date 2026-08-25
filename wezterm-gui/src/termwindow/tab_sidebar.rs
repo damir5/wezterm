@@ -370,7 +370,7 @@ impl TermWindow {
                     self.tab_sidebar.ui_scroll_offset,
                 )
             })
-            .filter(|node| node.on_click.is_some() || node.on_hover.is_some())
+            .filter(|node| node.is_interactive())
             .map(|node| SidebarHover::Node(node.id.clone()));
         if layout_hover.is_some() {
             self.tab_sidebar.hovered = layout_hover;
@@ -552,9 +552,18 @@ impl TermWindow {
             _ => {}
         }
 
+        let hovered_clickable = match self.tab_sidebar.hovered.as_ref() {
+            Some(SidebarHover::Node(id)) => self
+                .tab_sidebar
+                .ui_layout
+                .as_ref()
+                .and_then(|layout| layout.nodes.iter().find(|node| node.id == *id))
+                .is_some_and(|node| node.is_clickable()),
+            _ => false,
+        };
         let cursor = if self.tab_sidebar.resize.is_some() || on_edge {
             MouseCursor::SizeLeftRight
-        } else if matches!(self.tab_sidebar.hovered, Some(_)) {
+        } else if hovered_clickable {
             MouseCursor::Hand
         } else {
             MouseCursor::Arrow

@@ -978,7 +978,11 @@ mod test {
             .load(
                 r#"
 local ui = require 'wezterm.ui'
-return ui.column({ padding = 4, ui.text('hello'), ui.row({ ui.icon('dot') }) })
+return ui.column({
+  padding = 4,
+  ui.text('hello', { tooltip = 'details' }),
+  ui.row({ ui.icon('dot') }),
+})
 "#,
             )
             .eval()?;
@@ -987,7 +991,12 @@ return ui.column({ padding = 4, ui.text('hello'), ui.row({ ui.icon('dot') }) })
         };
         assert_eq!(shape.get::<_, String>("type")?, "column");
         assert_eq!(shape.get::<_, i64>("padding")?, 4);
-        assert_eq!(shape.get::<_, Table>("children")?.raw_len(), 2);
+        let children = shape.get::<_, Table>("children")?;
+        assert_eq!(children.raw_len(), 2);
+        assert_eq!(
+            children.get::<_, Table>(1)?.get::<_, String>("tooltip")?,
+            "details"
+        );
         Ok(())
     }
 
