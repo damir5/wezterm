@@ -236,7 +236,7 @@ impl super::TermWindow {
         let index = {
             let mux = Mux::get();
             mux.get_window(self.mux_window_id)
-                .and_then(|window| window.idx_by_id(tab_id))
+                .and_then(|window| window.get_tab_idx_for_id(tab_id))
         };
 
         if let Some(index) = index {

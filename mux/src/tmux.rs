@@ -910,7 +910,7 @@ impl TmuxDomain {
             return false;
         };
         let ordered = window
-            .iter()
+            .iter_tabs()
             .filter_map(|tab| remote_by_local.get(&tab.tab_id()).copied())
             .collect::<Vec<_>>();
         drop(window);

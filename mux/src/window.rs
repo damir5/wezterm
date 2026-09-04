@@ -121,7 +121,7 @@ impl Window {
             .min(self.tabs.len());
         self.tabs.insert(insertion_index, tab);
         if let Some(active) = active.and_then(|tab_id| self.get_tab_idx_for_id(tab_id)) {
-            self.active = active;
+            self.active_tab_idx = active;
         }
         self.invalidate();
         true

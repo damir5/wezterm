@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use wezterm_dynamic::Value as DynamicValue;
 use window::WindowOps;
-use window::{MouseCursor, MouseEvent, MouseEventKind, MousePress};
+use window::{CursorIcon, MouseEvent, MouseEventKind, MousePress};
 
 pub const COMPACT_WIDTH_CELLS: usize = 6;
 pub const ROW_HEIGHT_PX: usize = 40;
@@ -199,7 +199,7 @@ impl TermWindow {
     pub fn sidebar_relative_tab_id(&self, delta: isize, wrap: bool) -> Option<TabId> {
         let active_tab_id = Mux::get()
             .get_window(self.mux_window_id)
-            .and_then(|window| window.get_active().map(|tab| tab.tab_id()))?;
+            .and_then(|window| window.get_active_tab().map(|tab| tab.tab_id()))?;
         self.tab_sidebar
             .relative_tab_id(active_tab_id, delta, wrap)
     }
@@ -562,11 +562,11 @@ impl TermWindow {
             _ => false,
         };
         let cursor = if self.tab_sidebar.resize.is_some() || on_edge {
-            MouseCursor::SizeLeftRight
+            CursorIcon::EwResize
         } else if hovered_clickable {
-            MouseCursor::Hand
+            CursorIcon::Pointer
         } else {
-            MouseCursor::Arrow
+            CursorIcon::Default
         };
         context.set_cursor(Some(cursor));
         if invalidate {

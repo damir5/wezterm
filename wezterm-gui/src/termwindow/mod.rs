@@ -656,7 +656,7 @@ impl TermWindow {
                 }
             };
         } else if let Some(window) = mux.get_window(mux_window_id) {
-            for tab in window.iter() {
+            for tab in window.iter_tabs() {
                 // Mirrored tmux tabs created while no window was attached keep
                 // the detached session's size (tmux -CC attach does not size
                 // the session to the control client) and dpi 0. The
