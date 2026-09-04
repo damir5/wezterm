@@ -7,6 +7,13 @@ use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty};
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+// tmux 3.7c overflows its parser at 9,995 send-keys byte arguments.
+const TMUX_SEND_KEYS_CHUNK_SIZE: usize = 8 * 1024;
+
+fn send_keys_chunks(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
+    buf.chunks(TMUX_SEND_KEYS_CHUNK_SIZE)
+}
+
 /// A local tmux pane(tab) based on a tmux pty
 #[derive(Debug)]
 pub(crate) struct TmuxPty {
@@ -30,10 +37,12 @@ impl Write for TmuxPtyWriter {
         };
         log::trace!("pane:{}, content:{:?}", &pane_id, buf);
         let mut cmd_queue = self.cmd_queue.lock();
-        cmd_queue.push_back(Box::new(SendKeys {
-            pane: pane_id,
-            keys: buf.to_vec(),
-        }));
+        for keys in send_keys_chunks(buf) {
+            cmd_queue.push_back(Box::new(SendKeys {
+                pane: pane_id,
+                keys: keys.to_vec(),
+            }));
+        }
         drop(cmd_queue);
         TmuxDomainState::schedule_send_next_command(self.domain_id);
         Ok(buf.len())
@@ -52,10 +61,12 @@ impl Write for TmuxPty {
         };
         log::trace!("pane:{}, content:{:?}", &pane_id, buf);
         let mut cmd_queue = self.cmd_queue.lock();
-        cmd_queue.push_back(Box::new(SendKeys {
-            pane: pane_id,
-            keys: buf.to_vec(),
-        }));
+        for keys in send_keys_chunks(buf) {
+            cmd_queue.push_back(Box::new(SendKeys {
+                pane: pane_id,
+                keys: keys.to_vec(),
+            }));
+        }
         drop(cmd_queue);
         TmuxDomainState::schedule_send_next_command(self.domain_id);
         Ok(buf.len())
@@ -165,5 +176,42 @@ impl MasterPty for TmuxPty {
     #[cfg(unix)]
     fn tty_name(&self) -> Option<std::path::PathBuf> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_paste_is_split_into_safe_send_keys_commands() {
+        const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+        const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+        let mut paste = Vec::with_capacity(64 * 1024 + 13);
+        paste.extend_from_slice(BRACKETED_PASTE_START);
+        paste.resize(paste.len() + 64 * 1024 + 1, b'x');
+        paste.extend_from_slice(BRACKETED_PASTE_END);
+
+        let chunks: Vec<_> = send_keys_chunks(&paste).collect();
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.len() < 9_995));
+
+        let reconstructed = chunks.concat();
+        assert_eq!(reconstructed, paste);
+        assert_eq!(
+            reconstructed
+                .windows(BRACKETED_PASTE_START.len())
+                .filter(|window| *window == BRACKETED_PASTE_START)
+                .count(),
+            1
+        );
+        assert_eq!(
+            reconstructed
+                .windows(BRACKETED_PASTE_END.len())
+                .filter(|window| *window == BRACKETED_PASTE_END)
+                .count(),
+            1
+        );
     }
 }
