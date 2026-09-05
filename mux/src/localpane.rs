@@ -457,10 +457,27 @@ impl Pane for LocalPane {
     fn send_paste(&self, text: &str) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
         if self.tmux_domain.lock().is_some() {
-            Ok(())
-        } else {
-            self.terminal.lock().send_paste(text)
+            anyhow::bail!(
+                "Cannot paste into the tmux connection pane; select a remote terminal pane"
+            )
         }
+        if let Some(domain) = Mux::get().get_domain(self.domain_id) {
+            if let Some(domain) = domain.downcast_ref::<TmuxDomain>() {
+                domain.inner.send_paste(self.pane_id, text)?;
+                return Ok(());
+            }
+        }
+        self.terminal.lock().send_paste(text)
+    }
+
+    async fn send_paste_async(&self, text: &str) -> Result<(), Error> {
+        if let Some(domain) = Mux::get().get_domain(self.domain_id) {
+            if let Some(domain) = domain.downcast_ref::<TmuxDomain>() {
+                Mux::get().record_input_for_current_identity();
+                return domain.inner.send_paste(self.pane_id, text)?.await;
+            }
+        }
+        self.send_paste(text)
     }
 
     fn get_title(&self) -> String {
@@ -947,6 +964,9 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
             }
             DeviceControlMode::Exit => {
                 if let Some(tmux) = self.tmux_domain.take() {
+                    tmux.advance(Box::new(vec![termwiz::tmux_cc::Event::Exit {
+                        reason: None,
+                    }]));
                     let mux = Mux::get();
                     if let Some(pane) = mux.get_pane(self.pane_id) {
                         let pane = pane.downcast_ref::<LocalPane>().unwrap();

@@ -643,18 +643,20 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
-                    catch(
-                        move || {
+                    promise::spawn::spawn(async move {
+                        let result = async move {
                             let mux = Mux::get();
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.send_paste(&data)?;
+                            pane.send_paste_async(&data).await?;
                             maybe_push_pane_changes(&pane, sender, per_pane)?;
                             Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    )
+                        }
+                        .await;
+                        send_response(result);
+                    })
+                    .detach();
                 })
                 .detach();
             }

@@ -27,6 +27,58 @@ pub struct GuiFrontEnd {
     config_subscription: RefCell<Option<ConfigSubscription>>,
     input_stacks: RefCell<HashMap<PaneId, PaneInputStack>>,
     input_stack_windows: RefCell<HashMap<MuxWindowId, InputStackWindowUi>>,
+    paste_feedback: RefCell<HashMap<PaneId, PasteFeedback>>,
+}
+
+struct PasteFeedback {
+    message: String,
+    expires: Option<std::time::Instant>,
+}
+
+impl PasteFeedback {
+    fn paint(&self, ctx: &egui::Context, pane: &InputStackPaneRect) {
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new(("clipboard-paste", pane.pane_id)),
+        ));
+        let color = egui::Color32::from_rgb(230, 230, 230);
+        let galley = painter.layout(
+            self.message.clone(),
+            egui::TextStyle::Body.resolve(&ctx.style()),
+            color,
+            (pane.rect.width() - 32.0).max(32.0),
+        );
+        let position = pane.rect.left_top() + egui::vec2(8.0, 8.0);
+        painter.rect_filled(
+            egui::Rect::from_min_size(position, galley.size() + egui::vec2(16.0, 16.0)),
+            0.0,
+            egui::Color32::from_rgb(31, 34, 40),
+        );
+        painter.galley(position + egui::vec2(8.0, 8.0), galley, color);
+    }
+
+    fn pending(message: String) -> Self {
+        Self {
+            message,
+            expires: None,
+        }
+    }
+
+    fn finish(&mut self, result: anyhow::Result<()>) -> std::time::Duration {
+        let seconds = match result {
+            Ok(()) => {
+                self.message = "Paste queued".to_string();
+                4
+            }
+            Err(err) => {
+                self.message = format!("Paste failed: {err:#}");
+                30
+            }
+        };
+        let duration = std::time::Duration::from_secs(seconds);
+        self.expires = Some(std::time::Instant::now() + duration);
+        duration
+    }
 }
 
 #[derive(Default)]
@@ -87,6 +139,57 @@ impl Drop for GuiFrontEnd {
 }
 
 impl GuiFrontEnd {
+    pub(crate) fn begin_clipboard_paste(&self, pane_id: PaneId) -> bool {
+        let mut feedback = self.paste_feedback.borrow_mut();
+        if feedback
+            .get(&pane_id)
+            .is_some_and(|status| status.expires.is_none())
+        {
+            return false;
+        }
+        feedback.insert(
+            pane_id,
+            PasteFeedback::pending("Reading clipboard…".to_string()),
+        );
+        true
+    }
+
+    pub(crate) fn clipboard_paste_sending(&self, pane_id: PaneId, bytes: usize) {
+        if let Some(status) = self.paste_feedback.borrow_mut().get_mut(&pane_id) {
+            status.message = format!("Sending {bytes} bytes…");
+        }
+    }
+
+    pub(crate) fn finish_clipboard_paste(
+        &self,
+        pane_id: PaneId,
+        result: anyhow::Result<()>,
+    ) -> std::time::Duration {
+        self.paste_feedback
+            .borrow_mut()
+            .get_mut(&pane_id)
+            .map(|status| status.finish(result))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn has_paste_feedback(&self, panes: &[InputStackPaneRect]) -> bool {
+        let feedback = self.paste_feedback.borrow();
+        panes
+            .iter()
+            .any(|pane| feedback.contains_key(&pane.pane_id))
+    }
+
+    pub(crate) fn paint_paste_feedback(&self, ctx: &egui::Context, panes: &[InputStackPaneRect]) {
+        let mut feedback = self.paste_feedback.borrow_mut();
+        let now = std::time::Instant::now();
+        feedback.retain(|_, status| status.expires.map_or(true, |expires| expires > now));
+        for pane in panes {
+            if let Some(status) = feedback.get(&pane.pane_id) {
+                status.paint(ctx, pane);
+            }
+        }
+    }
+
     pub(crate) fn open_input_stack_editor(&self, window_id: MuxWindowId, pane_id: PaneId) {
         let mut windows = self.input_stack_windows.borrow_mut();
         let ui = windows.entry(window_id).or_default();
@@ -575,6 +678,7 @@ impl GuiFrontEnd {
             config_subscription: RefCell::new(None),
             input_stacks: RefCell::new(HashMap::new()),
             input_stack_windows: RefCell::new(HashMap::new()),
+            paste_feedback: RefCell::new(HashMap::new()),
         });
 
         mux.subscribe(move |n| {
@@ -622,6 +726,7 @@ impl GuiFrontEnd {
                     promise::spawn::spawn_into_main_thread(async move {
                         let front_end = crate::frontend::front_end();
                         front_end.input_stacks.borrow_mut().remove(&pane_id);
+                        front_end.paste_feedback.borrow_mut().remove(&pane_id);
                         for ui in front_end.input_stack_windows.borrow_mut().values_mut() {
                             ui.expanded.remove(&pane_id);
                             ui.errors.remove(&pane_id);
@@ -1066,7 +1171,39 @@ impl Drop for WorkspaceSwitcher {
 
 #[cfg(test)]
 mod input_stack_tests {
-    use super::{normalize_input_stack_item, serialize_input_stack};
+    use super::{normalize_input_stack_item, serialize_input_stack, PasteFeedback};
+
+    #[test]
+    fn paste_feedback_keeps_errors_visible_longer_than_acceptance() {
+        let mut status = PasteFeedback::pending("Reading clipboard…".to_string());
+        assert!(status.expires.is_none());
+        assert_eq!(status.finish(Ok(())).as_secs(), 4);
+        assert_eq!(status.message, "Paste queued");
+        assert!(status.expires.is_some());
+        assert_eq!(
+            status
+                .finish(Err(anyhow::anyhow!("remote disconnected")))
+                .as_secs(),
+            30
+        );
+        assert_eq!(status.message, "Paste failed: remote disconnected");
+
+        let ctx = egui::Context::default();
+        let pane = super::InputStackPaneRect {
+            pane_id: 123,
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
+        };
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(pane.rect),
+            ..Default::default()
+        });
+        status.paint(&ctx, &pane);
+        let output = ctx.end_pass();
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.job.text == status.message)
+        }), "Paste failure must render on the first frame of an idle terminal");
+    }
 
     #[test]
     fn input_stack_normalizes_newline_runs_without_trimming_spaces() {

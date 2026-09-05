@@ -428,6 +428,7 @@ impl crate::TermWindow {
         let front_end = crate::frontend::front_end();
         if front_end.input_stack_ui_is_active(self.mux_window_id)
             || front_end.has_input_stack_for_panes(&pane_rects)
+            || front_end.has_paste_feedback(&pane_rects)
         {
             let config = webgpu.config.borrow();
             let linear_format = config.format.remove_srgb_suffix();
@@ -786,6 +787,7 @@ fn composite_input_stack(
         ..Default::default()
     });
     front_end.paint_input_stack(&ctx, mux_window_id, panes, os_window);
+    front_end.paint_paste_feedback(&ctx, panes);
     let full_output = ctx.end_pass();
     for command in &full_output.platform_output.commands {
         if let egui::OutputCommand::CopyText(text) = command {

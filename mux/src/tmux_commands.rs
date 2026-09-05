@@ -23,6 +23,108 @@ pub(crate) trait TmuxCommand: Send + Debug {
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()>;
 }
 
+struct PasteCompletion {
+    remaining: usize,
+    error: Option<anyhow::Error>,
+    promise: promise::Promise<()>,
+}
+
+impl Drop for PasteCompletion {
+    fn drop(&mut self) {
+        if self.remaining != 0 {
+            self.promise
+                .err(anyhow!("tmux disconnected before paste completed"));
+        }
+    }
+}
+
+struct PasteCommand {
+    command: String,
+    completion: Arc<Mutex<PasteCompletion>>,
+}
+
+impl Debug for PasteCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PasteCommand")
+    }
+}
+
+impl TmuxCommand for PasteCommand {
+    fn get_command(&self, _: DomainId) -> String {
+        self.command.clone()
+    }
+
+    fn process_result(&self, _: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        let mut completion = self.completion.lock();
+        if result.error && completion.error.is_none() {
+            completion.error = Some(anyhow!("tmux paste failed: {}", result.output.trim()));
+        }
+        completion.remaining -= 1;
+        if completion.remaining == 0 {
+            let result = completion.error.take().map_or(Ok(()), Err);
+            completion.promise.result(result);
+        }
+        Ok(())
+    }
+}
+
+impl TmuxDomainState {
+    pub(crate) fn send_paste(
+        &self,
+        pane_id: PaneId,
+        text: &str,
+    ) -> anyhow::Result<promise::Future<()>> {
+        anyhow::ensure!(
+            !text.contains('\0'),
+            "tmux clipboard paste cannot contain NUL bytes"
+        );
+        let remote_id = self
+            .remote_panes
+            .lock()
+            .values()
+            .find_map(|pane| {
+                let pane = pane.lock();
+                (pane.local_pane_id == pane_id).then_some(pane.pane_id)
+            })
+            .ok_or_else(|| anyhow!("Remote pane no longer exists"))?;
+        static NEXT_PASTE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let buffer = format!(
+            "wezterm-{}-{}-{}",
+            std::process::id(),
+            self.domain_id,
+            NEXT_PASTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let text = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+        let mut encoded = String::new();
+        for byte in text.bytes() {
+            write!(&mut encoded, "\\{:03o}", byte)?;
+        }
+        let mut promise = promise::Promise::new();
+        let future = promise.get_future().unwrap();
+        let completion = Arc::new(Mutex::new(PasteCompletion {
+            remaining: 3,
+            error: None,
+            promise,
+        }));
+        let mut queue = self.cmd_queue.lock();
+        // tmux retains bracketed-paste mode across attach, even on versions that cannot report it.
+        // Always delete the private buffer, including when the destination disappears.
+        for command in [
+            format!("set-buffer -b {buffer} \"{encoded}\"\n"),
+            format!("paste-buffer -p -r -b {buffer} -t %{remote_id}\n"),
+            format!("delete-buffer -b {buffer}\n"),
+        ] {
+            queue.push_back(Box::new(PasteCommand {
+                command,
+                completion: completion.clone(),
+            }));
+        }
+        drop(queue);
+        Self::schedule_send_next_command(self.domain_id);
+        Ok(future)
+    }
+}
+
 pub(crate) const PANE_CWD_SUBSCRIPTION: &str = "wezterm-pane-cwd";
 pub(crate) const PANE_COMMAND_SUBSCRIPTION: &str = "wezterm-pane-command";
 pub(crate) const PANE_TITLE_SUBSCRIPTION: &str = "wezterm-pane-title";
@@ -325,13 +427,27 @@ impl TmuxDomainState {
 
         let mux = Mux::get();
         for p in to_remove {
-            let pane_map = self.remote_panes.lock();
-            let Some(pane) = pane_map.get(&p) else {
+            panes.remove(&p);
+            let pane = {
+                let mut pane_map = self.remote_panes.lock();
+                if pane_map.get(&p).map(|pane| pane.lock().window_id) != Some(window_id) {
+                    continue;
+                }
+                pane_map.remove(&p)
+            };
+            self.pending_resizes.lock().remove(&p);
+            let Some(pane) = pane else {
                 continue;
             };
-            let local_pane_id = pane.lock().local_pane_id;
+            let local_pane_id = {
+                let pane = pane.lock();
+                let (lock, condvar) = &*pane.active_lock;
+                *lock.lock() = true;
+                condvar.notify_all();
+                pane.local_pane_id
+            };
+            // @fdb:remote-tmux-close-lifecycle
             mux.remove_pane(local_pane_id);
-            panes.remove(&p);
         }
 
         if panes.is_empty() {
@@ -343,19 +459,7 @@ impl TmuxDomainState {
     }
 
     pub fn remove_detached_window(&self, window_id: TmuxWindowId) -> anyhow::Result<()> {
-        let mut gui_tabs = self.gui_tabs.lock();
-        let tab = match gui_tabs.get(&window_id) {
-            Some(x) => x,
-            None => {
-                anyhow::bail!("Cannot find the window {window_id}")
-            }
-        };
-
-        let mux = Mux::get();
-        mux.remove_tab(tab.tab_id);
-        gui_tabs.remove(&window_id);
-
-        Ok(())
+        self.remove_detached_pane(window_id, &HashSet::new())
     }
 
     fn set_pane_cursor_position(&self, pane: &Arc<dyn Pane>, x: usize, y: usize) {
@@ -390,9 +494,15 @@ impl TmuxDomainState {
             passthrough_pending: Vec::new(),
         }));
 
-        {
-            let mut pane_map = self.remote_panes.lock();
-            pane_map.insert(pane.pane_id, ref_pane.clone());
+        let previous = self
+            .remote_panes
+            .lock()
+            .insert(pane.pane_id, ref_pane.clone());
+        if let Some(previous) = previous {
+            let previous = previous.lock();
+            let (lock, condvar) = &*previous.active_lock;
+            *lock.lock() = true;
+            condvar.notify_all();
         }
 
         let pane_pty = TmuxPty {
@@ -729,6 +839,15 @@ impl TmuxDomainState {
                 }
             }
 
+            // Control-mode attach does not resize existing tmux windows. Size the
+            // completed layout before publishing it, so later GUI sizing wins.
+            if let Some(size) = mux
+                .resolve_pane_id(self.pane_id)
+                .and_then(|(_, _, tab_id)| mux.get_tab(tab_id))
+                .map(|tab| tab.get_size())
+            {
+                tab.resize(size);
+            }
             mux.add_tab_to_window(&tab, **gui_window_id)?;
             gui_window_id.notify();
 
@@ -799,6 +918,11 @@ impl TmuxDomainState {
                     Some(t) => t,
                     None => return,
                 };
+
+                if matches!(n, MuxNotification::PaneRemoved(pane_id) if pane_id == tmux_domain.inner.pane_id) {
+                    tmux_domain.inner.advance(Box::new(vec![Event::Exit { reason: None }]));
+                    return;
+                }
 
                 if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
                     return;
@@ -1036,12 +1160,10 @@ impl TmuxCommand for ListAllWindows {
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
             "list-windows -F \
-                '#{{session_id}} #{{window_id}} \
-                #{{window_width}} #{{window_height}} \
-                #{{window_active}} \
-                #{{window_name}} \
-                #{{window_layout}} \
-                #{{history_limit}}' -t ${}\n",
+                '#{{session_id}}\t#{{window_id}}\t\
+                #{{window_width}}\t#{{window_height}}\t\
+                #{{window_active}}\t#{{window_layout}}\t\
+                #{{history_limit}}\t#{{window_name}}' -t ${}\n",
             self.session_id
         )
     }
@@ -1058,7 +1180,7 @@ impl TmuxCommand for ListAllWindows {
             if line.is_empty() {
                 continue;
             }
-            let mut fields = line.split(' ');
+            let mut fields = line.splitn(8, '\t');
             let session_id =
                 parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
             let window_id =
@@ -1076,10 +1198,6 @@ impl TmuxCommand for ListAllWindows {
                 .ok_or_else(|| anyhow!("missing window_active"))?
                 .parse::<usize>()?;
 
-            let window_name = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_name"))?;
-
             let window_layout = fields
                 .next()
                 .ok_or_else(|| anyhow!("missing window_layout"))?;
@@ -1088,6 +1206,10 @@ impl TmuxCommand for ListAllWindows {
                 .next()
                 .ok_or_else(|| anyhow!("missing history_limit"))?
                 .parse::<isize>()?;
+
+            let window_name = fields
+                .next()
+                .ok_or_else(|| anyhow!("missing window_name"))?;
 
             let window_active = window_active == 1;
 
@@ -1644,6 +1766,154 @@ impl TmuxCommand for AttachDone {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::tmux::MUX_TEST_LOCK;
+
+    #[test]
+    fn cancelled_tmux_paste_resolves_with_an_error() {
+        let mut promise = promise::Promise::new();
+        let mut future = promise.get_future().unwrap();
+        drop(PasteCompletion {
+            remaining: 1,
+            error: None,
+            promise,
+        });
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            std::future::Future::poll(std::pin::Pin::new(&mut future), &mut context),
+            std::task::Poll::Ready(Err(_))
+        ));
+    }
+
+    #[test]
+    fn passive_tmux_removal_releases_local_pane_resources() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        for (whole_window, moved) in [(false, false), (true, false), (false, true), (true, true)] {
+            let domain = TmuxDomain::new(alloc_pane_id());
+            let pane =
+                parse_pane_item("$1\t@2\t%3\t0\t0\t0\t80\t24\t0\t0\t1\t0\t0\t0\t0\t0\tzsh\t/tmp")
+                    .unwrap();
+            let local = domain.inner.create_pane(&pane).unwrap();
+            mux.add_pane(&local).unwrap();
+            let tab = Arc::new(Tab::new(&TerminalSize::default()));
+            tab.assign_pane(&local);
+            mux.add_tab_no_panes(&tab);
+            domain.inner.gui_tabs.lock().insert(
+                2,
+                TmuxTab {
+                    tab_id: tab.tab_id(),
+                    tmux_window_id: 2,
+                    layout_csum: String::new(),
+                    panes: HashSet::from([3]),
+                },
+            );
+            let active_lock = domain.inner.remote_panes.lock()[&3]
+                .lock()
+                .active_lock
+                .clone();
+            let destination = moved.then(|| {
+                let destination = domain
+                    .inner
+                    .create_pane(&PaneItem {
+                        window_id: 4,
+                        ..pane
+                    })
+                    .unwrap();
+                mux.add_pane(&destination).unwrap();
+                destination
+            });
+            let destination_lock = moved.then(|| {
+                domain.inner.remote_panes.lock()[&3]
+                    .lock()
+                    .active_lock
+                    .clone()
+            });
+            domain.inner.remember_resize(3, PtySize::default());
+            if whole_window {
+                domain.inner.remove_detached_window(2).unwrap();
+            } else {
+                domain
+                    .inner
+                    .remove_detached_pane(2, &HashSet::new())
+                    .unwrap();
+            }
+            let released = *active_lock.0.lock();
+            let destination_released = destination_lock.as_ref().map(|lock| *lock.0.lock());
+            // Release the child waiter even when the regression assertion fails.
+            *active_lock.0.lock() = true;
+            active_lock.1.notify_all();
+            if let Some(lock) = destination_lock {
+                *lock.0.lock() = true;
+                lock.1.notify_all();
+            }
+            assert!(released, "removed panes must release their child waiter");
+            assert!(mux.get_pane(local.pane_id()).is_none());
+            if let Some(destination) = destination {
+                assert_eq!(destination_released, Some(false));
+                assert!(mux.get_pane(destination.pane_id()).is_some());
+                assert_eq!(domain.inner.remote_panes.lock()[&3].lock().window_id, 4);
+                assert!(domain.inner.pending_resizes.lock().contains_key(&3));
+                mux.remove_pane(destination.pane_id());
+            } else {
+                assert!(domain.inner.remote_panes.lock().is_empty());
+                assert!(domain.inner.pending_resizes.lock().is_empty());
+            }
+            assert!(domain.inner.gui_tabs.lock().is_empty());
+            assert!(mux.get_tab(tab.tab_id()).is_none());
+            // @fdb:remote-tmux-close-lifecycle-test
+            assert!(domain.inner.cmd_queue.lock().is_empty());
+        }
+    }
+
+    #[test]
+    fn window_names_with_whitespace_survive_attach() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let domain = Arc::new(TmuxDomain::new(alloc_pane_id()));
+        let dyn_domain: Arc<dyn crate::Domain> = domain.clone();
+        mux.add_domain(&dyn_domain);
+        *domain.inner.tmux_session.lock() = Some(1);
+        let command = ListAllWindows {
+            session_id: 1,
+            window_id: None,
+        };
+        let name = "Agent work\tproject";
+        let output = command
+            .get_command(domain.inner.domain_id)
+            .split('\'')
+            .nth(1)
+            .unwrap()
+            .to_string()
+            .replace("#{session_id}", "$1")
+            .replace("#{window_id}", "@2")
+            .replace("#{window_width}", "80")
+            .replace("#{window_height}", "24")
+            .replace("#{window_active}", "1")
+            .replace("#{window_name}", name)
+            .replace("#{window_layout}", "b25d,80x24,0,0,3")
+            .replace("#{history_limit}", "2000");
+        command
+            .process_result(
+                domain.inner.domain_id,
+                &Guarded {
+                    error: false,
+                    timestamp: 0,
+                    number: 0,
+                    flags: 1,
+                    output,
+                },
+            )
+            .unwrap();
+        let tab_id = domain.inner.gui_tabs.lock().get(&2).unwrap().tab_id;
+        assert_eq!(mux.get_tab(tab_id).unwrap().get_title(), name);
+        domain
+            .inner
+            .advance(Box::new(vec![Event::Exit { reason: None }]));
+    }
 
     #[test]
     fn swap_window_targets_tmux_window_ids() {
@@ -1834,10 +2104,33 @@ mod test {
 
     #[test]
     fn tmux_attach_restores_resize_and_process_identity() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
         let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         Mux::set_mux(&mux);
-        let domain = Arc::new(TmuxDomain::new(alloc_pane_id()));
+        let mut domain = TmuxDomain::new(alloc_pane_id());
+        let controller = domain
+            .inner
+            .create_pane(
+                &parse_pane_item(
+                    "$1\t@99\t%99\t0\t0\t0\t100\t30\t0\t0\t1\t0\t0\t0\t0\t0\tzsh\t/tmp",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        Arc::get_mut(&mut domain.inner).unwrap().pane_id = controller.pane_id();
+        let controller_tab = Arc::new(Tab::new(&TerminalSize {
+            rows: 30,
+            cols: 100,
+            ..TerminalSize::default()
+        }));
+        controller_tab.assign_pane(&controller);
+        mux.add_tab_no_panes(&controller_tab);
+        let controller_window = mux.new_empty_window(None, None);
+        mux.add_tab_to_window(&controller_tab, *controller_window)
+            .unwrap();
+        drop(controller_window);
+        let domain = Arc::new(domain);
         let dyn_domain: Arc<dyn crate::Domain> = domain.clone();
         mux.add_domain(&dyn_domain);
         domain
@@ -2013,6 +2306,9 @@ mod test {
                 .as_deref(),
             Some("claude")
         );
+        domain
+            .inner
+            .advance(Box::new(vec![Event::Exit { reason: None }]));
         Mux::shutdown();
     }
 }

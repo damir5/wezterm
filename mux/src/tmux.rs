@@ -289,9 +289,57 @@ pub(crate) struct PendingAgentIdentity {
 }
 
 #[cfg(test)]
+// Tests replacing the process-wide mux must keep it for their whole fixture.
+pub(crate) static MUX_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tmux_commands::SendKeys;
+
+    #[test]
+    fn missing_control_pane_cancels_pending_commands() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let domain = TmuxDomain::new(crate::pane::alloc_pane_id());
+        *domain.inner.state.lock() = State::Idle;
+        domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(TwoLineCommand));
+
+        domain.inner.send_next_command();
+
+        assert_eq!(*domain.inner.state.lock(), State::Exit);
+        assert!(domain.inner.cmd_queue.lock().is_empty());
+        assert!(domain.inner.response_queue.lock().is_empty());
+        domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(TwoLineCommand));
+        domain.inner.send_next_command();
+        assert!(domain.inner.cmd_queue.lock().is_empty());
+    }
+
+    #[test]
+    fn output_before_attach_preserves_every_chunk() {
+        let domain = TmuxDomain::new(1);
+        domain.inner.advance(Box::new(vec![
+            Event::Output {
+                pane: 3,
+                text: b"first".to_vec(),
+            },
+            Event::Output {
+                pane: 3,
+                text: b"second".to_vec(),
+            },
+        ]));
+        assert_eq!(domain.inner.backlog.lock().get(&3).unwrap(), b"firstsecond");
+    }
 
     #[test]
     fn shell_panes_clear_persisted_agent_identity() {
@@ -576,6 +624,10 @@ impl TmuxDomainState {
             let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
                 return;
             };
+            // AttachDone flushes the initial sizes; keep them available until then.
+            if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
+                return;
+            }
             if let Some(size) = tmux_domain.inner.take_resize(pane_id, request_id) {
                 tmux_domain
                     .inner
@@ -620,6 +672,9 @@ impl TmuxDomainState {
                     log::warn!("tmux configuration error: {error}");
                 }
                 Event::Exit { reason: _ } => {
+                    if state == State::Exit {
+                        return;
+                    }
                     *self.state.lock() = State::Exit;
                     let mut pane_map = self.remote_panes.lock();
                     for (_, v) in pane_map.iter_mut() {
@@ -671,7 +726,11 @@ impl TmuxDomainState {
                     } else {
                         // the output may come early then pane is ready, in this case we
                         // backlog it
-                        self.backlog.lock().insert(*pane, text.to_vec());
+                        self.backlog
+                            .lock()
+                            .entry(*pane)
+                            .or_default()
+                            .extend_from_slice(text);
                         log::debug!("Tmux pane {} havn't been attached", pane);
                     }
                 }
@@ -780,7 +839,13 @@ impl TmuxDomainState {
     /// the commands needed to process those responses later.
     /// must be called inside main thread
     fn send_next_command(&self) {
-        if *self.state.lock() != State::Idle {
+        let state = *self.state.lock();
+        if state == State::Exit {
+            self.cmd_queue.lock().clear();
+            self.response_queue.lock().clear();
+            return;
+        }
+        if state != State::Idle {
             return;
         }
         let mut cmd_queue = self.cmd_queue.as_ref().lock();
@@ -792,9 +857,18 @@ impl TmuxDomainState {
         if !commands.is_empty() {
             log::debug!("sending tmux command batch {:?}", commands);
             let mux = Mux::get();
-            if let Some(pane) = mux.get_pane(self.pane_id) {
-                let mut writer = pane.writer();
-                let _ = write!(writer, "{}", commands);
+            let result = mux
+                .get_pane(self.pane_id)
+                .ok_or_else(|| anyhow::anyhow!("tmux connection pane no longer exists"))
+                .and_then(|pane| {
+                    let mut writer = pane.writer();
+                    write!(writer, "{}", commands).map_err(anyhow::Error::from)
+                });
+            if let Err(err) = result {
+                log::error!("Failed to send tmux commands: {err:#}");
+                self.advance(Box::new(vec![Event::Exit {
+                    reason: Some(err.to_string()),
+                }]));
             }
         }
     }

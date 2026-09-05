@@ -384,16 +384,36 @@ impl Pane for ClientPane {
 
         let data = text.to_owned();
         promise::spawn::spawn(async move {
-            client
+            if let Err(err) = client
                 .client
                 .send_paste(SendPaste {
                     pane_id: remote_pane_id,
                     data,
                 })
                 .await
+            {
+                log::error!("Paste to mux pane {remote_pane_id} failed: {err:#}");
+            }
         })
         .detach();
         self.renderable.lock().inner.borrow_mut().update_last_send();
+        Ok(())
+    }
+
+    async fn send_paste_async(&self, text: &str) -> anyhow::Result<()> {
+        self.renderable
+            .lock()
+            .inner
+            .borrow_mut()
+            .predict_from_paste(text);
+        self.renderable.lock().inner.borrow_mut().update_last_send();
+        self.client
+            .client
+            .send_paste(SendPaste {
+                pane_id: self.remote_pane_id,
+                data: text.to_owned(),
+            })
+            .await?;
         Ok(())
     }
 

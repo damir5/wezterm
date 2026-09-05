@@ -54,7 +54,7 @@ use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, LinkedList, VecDeque};
 use std::ops::Add;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -343,10 +343,9 @@ pub struct TabState {
 }
 
 /// Manages the state/queue of lua based event handlers.
-/// We don't want to queue more than 1 event at a time,
-/// so we use this enum to allow for at most 1 executing
-/// and 1 pending event.
-#[derive(Copy, Clone, Debug)]
+/// One handler executes at a time. Output retains one pending notification per
+/// pane; other window events retain a single pending notification.
+#[derive(Clone, Debug)]
 enum EventState {
     /// The event is not running
     None,
@@ -354,7 +353,83 @@ enum EventState {
     InProgress,
     /// The event is running, and we have another one ready to
     /// run once it completes
-    InProgressWithQueued(Option<PaneId>),
+    InProgressWithQueued(VecDeque<Option<PaneId>>),
+}
+
+impl EventState {
+    fn queue(&mut self, name: &str, pane_id: Option<PaneId>) -> bool {
+        match self {
+            Self::None => {
+                *self = Self::InProgress;
+                true
+            }
+            Self::InProgress => {
+                *self = Self::InProgressWithQueued(VecDeque::from([pane_id]));
+                false
+            }
+            Self::InProgressWithQueued(panes) => {
+                if name == "pane-output" {
+                    if !panes.contains(&pane_id) {
+                        panes.push_back(pane_id);
+                    }
+                } else if panes.front() != Some(&pane_id) {
+                    log::warn!(
+                        "Cannot queue {} event for pane {:?}, as \
+                         there is already an event queued for pane {:?} \
+                         in the same window",
+                        name, pane_id, panes.front().unwrap()
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn finish(&mut self, again: bool) -> Option<Option<PaneId>> {
+        if again {
+            if let Self::InProgressWithQueued(panes) = self {
+                let pane = panes.pop_front().unwrap();
+                if panes.is_empty() {
+                    *self = Self::InProgress;
+                }
+                return Some(pane);
+            }
+        }
+        *self = Self::None;
+        None
+    }
+}
+
+#[cfg(test)]
+mod window_event_tests {
+    use super::EventState;
+
+    #[test]
+    fn pane_output_keeps_each_panes_latest_notification() {
+        let mut state = EventState::None;
+        assert!(state.queue("pane-output", Some(1)));
+        assert!(!state.queue("pane-output", Some(2)));
+        assert!(!state.queue("pane-output", Some(3)));
+        assert!(!state.queue("pane-output", Some(2)));
+        assert_eq!(state.finish(true), Some(Some(2)));
+        assert_eq!(state.finish(true), Some(Some(3)));
+        assert_eq!(state.finish(true), None);
+        assert!(state.queue("pane-output", Some(1)));
+    }
+
+    #[test]
+    fn window_events_still_coalesce_and_missing_lua_clears_the_queue() {
+        let mut state = EventState::None;
+        assert!(state.queue("update-status", Some(1)));
+        assert!(!state.queue("update-status", Some(2)));
+        assert!(!state.queue("update-status", Some(3)));
+        assert_eq!(state.finish(true), Some(Some(2)));
+        assert_eq!(state.finish(true), None);
+        assert!(state.queue("pane-output", Some(1)));
+        assert!(!state.queue("pane-output", Some(2)));
+        assert_eq!(state.finish(false), None);
+        assert!(state.queue("pane-output", Some(3)));
+    }
 }
 
 pub struct TermWindow {
@@ -1722,6 +1797,12 @@ impl TermWindow {
         };
         let pane = match pane {
             Some(pane) => pane,
+            None if name == "pane-output" => {
+                // A queued pane may have closed. Never report its output as
+                // belonging to the active pane, and keep draining the queue.
+                self.finish_window_event(name, true);
+                return;
+            }
             None => match self.get_active_pane_or_overlay() {
                 Some(pane) => pane,
                 None => return,
@@ -1800,20 +1881,8 @@ impl TermWindow {
             .event_states
             .entry(name.to_string())
             .or_insert(EventState::None);
-        if again {
-            match state {
-                EventState::InProgress => {
-                    *state = EventState::None;
-                }
-                EventState::InProgressWithQueued(pane) => {
-                    let pane = *pane;
-                    *state = EventState::InProgress;
-                    self.schedule_window_event(name, pane);
-                }
-                EventState::None => {}
-            }
-        } else {
-            *state = EventState::None;
+        if let Some(pane) = state.finish(again) {
+            self.schedule_window_event(name, pane);
         }
     }
 
@@ -1826,33 +1895,8 @@ impl TermWindow {
             .event_states
             .entry(name.to_string())
             .or_insert(EventState::None);
-        match state {
-            EventState::InProgress => {
-                // Flag that we want to run again when the currently
-                // executing event calls finish_window_event().
-                *state = EventState::InProgressWithQueued(pane_id);
-                return;
-            }
-            EventState::InProgressWithQueued(other_pane) => {
-                // We've already got one copy executing and another
-                // pending dispatch, so don't queue another.
-                if pane_id != *other_pane {
-                    log::warn!(
-                        "Cannot queue {} event for pane {:?}, as \
-                         there is already an event queued for pane {:?} \
-                         in the same window",
-                        name,
-                        pane_id,
-                        other_pane
-                    );
-                }
-                return;
-            }
-            EventState::None => {
-                // Nothing pending, so schedule a call now
-                *state = EventState::InProgress;
-                self.schedule_window_event(name, pane_id);
-            }
+        if state.queue(name, pane_id) {
+            self.schedule_window_event(name, pane_id);
         }
     }
 

@@ -249,6 +249,10 @@ pub trait Pane: Downcast + Send + Sync {
         Progress::None
     }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
+    /// Wait for paste acceptance instead of discarding asynchronous errors.
+    async fn send_paste_async(&self, text: &str) -> anyhow::Result<()> {
+        self.send_paste(text)
+    }
     fn send_composed_text(&self, text: &str) -> anyhow::Result<()> {
         self.writer().write_all(text.as_bytes())?;
         Ok(())
