@@ -2,8 +2,8 @@
 #[cfg(feature = "tmux_cc")]
 use crate::tmux_cc::Event;
 use crate::{
-    Action, CSI, DeviceControlMode, EnterDeviceControlMode, Esc, OperatingSystemCommand,
-    ShortDeviceControl,
+    Action, DeviceControlMode, EnterDeviceControlMode, Esc, OperatingSystemCommand,
+    ShortDeviceControl, CSI,
 };
 #[cfg(feature = "tmux_cc")]
 use core::borrow::BorrowMut;
@@ -80,47 +80,58 @@ impl Parser {
         }
     }
 
-    /// advance with tmux parser, bypass VTParse
-    #[cfg(feature = "tmux_cc")]
-    fn advance_tmux_bytes(&mut self, bytes: &[u8]) -> crate::Result<Vec<Event>> {
-        let parser_state = self.state.borrow();
-        let tmux_state = parser_state.tmux_state.as_ref().unwrap();
-        let mut tmux_parser = tmux_state.borrow_mut();
-        return tmux_parser.advance_bytes(bytes);
-    }
-
     pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], mut callback: F) {
-        #[cfg(feature = "tmux_cc")]
-        let is_tmux_mode: bool = self.state.borrow().tmux_state.is_some();
-        #[cfg(feature = "tmux_cc")]
-        if is_tmux_mode {
-            match self.advance_tmux_bytes(bytes) {
-                Ok(tmux_events) => {
-                    callback(Action::DeviceControl(DeviceControlMode::TmuxEvents(
-                        Box::new(tmux_events),
-                    )));
-                }
-                Err(err_buf) => {
-                    // capture bytes cannot be parsed
-                    let unparsed_str = err_buf.to_string().to_owned();
-                    let mut parser_state = self.state.borrow_mut();
-                    parser_state.tmux_state = None;
-                    let mut perform = Performer {
-                        callback: &mut callback,
-                        state: &mut parser_state,
-                    };
-                    self.state_machine
-                        .parse(unparsed_str.as_bytes(), &mut perform);
+        let mut parser_state = self.state.borrow_mut();
+        for &byte in bytes {
+            #[cfg(feature = "tmux_cc")]
+            if byte == 0x1b && parser_state.tmux_state.is_some() {
+                // Protocol text escapes ESC bytes. A raw ESC is the terminator
+                // or terminal output after an abruptly closed connection.
+                parser_state.tmux_state = None;
+                self.state_machine = VTParser::new();
+                callback(Action::DeviceControl(DeviceControlMode::Exit));
+            }
+            #[cfg(feature = "tmux_cc")]
+            if let Some(tmux) = parser_state.tmux_state.as_mut() {
+                match tmux.get_mut().advance_byte(byte) {
+                    Ok(event) => {
+                        if let Some(event) = event {
+                            let exited = matches!(event, Event::Exit { .. });
+                            callback(Action::DeviceControl(DeviceControlMode::TmuxEvents(
+                                Box::new(vec![event]),
+                            )));
+                            if exited {
+                                parser_state.tmux_state = None;
+                                self.state_machine = VTParser::new();
+                                callback(Action::DeviceControl(DeviceControlMode::Exit));
+                            }
+                        }
+                        continue;
+                    }
+                    Err(err) => {
+                        // SSH can return to the shell without a tmux terminator.
+                        // End control mode and replay the non-protocol line as terminal output.
+                        parser_state.tmux_state = None;
+                        self.state_machine = VTParser::new();
+                        callback(Action::DeviceControl(DeviceControlMode::Exit));
+                        self.state_machine.parse(
+                            err.to_string().as_bytes(),
+                            &mut Performer {
+                                callback: &mut callback,
+                                state: &mut parser_state,
+                            },
+                        );
+                    }
                 }
             }
-            return;
+            self.state_machine.parse_byte(
+                byte,
+                &mut Performer {
+                    callback: &mut callback,
+                    state: &mut parser_state,
+                },
+            );
         }
-
-        let mut perform = Performer {
-            callback: &mut callback,
-            state: &mut self.state.borrow_mut(),
-        };
-        self.state_machine.parse(bytes, &mut perform);
     }
 
     /// A specialized version of the parser that halts after recognizing the
@@ -291,6 +302,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                     Err(_) => {
                         drop(tmux_parser);
                         self.state.tmux_state = None; // drop tmux state
+                        (self.callback)(Action::DeviceControl(DeviceControlMode::Exit));
                     }
                 }
                 return;
@@ -717,6 +729,38 @@ mod test {
             actions
         );
         assert_eq!(encode(&actions), "\x1b[!p");
+    }
+
+    #[test]
+    #[cfg(feature = "tmux_cc")]
+    fn broken_tmux_stream_exits_control_mode() {
+        for suffix in [
+            &b"Connection closed.\r\nSHELL_READY> "[..],
+            &b"\x1b[0mSHELL_READY> "[..],
+            &b"\x1b\\SHELL_READY> "[..],
+            &b"%exit\n\x1b\\SHELL_READY> "[..],
+        ] {
+            let mut input = b"\x1bP1000p%begin 1 1 0\n%end 1 1 0\n".to_vec();
+            input.extend_from_slice(suffix);
+            for split in 0..=input.len() {
+                let mut parser = Parser::new();
+                let mut actions = parser.parse_as_vec(&input[..split]);
+                actions.extend(parser.parse_as_vec(&input[split..]));
+                assert!(actions.iter().any(|action| matches!(
+                    action,
+                    Action::DeviceControl(DeviceControlMode::Exit)
+                )));
+                assert!(encode(&actions).contains("SHELL_READY> "), "split {split}");
+            }
+        }
+        let mut parser = Parser::new();
+        parser.parse_as_vec(b"\x1bP1000p%begin 1 1 0\npartial capture");
+        let actions = parser.parse_as_vec(b"\x1b[0mSHELL_READY> ");
+        assert!(matches!(
+            actions.first(),
+            Some(Action::DeviceControl(DeviceControlMode::Exit))
+        ));
+        assert!(encode(&actions).contains("SHELL_READY> "));
     }
 
     #[test]

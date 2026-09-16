@@ -139,6 +139,10 @@ impl UserData for MuxPane {
         // For backwards compatibility with prior releases when there
         // was a separate Gui-level PaneObject
         methods.add_method("mux_pane", |_, this, _: ()| Ok(*this));
+        methods.add_method("get_controller_pane_id", |_, this, _: ()| {
+            let mux = get_mux()?;
+            Ok(this.resolve(&mux)?.controller_pane_id())
+        });
 
         methods.add_method("get_title", |_, this, _: ()| {
             let mux = get_mux()?;

@@ -314,6 +314,7 @@ mod tests {
         domain.inner.send_next_command();
 
         assert_eq!(*domain.inner.state.lock(), State::Exit);
+        assert_eq!(domain.state(), DomainState::Detached);
         assert!(domain.inner.cmd_queue.lock().is_empty());
         assert!(domain.inner.response_queue.lock().is_empty());
         domain
@@ -323,6 +324,24 @@ mod tests {
             .push_back(Box::new(TwoLineCommand));
         domain.inner.send_next_command();
         assert!(domain.inner.cmd_queue.lock().is_empty());
+    }
+
+    #[test]
+    fn detach_without_controller_does_not_wait_for_remote_acknowledgement() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let domain = TmuxDomain::new(crate::pane::alloc_pane_id());
+        assert!(domain.detachable());
+        domain.detach().unwrap();
+        assert_eq!(domain.state(), DomainState::Detached);
+        domain.inner.advance(Box::new(vec![Event::Output {
+            pane: 3,
+            text: b"late output".to_vec(),
+        }]));
+        assert!(domain.inner.backlog.lock().is_empty());
+        domain.detach().unwrap();
     }
 
     #[test]
@@ -643,6 +662,9 @@ impl TmuxDomainState {
     pub fn advance(&self, events: Box<Vec<Event>>) {
         for event in events.iter() {
             let state = *self.state.lock();
+            if state == State::Exit {
+                return;
+            }
             log::debug!("tmux: {:?} in state {:?}", event, state);
             match event {
                 // Tmux generic events
@@ -656,6 +678,13 @@ impl TmuxDomainState {
                             let domain_id = self.domain_id;
                             let resp = response.clone();
                             promise::spawn::spawn_into_main_thread(async move {
+                                if Mux::get()
+                                    .get_domain(domain_id)
+                                    .map(|domain| domain.state())
+                                    != Some(DomainState::Attached)
+                                {
+                                    return;
+                                }
                                 if let Err(err) = cmd.process_result(domain_id, &resp) {
                                     log::error!("Tmux processing command result error: {}", err);
                                 }
@@ -672,9 +701,6 @@ impl TmuxDomainState {
                     log::warn!("tmux configuration error: {error}");
                 }
                 Event::Exit { reason: _ } => {
-                    if state == State::Exit {
-                        return;
-                    }
                     *self.state.lock() = State::Exit;
                     let mut pane_map = self.remote_panes.lock();
                     for (_, v) in pane_map.iter_mut() {
@@ -687,13 +713,21 @@ impl TmuxDomainState {
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
                     cmd_queue.clear();
                     self.response_queue.lock().clear();
+                    self.pending_splits.lock().clear();
 
-                    // Force to quit the tmux mode
+                    // Cleanup runs outside the controller terminal and mux window locks.
                     let pane_id = self.pane_id;
+                    let domain_id = self.domain_id;
                     promise::spawn::spawn_into_main_thread_with_low_priority(async move {
-                        if let Some(x) = Mux::get().get_pane(pane_id) {
-                            let _ = write!(x.writer(), "\n\n");
+                        let mux = Mux::get();
+                        if let Some(pane) = mux.get_pane(pane_id) {
+                            if pane.domain_id_for_spawn() == domain_id {
+                                pane.perform_actions(vec![termwiz::escape::Action::DeviceControl(
+                                    termwiz::escape::DeviceControlMode::Exit,
+                                )]);
+                            }
                         }
+                        mux.domain_was_detached(domain_id);
                     })
                     .detach();
 
@@ -1103,14 +1137,27 @@ impl Domain for TmuxDomain {
     }
 
     fn detachable(&self) -> bool {
-        false
+        true
     }
 
     fn detach(&self) -> anyhow::Result<()> {
-        anyhow::bail!("detach not implemented for TmuxDomain");
+        if *self.inner.state.lock() != State::Exit {
+            if let Some(pane) = Mux::get().get_pane(self.inner.pane_id) {
+                if let Err(err) = pane.writer().write_all(b"detach-client\n") {
+                    log::warn!("Failed to detach tmux client: {err:#}");
+                }
+            }
+            self.inner
+                .advance(Box::new(vec![Event::Exit { reason: None }]));
+        }
+        Ok(())
     }
 
     fn state(&self) -> DomainState {
-        DomainState::Attached
+        if *self.inner.state.lock() == State::Exit {
+            DomainState::Detached
+        } else {
+            DomainState::Attached
+        }
     }
 }

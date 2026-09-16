@@ -110,7 +110,7 @@ impl TmuxDomainState {
         // tmux retains bracketed-paste mode across attach, even on versions that cannot report it.
         // Always delete the private buffer, including when the destination disappears.
         for command in [
-            format!("set-buffer -b {buffer} \"{encoded}\"\n"),
+            format!("set-buffer -b {buffer} -- \"{encoded}\"\n"),
             format!("paste-buffer -p -r -b {buffer} -t %{remote_id}\n"),
             format!("delete-buffer -b {buffer}\n"),
         ] {

@@ -259,6 +259,11 @@ impl Pane for LocalPane {
     }
 
     fn kill(&self) {
+        if let Some(tmux) = self.tmux_domain.lock().take() {
+            tmux.advance(Box::new(vec![termwiz::tmux_cc::Event::Exit {
+                reason: None,
+            }]));
+        }
         let mut proc = self.process.lock();
         log::debug!(
             "killing process in pane {}, state is {:?}",
@@ -305,6 +310,11 @@ impl Pane for LocalPane {
                 };
 
                 if let Some(status) = status {
+                    if let Some(tmux) = self.tmux_domain.lock().take() {
+                        tmux.advance(Box::new(vec![termwiz::tmux_cc::Event::Exit {
+                            reason: None,
+                        }]));
+                    }
                     let success = match status.success() {
                         true => true,
                         false => configuration()
@@ -415,10 +425,13 @@ impl Pane for LocalPane {
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
-        if self.tmux_domain.lock().is_some() {
+        let tmux = self.tmux_domain.lock().clone();
+        if let Some(tmux) = tmux {
             log::trace!("key: {:?}", key);
             if key == KeyCode::Char('q') {
-                self.terminal.lock().send_paste("detach\n")?;
+                if let Some(domain) = Mux::get().get_domain(tmux.domain_id) {
+                    domain.detach()?;
+                }
             }
             return Ok(());
         } else {
@@ -972,7 +985,6 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                         let pane = pane.downcast_ref::<LocalPane>().unwrap();
                         pane.tmux_domain.lock().take();
                     }
-                    mux.domain_was_detached(tmux.domain_id);
                 }
             }
             DeviceControlMode::Data(c) => {

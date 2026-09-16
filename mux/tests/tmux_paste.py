@@ -10,7 +10,7 @@ import time
 
 BIN = Path(__file__).resolve().parents[2] / "target" / "debug"
 PAYLOAD = Path(sys.argv[1]).read_bytes() if len(sys.argv) > 1 else (
-    'line " č ✓ $HOME ; \\ end\nsecond\r\nthird\r' * 2000
+    '---\n' + 'line " č ✓ $HOME ; \\ end\nsecond\r\nthird\r' * 2000
 ).encode()
 
 
