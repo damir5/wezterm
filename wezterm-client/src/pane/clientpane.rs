@@ -546,7 +546,7 @@ impl Pane for ClientPane {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         promise::spawn::spawn(async move {
-            client
+            if let Err(err) = client
                 .client
                 .key_down(SendKeyDown {
                     pane_id: remote_pane_id,
@@ -557,6 +557,9 @@ impl Pane for ClientPane {
                     input_serial,
                 })
                 .await
+            {
+                log::error!("Key to mux pane {remote_pane_id} failed: {err:#}");
+            }
         })
         .detach();
         self.renderable.lock().inner.borrow_mut().update_last_send();
@@ -791,12 +794,29 @@ struct PaneWriter {
 
 impl std::io::Write for PaneWriter {
     fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
-        promise::spawn::block_on(self.client.client.write_to_pane(WriteToPane {
-            pane_id: self.remote_pane_id,
-            data: data.to_vec(),
-        }))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
-        Ok(data.len())
+        // Key assignments such as SendString call this on the GUI's main
+        // thread, so waiting here for the server's reply stops that window
+        // handling keys and repainting until it arrives. A reply that never
+        // arrives parks the window for good, while output keeps flowing on
+        // other threads. Hand the write off the same way send_paste does.
+        let client = Arc::clone(&self.client);
+        let remote_pane_id = self.remote_pane_id;
+        let data = data.to_vec();
+        let len = data.len();
+        promise::spawn::spawn(async move {
+            if let Err(err) = client
+                .client
+                .write_to_pane(WriteToPane {
+                    pane_id: remote_pane_id,
+                    data,
+                })
+                .await
+            {
+                log::error!("Write to mux pane {remote_pane_id} failed: {err:#}");
+            }
+        })
+        .detach();
+        Ok(len)
     }
 
     fn flush(&mut self) -> Result<(), std::io::Error> {
