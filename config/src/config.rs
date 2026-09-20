@@ -1783,11 +1783,15 @@ pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
 }
 
 pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
+    // The fork shares the upstream mux socket conventions but not the codec
+    // version; a stock wezterm attaching to our socket (or vice versa) attaches
+    // successfully and then renders nothing. Keep the families in separate
+    // runtime dirs so sockets, gui-sock discovery and logs never collide.
     if let Some(runtime) = dirs_next::runtime_dir() {
-        return Ok(runtime.join("wezterm"));
+        return Ok(runtime.join("wezteam"));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR.join(".local/share/wezteam"))
 }
 
 pub fn pki_dir() -> anyhow::Result<PathBuf> {

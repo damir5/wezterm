@@ -33,5 +33,17 @@ cargo test -p wezterm-gui tab_sidebar
 cargo check -p wezterm-gui -p mux -p mux-lua
 ```
 
+## Running and installing
+
+The macOS app is `/Applications/WezTeam.app` (`make install-app`). Its shim
+execs `target/debug/wezterm-gui` at every launch, so **a rebuild never
+requires reinstalling the app** — relaunch WezTeam and the new binary runs.
+Run `make install-app` only when the bundle itself changes: icon, shim, or
+Info.plist. The debug profile is the daily driver (`opt-level = 2`,
+`debug = 1`, assertions off); release builds are not maintained. The fork's
+sockets, logs, and gui-sock discovery live under `~/.local/share/wezteam`,
+deliberately separate from stock wezterm (`~/.local/share/wezterm`) — the two
+mux codecs are incompatible and must never share a socket.
+
 The sidebar is deliberately disabled for non-WebGpu windows; it must not reserve
 space or intercept input if it cannot be rendered.

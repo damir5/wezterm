@@ -30,6 +30,13 @@ opt-level = 3
 [profile.dev]
 # Remote pane rendering is unusably CPU-heavy without optimization.
 opt-level = 2
+# Match release checks so the GUI stays usable as a daily driver; release
+# runs with both off.
+debug-assertions = false
+overflow-checks = false
+# Line tables keep backtraces with file/line; full debuginfo doubled every
+# rlib and binary and let target/debug grow past 100G.
+debug = 1
 # https://jakedeichert.com/blog/reducing-rust-incremental-compilation-times-on-macos-by-70-percent/
 # Disabled because it breaks builds on Windows
 #split-debuginfo = "unpacked"

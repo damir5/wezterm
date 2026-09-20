@@ -1,0 +1,19 @@
+#!/bin/sh
+# WezTeam app shim: always exec the current debug build, so every new
+# cargo build is promoted on the next launch without reinstalling the app.
+#
+# Exec under the name `wezteam-gui` (symlink next to the cargo binary):
+# LaunchServices resolves the exec'd binary by name and, seeing
+# `wezterm-gui`, attaches the menu-bar name of the only registered app
+# that owns that executable name — stock /Applications/WezTerm.app. The
+# symlink keeps the fork's own name so the menu reads WezTeam.
+DIR="$HOME/dev/vendor/wezterm/target/debug"
+BIN="$DIR/wezteam-gui"
+[ -L "$BIN" ] || ln -sf wezterm-gui "$BIN"
+[ -x "$BIN" ] || {
+	echo "Missing $BIN — build it first: cargo build -p wezterm-gui -p wezterm-mux-server" >&2
+	exit 1
+}
+exec "$BIN" \
+	--config-file "$HOME/dev/test/wezterm-agent-poc/wezterm.lua" \
+	connect unix "$@"
