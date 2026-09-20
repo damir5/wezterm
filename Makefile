@@ -29,6 +29,7 @@ servedocs:
 	ci/build-docs.sh serve
 
 APP_DIR := /Applications/WezTeam.app
+TARGET_DIR ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 CACHE_DAYS ?= 14
 
 .PHONY: install-app uninstall-app cache-size cache-gc install-cache-reminder remove-cache-reminder
