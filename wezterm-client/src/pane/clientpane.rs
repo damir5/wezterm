@@ -397,7 +397,6 @@ impl Pane for ClientPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
-        let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         self.renderable
             .lock()
@@ -406,19 +405,12 @@ impl Pane for ClientPane {
             .predict_from_paste(text);
 
         let data = text.to_owned();
-        promise::spawn::spawn(async move {
-            if let Err(err) = client
-                .client
-                .send_paste(SendPaste {
-                    pane_id: remote_pane_id,
-                    data,
-                })
-                .await
-            {
-                log::error!("Paste to mux pane {remote_pane_id} failed: {err:#}");
-            }
-        })
-        .detach();
+        self.client
+            .client
+            .send_pdu_no_response(Pdu::SendPaste(SendPaste {
+                pane_id: remote_pane_id,
+                data,
+            }))?;
         self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
@@ -543,25 +535,17 @@ impl Pane for ClientPane {
             input_serial = inner.input_serial;
             inner.predict_from_key_event(key, mods);
         }
-        let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        promise::spawn::spawn(async move {
-            if let Err(err) = client
-                .client
-                .key_down(SendKeyDown {
-                    pane_id: remote_pane_id,
-                    event: KeyEvent {
-                        key,
-                        modifiers: mods,
-                    },
-                    input_serial,
-                })
-                .await
-            {
-                log::error!("Key to mux pane {remote_pane_id} failed: {err:#}");
-            }
-        })
-        .detach();
+        self.client
+            .client
+            .send_pdu_no_response(Pdu::SendKeyDown(SendKeyDown {
+                pane_id: remote_pane_id,
+                event: KeyEvent {
+                    key,
+                    modifiers: mods,
+                },
+                input_serial,
+            }))?;
         self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
@@ -794,29 +778,14 @@ struct PaneWriter {
 
 impl std::io::Write for PaneWriter {
     fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
-        // Key assignments such as SendString call this on the GUI's main
-        // thread, so waiting here for the server's reply stops that window
-        // handling keys and repainting until it arrives. A reply that never
-        // arrives parks the window for good, while output keeps flowing on
-        // other threads. Hand the write off the same way send_paste does.
-        let client = Arc::clone(&self.client);
-        let remote_pane_id = self.remote_pane_id;
-        let data = data.to_vec();
-        let len = data.len();
-        promise::spawn::spawn(async move {
-            if let Err(err) = client
-                .client
-                .write_to_pane(WriteToPane {
-                    pane_id: remote_pane_id,
-                    data,
-                })
-                .await
-            {
-                log::error!("Write to mux pane {remote_pane_id} failed: {err:#}");
-            }
-        })
-        .detach();
-        Ok(len)
+        self.client
+            .client
+            .send_pdu_no_response(Pdu::WriteToPane(WriteToPane {
+                pane_id: self.remote_pane_id,
+                data: data.to_vec(),
+            }))
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        Ok(data.len())
     }
 
     fn flush(&mut self) -> Result<(), std::io::Error> {

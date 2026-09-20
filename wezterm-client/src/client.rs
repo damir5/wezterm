@@ -467,11 +467,25 @@ async fn client_thread_async(
                                     e
                                 })?;
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
+                            let error = match &decoded.pdu {
+                                Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                                    Some(reason.clone())
+                                }
+                                _ => None,
+                            };
                             if promise.try_send(Ok(decoded.pdu)).is_err() {
-                                log::debug!(
-                                    "promise for serial {} was dropped by caller",
-                                    decoded.serial
-                                );
+                                if let Some(reason) = error {
+                                    log::error!(
+                                        "unobserved error response for serial {}: {}",
+                                        decoded.serial,
+                                        reason
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "promise for serial {} was dropped by caller",
+                                        decoded.serial
+                                    );
+                                }
                             }
                         } else {
                             let reason =
@@ -1375,17 +1389,26 @@ impl Client {
     }
 
     pub async fn send_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {
-        let (promise, rx) = bounded(1);
-        self.sender
-            .send(ReaderMessage::SendPdu { pdu, promise })
-            .await
-            .map_err(|_| ChannelSendError)
-            .context("send_pdu send")?;
+        let rx = self.queue_pdu(pdu)?;
         let res = rx.recv().await.context("send_pdu recv")??;
         if let Pdu::ErrorResponse(ErrorResponse { reason }) = &res {
             bail!("{}", reason);
         }
         Ok(res)
+    }
+
+    pub(crate) fn send_pdu_no_response(&self, pdu: Pdu) -> anyhow::Result<()> {
+        drop(self.queue_pdu(pdu)?);
+        Ok(())
+    }
+
+    fn queue_pdu(&self, pdu: Pdu) -> anyhow::Result<Receiver<anyhow::Result<Pdu>>> {
+        let (promise, rx) = bounded(1);
+        self.sender
+            .try_send(ReaderMessage::SendPdu { pdu, promise })
+            .map_err(|_| ChannelSendError)
+            .context("send_pdu send")?;
+        Ok(rx)
     }
 
     pub async fn resolve_pane_id(&self, pane_id: Option<PaneId>) -> anyhow::Result<PaneId> {
@@ -1471,6 +1494,39 @@ impl Client {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn test_client(sender: Sender<ReaderMessage>) -> Client {
+        Client {
+            sender,
+            local_domain_id: None,
+            client_id: ClientId::new(),
+            client_domain_config: ClientDomainConfig::Unix(UnixDomain::default()),
+            is_reconnectable: false,
+            is_local: true,
+        }
+    }
+
+    #[test]
+    fn no_response_pdus_are_queued_in_call_order() {
+        let (sender, receiver) = unbounded();
+        let client = test_client(sender);
+
+        for (pane_id, data) in [(1, b"first".to_vec()), (2, b"second".to_vec())] {
+            client
+                .send_pdu_no_response(Pdu::WriteToPane(WriteToPane { pane_id, data }))
+                .unwrap();
+        }
+
+        for expected_pane_id in [1, 2] {
+            let ReaderMessage::SendPdu { pdu, .. } = receiver.try_recv().unwrap() else {
+                panic!("expected queued PDU");
+            };
+            let Pdu::WriteToPane(request) = pdu else {
+                panic!("expected WriteToPane");
+            };
+            assert_eq!(request.pane_id, expected_pane_id);
+        }
+    }
 
     #[test]
     fn reconnect_backoff_decision_and_progression() {
