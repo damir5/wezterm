@@ -1,4 +1,4 @@
-use crate::domain::{DomainId, DomainState};
+use crate::domain::DomainId;
 use crate::pane::{
     CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
     SearchResult, WithPaneLines,
@@ -428,24 +428,15 @@ impl Pane for LocalPane {
         let tmux = self.tmux_domain.lock().clone();
         if let Some(tmux) = tmux {
             log::trace!("key: {:?}", key);
-            // Only a pane still driving a live control stream should swallow
-            // keys. That stream can end without a DCS Exit -- an ssh drop
-            // leaves the shell running, so nothing clears tmux_domain -- and
-            // the guard would then refuse every keystroke for the rest of the
-            // pane's life while paste and output kept working.
-            match Mux::get().get_domain(tmux.domain_id) {
-                Some(domain) if domain.state() == DomainState::Attached => {
-                    if key == KeyCode::Char('q') {
-                        domain.detach()?;
-                    }
-                    return Ok(());
-                }
-                _ => {
-                    self.tmux_domain.lock().take();
+            if key == KeyCode::Char('q') {
+                if let Some(domain) = Mux::get().get_domain(tmux.domain_id) {
+                    domain.detach()?;
                 }
             }
+            return Ok(());
+        } else {
+            self.terminal.lock().key_down(key, mods)
         }
-        self.terminal.lock().key_down(key, mods)
     }
 
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
