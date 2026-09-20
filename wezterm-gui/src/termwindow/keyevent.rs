@@ -402,7 +402,10 @@ impl super::TermWindow {
                 self.key_table_state.did_process_key();
                 let handled = match self.perform_key_assignment(&pane, &entry.action) {
                     Ok(PerformAssignmentResult::Handled) => true,
-                    Err(_) => true,
+                    Err(err) => {
+                        log::error!("key assignment {:?} failed: {err:#}", entry.action);
+                        true
+                    }
                     Ok(_) => false,
                 };
 
@@ -802,6 +805,9 @@ impl super::TermWindow {
                     }
                 };
 
+                if let Err(err) = &res {
+                    log::error!("sending key {:?} to pane failed: {err:#}", key);
+                }
                 if res.is_ok() {
                     if window_key.key_is_down
                         && !key.is_modifier()
