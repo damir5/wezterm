@@ -16,6 +16,7 @@ use mux::Mux;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
+use parking_lot::RwLock;
 use smol::channel::{bounded, unbounded, Receiver, Sender};
 use smol::prelude::*;
 use smol::{block_on, Async};
@@ -34,6 +35,63 @@ use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 use wezterm_uds::UnixStream;
+
+type ToastFn = Box<dyn Fn(&str, &str) + Send + Sync>;
+type ClearToastFn = Box<dyn Fn() + Send + Sync>;
+
+static TOAST_HANDLER: RwLock<Option<ToastFn>> = RwLock::new(None);
+static CLEAR_TOAST_HANDLER: RwLock<Option<ClearToastFn>> = RwLock::new(None);
+
+pub fn set_toast_handler(
+    show: impl Fn(&str, &str) + Send + Sync + 'static,
+    clear: impl Fn() + Send + Sync + 'static,
+) {
+    *TOAST_HANDLER.write() = Some(Box::new(show));
+    *CLEAR_TOAST_HANDLER.write() = Some(Box::new(clear));
+}
+
+pub fn toast(title: &str, message: &str) {
+    if let Some(handler) = TOAST_HANDLER.read().as_ref() {
+        handler(title, message);
+    }
+}
+
+pub fn clear_toast() {
+    if let Some(handler) = CLEAR_TOAST_HANDLER.read().as_ref() {
+        handler();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectBackoff {
+    current: Duration,
+    base: Duration,
+    max: Duration,
+}
+
+impl ReconnectBackoff {
+    pub const fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            current: base,
+            base,
+            max,
+        }
+    }
+
+    pub fn current(&self) -> Duration {
+        self.current
+    }
+
+    pub fn next_backoff(&mut self) -> Duration {
+        let prev = self.current;
+        self.current = (self.current + self.current).min(self.max);
+        prev
+    }
+
+    pub fn reset(&mut self) {
+        self.current = self.base;
+    }
+}
 
 #[derive(Error, Debug)]
 #[error("Timeout")]
@@ -410,7 +468,10 @@ async fn client_thread_async(
                                 })?;
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
                             if promise.try_send(Ok(decoded.pdu)).is_err() {
-                                return Err(NotReconnectableError::ClientWasDestroyed.into());
+                                log::debug!(
+                                    "promise for serial {} was dropped by caller",
+                                    decoded.serial
+                                );
                             }
                         } else {
                             let reason =
@@ -631,10 +692,7 @@ impl Reconnectable {
 
     fn reconnectable(&mut self) -> bool {
         match &self.config {
-            // It doesn't make sense to reconnect to a unix socket; we only
-            // get disconnected it it dies, so respawning it would not preserve
-            // the set of tabs and we'd have confusing and inconsistent state
-            ClientDomainConfig::Unix(_) => false,
+            ClientDomainConfig::Unix(_) => true,
             ClientDomainConfig::Tls(_) => true,
             // It *does* make sense to reconnect with an ssh session, but we
             // need to grow some smarts about whether the disconnect was because
@@ -1046,10 +1104,11 @@ impl Client {
         let client_id = ClientId::new();
 
         thread::spawn(move || {
-            const BASE_INTERVAL: Duration = Duration::from_secs(1);
-            const MAX_INTERVAL: Duration = Duration::from_secs(10);
+            let mut backoff = ReconnectBackoff::new(
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+            );
 
-            let mut backoff = BASE_INTERVAL;
             loop {
                 if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
                     if !reconnectable.reconnectable() || local_domain_id.is_none() {
@@ -1059,48 +1118,62 @@ impl Client {
 
                     let local_domain_id = local_domain_id.expect("checked above");
 
-                    if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
-                        if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
-                            // Don't reconnect for a simple EOF
-                            log::error!("server closed connection ({})", e);
-                            break;
-                        }
-                    }
-
                     if let Some(err) = e.root_cause().downcast_ref::<NotReconnectableError>() {
                         log::error!("{}; won't try to reconnect", err);
                         break;
                     }
 
-                    let mut ui = ConnectionUI::new();
+                    log::warn!("mux connection lost: {:#}; scheduling reconnect", e);
+                    crate::toast("wezterm", "mux server unreachable, reconnecting…");
+
+                    let mut ui = ConnectionUI::new_headless();
                     ui.title("wezterm: Reconnecting...");
 
+                    let mut destroyed = false;
                     loop {
+                        if receiver.is_closed() {
+                            // The Client was destroyed while we were
+                            // disconnected; re-entering client_thread now
+                            // would panic on its consumed stream.
+                            log::debug!("receiver closed; stopping reconnect loop");
+                            destroyed = true;
+                            break;
+                        }
+
+                        let wait_interval = backoff.next_backoff();
                         ui.sleep_with_reason(
                             &format!("client disconnected {}; will reconnect", e),
-                            backoff,
+                            wait_interval,
                         )
                         .ok();
+
                         let initial = false;
                         let no_auto_start = true; // Don't auto-start on a reconnect
                         match reconnectable.connect(initial, &mut ui, no_auto_start) {
                             Ok(_) => {
-                                backoff = BASE_INTERVAL;
-                                log::error!("Reconnected!");
+                                backoff.reset();
+                                log::info!("Reconnected to mux server!");
+                                crate::clear_toast();
                                 promise::spawn::spawn_into_main_thread(async move {
-                                    ClientDomain::reattach(local_domain_id, ui).await.ok();
+                                    if let Err(err) = ClientDomain::reattach(local_domain_id, ui).await {
+                                        log::error!("Error during reattach: {:#}", err);
+                                    } else {
+                                        crate::domain::fire_reattach_callback(local_domain_id);
+                                    }
                                 })
                                 .detach();
                                 break;
                             }
                             Err(err) => {
-                                backoff = (backoff + backoff).min(MAX_INTERVAL);
-                                ui.output_str(&format!(
-                                    "problem reconnecting: {}; will reconnect in {:?}\n",
-                                    err, backoff
-                                ));
+                                log::debug!(
+                                    "problem reconnecting: {}; will retry",
+                                    err
+                                );
                             }
                         }
+                    }
+                    if destroyed {
+                        break;
                     }
                 } else {
                     log::error!("client_thread returned without any error condition");
@@ -1308,7 +1381,11 @@ impl Client {
             .await
             .map_err(|_| ChannelSendError)
             .context("send_pdu send")?;
-        rx.recv().await.context("send_pdu recv")?
+        let res = rx.recv().await.context("send_pdu recv")??;
+        if let Pdu::ErrorResponse(ErrorResponse { reason }) = &res {
+            bail!("{}", reason);
+        }
+        Ok(res)
     }
 
     pub async fn resolve_pane_id(&self, pane_id: Option<PaneId>) -> anyhow::Result<PaneId> {
@@ -1389,4 +1466,56 @@ impl Client {
         GetPaneDirectionResponse
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_decision_and_progression() {
+        let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(10));
+        assert_eq!(backoff.current(), Duration::from_secs(1));
+
+        // Step 1: returns 1s, next is 2s
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(1));
+        assert_eq!(backoff.current(), Duration::from_secs(2));
+
+        // Step 2: returns 2s, next is 4s
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(2));
+        assert_eq!(backoff.current(), Duration::from_secs(4));
+
+        // Step 3: returns 4s, next is 8s
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(4));
+        assert_eq!(backoff.current(), Duration::from_secs(8));
+
+        // Step 4: returns 8s, next is capped at 10s
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(8));
+        assert_eq!(backoff.current(), Duration::from_secs(10));
+
+        // Step 5: returns 10s, stays at 10s
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(10));
+        assert_eq!(backoff.current(), Duration::from_secs(10));
+
+        // Reset restores base interval
+        backoff.reset();
+        assert_eq!(backoff.current(), Duration::from_secs(1));
+        assert_eq!(backoff.next_backoff(), Duration::from_secs(1));
+        assert_eq!(backoff.current(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn reconnectable_error_classification() {
+        let eof = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "premature EOF",
+        ));
+
+        let destroyed = anyhow::Error::new(NotReconnectableError::ClientWasDestroyed);
+        assert!(destroyed.root_cause().is::<NotReconnectableError>());
+
+        // The reconnect policy only excludes NotReconnectableError; every
+        // other failure, including EOF and protocol corruption, retries.
+        assert!(!eof.root_cause().is::<NotReconnectableError>());
+    }
 }

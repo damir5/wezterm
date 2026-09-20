@@ -70,6 +70,7 @@ fn main() {
         std::process::exit(1);
     }
     wezterm_blob_leases::clear_storage();
+    remove_server_info();
 }
 
 fn run() -> anyhow::Result<()> {
@@ -235,6 +236,8 @@ fn run() -> anyhow::Result<()> {
         e
     })?;
 
+    write_server_info();
+
     let activity = Activity::new();
 
     promise::spawn::spawn(async move {
@@ -310,6 +313,29 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
 fn terminate_with_error(err: anyhow::Error) -> ! {
     log::error!("{:#}; terminating", err);
     std::process::exit(1);
+}
+
+fn server_info_path() -> std::path::PathBuf {
+    config::RUNTIME_DIR.join("server-info.json")
+}
+
+/// Best-effort record of this server's identity so that clients can
+/// detect build skew. Write errors are ignored.
+fn write_server_info() {
+    let started_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let info = serde_json::json!({
+        "pid": std::process::id(),
+        "version": config::wezterm_version(),
+        "started_at_unix": started_at_unix,
+    });
+    let _ = std::fs::write(server_info_path(), info.to_string());
+}
+
+fn remove_server_info() {
+    let _ = std::fs::remove_file(server_info_path());
 }
 
 mod ossl;

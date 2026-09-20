@@ -948,13 +948,28 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                 {
                     log::info!("tmux -CC mode requested");
 
-                    // Create a new domain to host these tmux tabs
-                    let domain = TmuxDomain::new(self.pane_id);
-                    let tmux_domain = Arc::clone(&domain.inner);
-
-                    let domain: Arc<dyn Domain> = Arc::new(domain);
                     let mux = Mux::get();
-                    mux.add_domain(&domain);
+                    let existing = mux.iter_domains().into_iter().find_map(|d| {
+                        let tmux = d.downcast_ref::<TmuxDomain>()?;
+                        (tmux.controller_pane_id() == self.pane_id)
+                            .then(|| (Arc::clone(&d), Arc::clone(&tmux.inner)))
+                    });
+                    let tmux_domain = match existing {
+                        Some((domain, inner)) => {
+                            log::info!("reusing existing tmux domain {}", domain.domain_id());
+                            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                                tmux.reset();
+                            }
+                            inner
+                        }
+                        None => {
+                            let domain = TmuxDomain::new(self.pane_id);
+                            let tmux_domain = Arc::clone(&domain.inner);
+                            let domain: Arc<dyn Domain> = Arc::new(domain);
+                            mux.add_domain(&domain);
+                            tmux_domain
+                        }
+                    };
 
                     if let Some(pane) = mux.get_pane(self.pane_id) {
                         let pane = pane.downcast_ref::<LocalPane>().unwrap();

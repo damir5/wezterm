@@ -710,24 +710,36 @@ impl TmuxDomainState {
                         *released = true;
                         condvar.notify_all();
                     }
-                    let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                    cmd_queue.clear();
+                    pane_map.clear();
+                    self.gui_tabs.lock().clear();
+                    self.cmd_queue.lock().clear();
                     self.response_queue.lock().clear();
                     self.pending_splits.lock().clear();
+                    self.pending_titles.lock().clear();
+                    self.pending_resizes.lock().clear();
+                    self.pending_agent_identity.lock().clear();
+                    self.backlog.lock().clear();
+                    self.gui_window.lock().take();
 
                     // Cleanup runs outside the controller terminal and mux window locks.
                     let pane_id = self.pane_id;
                     let domain_id = self.domain_id;
-                    promise::spawn::spawn_into_main_thread_with_low_priority(async move {
+                    promise::spawn::spawn_into_main_thread(async move {
                         let mux = Mux::get();
-                        if let Some(pane) = mux.get_pane(pane_id) {
+                        let pane_dead = if let Some(pane) = mux.get_pane(pane_id) {
                             if pane.domain_id_for_spawn() == domain_id {
                                 pane.perform_actions(vec![termwiz::escape::Action::DeviceControl(
                                     termwiz::escape::DeviceControlMode::Exit,
                                 )]);
                             }
-                        }
+                            pane.is_dead()
+                        } else {
+                            true
+                        };
                         mux.domain_was_detached(domain_id);
+                        if pane_dead {
+                            mux.remove_domain(domain_id);
+                        }
                     })
                     .detach();
 
@@ -1066,6 +1078,23 @@ impl TmuxDomain {
         });
 
         Self { inner }
+    }
+
+    pub fn reset(&self) {
+        let mux = Mux::get();
+        mux.domain_was_detached(self.inner.domain_id);
+        *self.inner.state.lock() = State::WaitForInitialGuard;
+        *self.inner.attach_state.lock() = AttachState::Init;
+        self.inner.cmd_queue.lock().clear();
+        self.inner.response_queue.lock().clear();
+        self.inner.pending_splits.lock().clear();
+        self.inner.pending_titles.lock().clear();
+        self.inner.pending_resizes.lock().clear();
+        self.inner.pending_agent_identity.lock().clear();
+        self.inner.backlog.lock().clear();
+        self.inner.gui_tabs.lock().clear();
+        self.inner.remote_panes.lock().clear();
+        *self.inner.gui_window.lock() = None;
     }
 
     fn send_next_command(&self) {

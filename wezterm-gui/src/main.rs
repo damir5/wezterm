@@ -355,6 +355,7 @@ async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
         if let Some(dom) = dom.downcast_ref::<ClientDomain>() {
             if dom.connect_automatically() {
                 dom.attach(None).await?;
+                trigger_and_log_gui_attached(MuxDomain(dom.domain_id())).await;
             }
         }
     }
@@ -383,6 +384,82 @@ async fn trigger_and_log_gui_startup(spawn_command: Option<SpawnCommand>) {
     }
 }
 
+async fn trigger_client_version_mismatch(
+    lua: Option<Rc<mlua::Lua>>,
+    server_version: String,
+    client_version: String,
+    domain: String,
+) -> anyhow::Result<()> {
+    if let Some(lua) = lua {
+        let table = lua.create_table()?;
+        table.set("server_version", server_version)?;
+        table.set("client_version", client_version)?;
+        table.set("domain", domain)?;
+        let args = lua.pack_multi(table)?;
+        config::lua::emit_event(&lua, ("client-version-mismatch".to_string(), args)).await?;
+    }
+    Ok(())
+}
+
+async fn trigger_and_log_client_version_mismatch(
+    server_version: String,
+    client_version: String,
+    domain: String,
+) {
+    if let Err(err) = config::with_lua_config_on_main_thread({
+        let server_version = server_version.clone();
+        let client_version = client_version.clone();
+        let domain = domain.clone();
+        move |lua| trigger_client_version_mismatch(lua, server_version, client_version, domain)
+    })
+    .await
+    {
+        let message = format!("while processing client-version-mismatch event: {:#}", err);
+        log::error!("{}", message);
+    }
+}
+
+pub(crate) async fn check_and_notify_version_mismatch_at_attach(
+    domain: &MuxDomain,
+    domain_name: &str,
+) {
+    let is_unix = Mux::get()
+        .get_domain(domain.0)
+        .and_then(|d| d.downcast_ref::<ClientDomain>().map(|c| c.is_unix()))
+        .unwrap_or(false);
+    if !is_unix {
+        // server-info.json describes the local unix mux server; a TLS/ssh
+        // domain has its own far-end server that this file says nothing about.
+        return;
+    }
+    let client_version = config::wezterm_version();
+    if let Some(info) = wezterm_client::server_info::read_server_info(&config::RUNTIME_DIR) {
+        if let wezterm_client::server_info::VersionCheckResult::Mismatch {
+            server_version,
+            client_version,
+        } = wezterm_client::server_info::check_version_compat(Some(&info), client_version)
+        {
+            log::warn!(
+                "Mux server version mismatch for domain '{}': server={}, client={}",
+                domain_name,
+                server_version,
+                client_version
+            );
+            let message = format!(
+                "Mux server version ({}) does not match client version ({}). Behavior may be broken.",
+                server_version, client_version
+            );
+            persistent_toast_notification("Version Mismatch", &message);
+            trigger_and_log_client_version_mismatch(
+                server_version,
+                client_version,
+                domain_name.to_string(),
+            )
+            .await;
+        }
+    }
+}
+
 async fn trigger_gui_attached(lua: Option<Rc<mlua::Lua>>, domain: MuxDomain) -> anyhow::Result<()> {
     if let Some(lua) = lua {
         let args = lua.pack_multi(domain)?;
@@ -391,7 +468,14 @@ async fn trigger_gui_attached(lua: Option<Rc<mlua::Lua>>, domain: MuxDomain) -> 
     Ok(())
 }
 
-async fn trigger_and_log_gui_attached(domain: MuxDomain) {
+pub(crate) async fn trigger_and_log_gui_attached(domain: MuxDomain) {
+    let domain_name = Mux::get()
+        .get_domain(domain.0)
+        .map(|d| d.domain_name().to_string())
+        .unwrap_or_else(|| format!("domain-{}", domain.0));
+
+    check_and_notify_version_mismatch_at_attach(&domain, &domain_name).await;
+
     if let Err(err) =
         config::with_lua_config_on_main_thread(move |lua| trigger_gui_attached(lua, domain)).await
     {
@@ -1210,6 +1294,25 @@ fn run() -> anyhow::Result<()> {
     };
 
     env_bootstrap::bootstrap();
+    wezterm_client::set_toast_handler(
+        |title, message| {
+            persistent_toast_notification(title, message);
+        },
+        // There is no way to retract a system notification, so announce the
+        // recovery instead of leaving "unreachable" as the last word.
+        || {
+            persistent_toast_notification("wezterm", "mux server reconnected");
+        },
+    );
+    wezterm_client::domain::set_reattach_callback(|domain_id| {
+        promise::spawn::spawn_into_main_thread(async move {
+            promise::spawn::spawn(async move {
+                trigger_and_log_gui_attached(MuxDomain(domain_id)).await;
+            })
+            .detach();
+        })
+        .detach();
+    });
     // window_funcs is not set up by env_bootstrap as window_funcs is
     // GUI environment specific and env_bootstrap is used to setup the
     // headless mux server.

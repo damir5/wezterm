@@ -21,6 +21,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
+use termwiz::hyperlink::Rule;
 use termwiz::input::KeyEvent;
 use termwiz::surface::SequenceNo;
 use url::Url;
@@ -237,7 +238,7 @@ impl ClientPane {
                 log::trace!("remote pane {} has been removed", pane_id);
                 self.renderable.lock().inner.borrow_mut().dead = true;
                 let mux = Mux::get();
-                mux.prune_dead_windows();
+                mux.remove_pane(self.local_pane_id);
 
                 self.client.expire_stale_mappings();
             }
@@ -265,6 +266,24 @@ impl ClientPane {
 
     pub fn remote_pane_id(&self) -> TabId {
         self.remote_pane_id
+    }
+
+    pub fn reestablish_and_backfill(&self) {
+        self.renderable.lock().reestablish_and_backfill();
+
+        let palette = self.configured_palette.lock().clone();
+        let client = Arc::clone(&self.client);
+        let remote_pane_id = self.remote_pane_id;
+        promise::spawn::spawn(async move {
+            client
+                .client
+                .set_configured_palette_for_pane(SetPalette {
+                    pane_id: remote_pane_id,
+                    palette,
+                })
+                .await
+        })
+        .detach();
     }
 
     pub fn remote_controller_pane_id(&self) -> Option<PaneId> {
@@ -345,6 +364,10 @@ impl Pane for ClientPane {
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
         mux::pane::impl_get_logical_lines_via_get_lines(self, lines)
+    }
+
+    fn apply_hyperlinks(&self, _lines: Range<StableRowIndex>, _rules: &[Rule]) {
+        // RenderableInner::put_line scans fetched lines before caching them.
     }
 
     fn get_current_seqno(&self) -> SequenceNo {

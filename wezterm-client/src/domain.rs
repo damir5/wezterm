@@ -142,6 +142,21 @@ impl ClientInner {
         }
         None
     }
+    pub fn record_remote_to_local_pane_mapping(
+        &self,
+        remote_pane_id: PaneId,
+        local_pane_id: PaneId,
+    ) {
+        let mut pane_map = self.remote_to_local_pane.lock().unwrap();
+        let prior = pane_map.insert(remote_pane_id, local_pane_id);
+        log::trace!(
+            "record_remote_to_local_pane_mapping: {} -> {} (prior={prior:?}, domain={})",
+            remote_pane_id,
+            local_pane_id,
+            self.local_domain_id,
+        );
+    }
+
     pub fn remove_old_pane_mapping(&self, remote_pane_id: PaneId) {
         let mut pane_map = self.remote_to_local_pane.lock().unwrap();
         pane_map.remove(&remote_pane_id);
@@ -395,7 +410,30 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
     true
 }
 
+pub type ReattachCallback = Box<dyn Fn(DomainId) + Send + Sync>;
+static REATTACH_CALLBACK: parking_lot::RwLock<Option<ReattachCallback>> =
+    parking_lot::RwLock::new(None);
+
+pub fn set_reattach_callback(cb: impl Fn(DomainId) + Send + Sync + 'static) {
+    *REATTACH_CALLBACK.write() = Some(Box::new(cb));
+}
+
+/// Announce a domain (re)attachment to the GUI. Callers of `reattach` use
+/// this instead of `reattach` firing it internally, so that a caller which
+/// emits its own gui-attached event cannot produce the event twice.
+pub fn fire_reattach_callback(domain_id: DomainId) {
+    if let Some(cb) = REATTACH_CALLBACK.read().as_ref() {
+        cb(domain_id);
+    }
+}
+
 impl ClientDomain {
+    /// True when this domain talks to the local mux server that owns
+    /// config::RUNTIME_DIR, and only that server's server-info.json applies.
+    pub fn is_unix(&self) -> bool {
+        matches!(self.config, ClientDomainConfig::Unix(_))
+    }
+
     pub fn new(config: ClientDomainConfig) -> Self {
         let local_domain_id = alloc_domain_id();
         let label = config.label();
@@ -466,8 +504,14 @@ impl ClientDomain {
     pub async fn reattach(domain_id: DomainId, ui: ConnectionUI) -> anyhow::Result<()> {
         let inner = Self::get_client_inner_for_domain(domain_id)?;
 
+        ui.output_str("Checking server version\n");
+        if let Err(err) = inner.client.verify_version_compat(&ui).await {
+            log::warn!("version check warning during reattach: {:#}", err);
+        }
+
+        ui.output_str("Requesting pane list...\n");
         let panes = inner.client.list_panes().await?;
-        Self::process_pane_list(inner, panes, None)?;
+        Self::process_pane_list(Arc::clone(&inner), panes, None)?;
 
         ui.close();
         Ok(())
@@ -583,11 +627,13 @@ impl ClientDomain {
                     if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
                         match mux.get_pane(pane_id) {
                             Some(pane) => {
-                                if let Some(pane) = pane.downcast_ref::<ClientPane>() {
-                                    pane.set_remote_controller_pane_id(entry.controller_pane_id);
-                                    pane.set_current_working_dir(
+                                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                                    client_pane.set_remote_controller_pane_id(entry.controller_pane_id);
+                                    client_pane.set_current_working_dir(
                                         entry.working_dir.clone().map(Into::into),
                                     );
+                                    inner.record_remote_to_local_pane_mapping(entry.pane_id, pane_id);
+                                    client_pane.reestablish_and_backfill();
                                 }
                                 pane
                             }
@@ -605,7 +651,11 @@ impl ClientDomain {
                                     entry.working_dir.clone().map(Into::into),
                                     entry.controller_pane_id,
                                 ));
+                                inner.record_remote_to_local_pane_mapping(entry.pane_id, pane.pane_id());
                                 mux.add_pane(&pane).expect("failed to add pane to mux");
+                                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                                    client_pane.reestablish_and_backfill();
+                                }
                                 pane
                             }
                         }
@@ -625,7 +675,11 @@ impl ClientDomain {
                             entry,
                             pane.pane_id()
                         );
+                        inner.record_remote_to_local_pane_mapping(entry.pane_id, pane.pane_id());
                         mux.add_pane(&pane).expect("failed to add pane to mux");
+                        if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                            client_pane.reestablish_and_backfill();
+                        }
                         pane
                     }
                 });
@@ -710,9 +764,31 @@ impl ClientDomain {
             }
         }
         if !remote_panes_to_forget.is_empty() {
-            let mut panes = inner.remote_to_local_pane.lock().unwrap();
-            for p in remote_panes_to_forget {
-                panes.remove(&p);
+            let mut local_panes_to_remove = vec![];
+            {
+                let mut panes = inner.remote_to_local_pane.lock().unwrap();
+                for p in remote_panes_to_forget {
+                    if let Some(local_pane_id) = panes.remove(&p) {
+                        local_panes_to_remove.push(local_pane_id);
+                    }
+                }
+            }
+
+            // These panes are gone on the server, so drop our local stand-ins
+            // too. Forgetting only the id mapping would leave a pane that is
+            // still in the mux and not marked dead -- nothing prunes it, it
+            // keeps rendering its last screen, and the keys we send for it
+            // name a remote pane that no longer exists.
+            for local_pane_id in local_panes_to_remove {
+                if let Some(pane) = mux.get_pane(local_pane_id) {
+                    if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                        // Removal calls Pane::kill; the remote pane is already
+                        // gone and its id may since have been handed to a new
+                        // pane, so the kill must not reach the server.
+                        client_pane.ignore_next_kill();
+                    }
+                }
+                mux.remove_pane(local_pane_id);
             }
         }
 
@@ -962,8 +1038,11 @@ impl Domain for ClientDomain {
 
     async fn attach(&self, window_id: Option<WindowId>) -> anyhow::Result<()> {
         if self.state() == DomainState::Attached {
-            // Already attached
-            return Ok(());
+            let ui = ConnectionUI::with_params(ConnectionUIParams {
+                window_id,
+                ..Default::default()
+            });
+            return Self::reattach(self.local_domain_id, ui).await;
         }
 
         let domain_id = self.local_domain_id;

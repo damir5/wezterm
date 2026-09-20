@@ -470,11 +470,11 @@ impl SessionHandler {
 
                     let client_id = Arc::new(client_id);
                     self.client_id.replace(client_id.clone());
-                    spawn_into_main_thread(async move {
-                        let mux = Mux::get();
-                        mux.register_client(client_id);
-                    })
-                    .detach();
+                    // Register inline so that registration is ordered with
+                    // this session: Drop unregisters in the same task, so a
+                    // client vanishing right after this PDU cannot leave a
+                    // phantom entry in the mux client list.
+                    Mux::get().register_client(client_id);
                 }
                 send_response(Ok(Pdu::UnitResponse(UnitResponse {})))
             }

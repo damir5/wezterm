@@ -950,8 +950,20 @@ impl Parser {
         Ok(events)
     }
 
+    /// Protocol lines are terminated by `\n`. A pty with output
+    /// post-processing turns that into `\r\n`, and stacked ptys (ssh
+    /// inside a pane pty) into `\r\r\n`, so drop every trailing CR
+    /// before parsing. `%output` and guarded block content are
+    /// vis-encoded by tmux, so a literal trailing CR here is always a
+    /// pty artifact rather than payload.
+    fn strip_trailing_carriage_returns(&mut self) {
+        while self.buffer.last() == Some(&b'\r') {
+            self.buffer.pop();
+        }
+    }
+
     fn process_guarded_line(&mut self) -> Result<Option<Event>> {
-        let line = std::str::from_utf8(&self.buffer)?;
+        let line = String::from_utf8_lossy(&self.buffer).into_owned();
         let result = match parse_line(&self.buffer) {
             Ok(Event::End {
                 timestamp,
@@ -999,29 +1011,35 @@ impl Parser {
                     .begun
                     .as_mut()
                     .ok_or_else(|| format_err!("missing begun"))?;
-                begun.output.push_str(line);
+                begun.output.push_str(&line);
                 begun.output.push('\n');
                 None
             }
         };
         self.buffer.clear();
-        return Ok(result);
+        Ok(result)
     }
 
     fn process_line(&mut self) -> Result<Option<Event>> {
-        if self.buffer.last() == Some(&b'\r') {
-            self.buffer.pop();
-        }
+        self.strip_trailing_carriage_returns();
         if self.begun.is_some() {
             return self.process_guarded_line();
         }
 
-        let result = match parse_line(&self.buffer) {
-            Ok(Event::Begin {
+        let event = match parse_line(&self.buffer) {
+            Ok(event) => event,
+            Err(err) => {
+                log::error!("Unrecognized tmux cc line: {}", err);
+                bail!("{}", String::from_utf8_lossy(&self.buffer));
+            }
+        };
+
+        let result = match event {
+            Event::Begin {
                 timestamp,
                 number,
                 flags,
-            }) => {
+            } => {
                 if self.begun.is_some() {
                     log::error!(
                         "expected %end or %error before %begin ({})",
@@ -1037,11 +1055,7 @@ impl Parser {
                 });
                 None
             }
-            Ok(event) => Some(event),
-            Err(err) => {
-                log::error!("Unrecognized tmux cc line: {}", err);
-                bail!("{}", String::from_utf8_lossy(&self.buffer));
-            }
+            event => Some(event),
         };
 
         self.buffer.clear();
@@ -1289,5 +1303,36 @@ here
         assert!(matches!(&layout[0], WindowLayout::SplitHorizontal(_x)));
         assert!(matches!(&layout[1], WindowLayout::SplitVertical(_x)));
         assert!(matches!(&layout[2], WindowLayout::SplitHorizontal(_x)));
+    }
+
+    #[test]
+    fn guarded_blocks_survive_doubled_trailing_carriage_returns() {
+        // A pty with output post-processing (or several stacked ones, e.g.
+        // ssh inside a pane pty) doubles the trailing CR of every protocol
+        // line. Framing must still be recognized; one unparsable line must
+        // not tear the control session down.
+        let input = b"%begin 1604279270 310 0\r\r\nstuff\r\r\n%end 1604279270 310 0\r\r\n%session-changed $1 1\r\r\n";
+        let mut p = Parser::new();
+        let events = p.advance_bytes(input).unwrap();
+        assert_eq!(events.len(), 2, "events: {events:?}");
+        assert_eq!(
+            events[0],
+            Event::Guarded(Guarded {
+                timestamp: 1604279270,
+                number: 310,
+                flags: 0,
+                error: false,
+                // CapturePane re-adds \r itself, so block content must
+                // reach it free of the pty's carriage returns.
+                output: "stuff\n".to_owned()
+            })
+        );
+        assert_eq!(
+            events[1],
+            Event::SessionChanged {
+                session: 1,
+                name: "1".to_owned()
+            }
+        );
     }
 }

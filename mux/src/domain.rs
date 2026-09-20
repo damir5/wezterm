@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use wezterm_term::TerminalSize;
 
@@ -497,24 +498,118 @@ impl LocalDomain {
 /// awkward at the moment.
 #[derive(Clone)]
 pub(crate) struct WriterWrapper {
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    target: WriterTarget,
+}
+
+#[derive(Clone)]
+enum WriterTarget {
+    Direct(Arc<Mutex<Box<dyn Write + Send>>>),
+    Queued {
+        tx: SyncSender<WriterMessage>,
+        error: Arc<Mutex<Option<(std::io::ErrorKind, String)>>>,
+        pane_id: PaneId,
+    },
+}
+
+const PTY_WRITE_QUEUE_DEPTH: usize = 64;
+const PTY_WRITE_CHUNK_SIZE: usize = 64 * 1024;
+
+enum WriterMessage {
+    Write(Vec<u8>),
+    Flush,
+}
+
+fn schedule_pane_kill(pane_id: PaneId) {
+    if promise::spawn::is_scheduler_configured() {
+        promise::spawn::spawn_into_main_thread(async move {
+            if let Some(pane) = Mux::try_get().and_then(|mux| mux.get_pane(pane_id)) {
+                pane.kill();
+            }
+        })
+        .detach();
+    }
 }
 
 impl WriterWrapper {
     pub fn new(writer: Box<dyn Write + Send>) -> Self {
         Self {
-            writer: Arc::new(Mutex::new(writer)),
+            target: WriterTarget::Direct(Arc::new(Mutex::new(writer))),
         }
+    }
+
+    pub fn new_queued(mut writer: Box<dyn Write + Send>, pane_id: PaneId) -> Self {
+        let (tx, rx) = sync_channel(PTY_WRITE_QUEUE_DEPTH);
+        let error = Arc::new(Mutex::new(None));
+        let worker_error = Arc::clone(&error);
+        std::thread::spawn(move || {
+            while let Ok(message) = rx.recv() {
+                let result = match message {
+                    WriterMessage::Write(data) => writer.write_all(&data),
+                    WriterMessage::Flush => writer.flush(),
+                };
+                if let Err(err) = result {
+                    *worker_error.lock() = Some((err.kind(), err.to_string()));
+                    schedule_pane_kill(pane_id);
+                    break;
+                }
+            }
+        });
+        Self {
+            target: WriterTarget::Queued {
+                tx,
+                error,
+                pane_id,
+            },
+        }
+    }
+
+    fn background_error(&self) -> Option<std::io::Error> {
+        match &self.target {
+            WriterTarget::Direct(_) => None,
+            WriterTarget::Queued { error, .. } => error
+                .lock()
+                .as_ref()
+                .map(|(kind, message)| std::io::Error::new(*kind, message.clone())),
+        }
+    }
+
+    fn enqueue(&self, message: WriterMessage) -> std::io::Result<()> {
+        if let Some(err) = self.background_error() {
+            return Err(err);
+        }
+        let WriterTarget::Queued { tx, pane_id, .. } = &self.target else {
+            unreachable!();
+        };
+        tx.try_send(message).map_err(|err| match err {
+            TrySendError::Full(_) => {
+                schedule_pane_kill(*pane_id);
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, "pty write queue is full")
+            }
+            TrySendError::Disconnected(_) => self.background_error().unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty writer stopped")
+            }),
+        })
     }
 }
 
 impl std::io::Write for WriterWrapper {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.writer.lock().write(buf)
+        if let WriterTarget::Direct(writer) = &self.target {
+            return writer.lock().write(buf);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let len = buf.len().min(PTY_WRITE_CHUNK_SIZE);
+        self.enqueue(WriterMessage::Write(buf[..len].to_vec()))?;
+        Ok(len)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.writer.lock().flush()
+        match &self.target {
+            WriterTarget::Direct(writer) => writer.lock().flush(),
+            WriterTarget::Queued { .. } => self.enqueue(WriterMessage::Flush),
+        }
     }
 }
 
@@ -618,7 +713,7 @@ impl Domain for LocalDomain {
             self.name
         );
         let child_result = pair.slave.spawn_command(cmd);
-        let mut writer = WriterWrapper::new(pair.master.take_writer()?);
+        let mut writer = WriterWrapper::new_queued(pair.master.take_writer()?, pane_id);
 
         let mut terminal = wezterm_term::Terminal::new(
             size,
@@ -730,5 +825,58 @@ impl Domain for LocalDomain {
 
     fn state(&self) -> DomainState {
         DomainState::Attached
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Condvar, Mutex as StdMutex};
+
+    struct BlockingWriter {
+        started: Option<std::sync::mpsc::Sender<()>>,
+        gate: Arc<(StdMutex<bool>, Condvar)>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+            }
+            let (lock, condvar) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = condvar.wait(released).unwrap();
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn blocked_pty_writer_fails_fast_when_its_queue_fills() {
+        let gate = Arc::new((StdMutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut writer = WriterWrapper::new_queued(
+            Box::new(BlockingWriter {
+                started: Some(started_tx),
+                gate: Arc::clone(&gate),
+            }),
+            alloc_pane_id(),
+        );
+
+        writer.write_all(b"first").unwrap();
+        started_rx.recv().unwrap();
+        for _ in 0..PTY_WRITE_QUEUE_DEPTH {
+            writer.write_all(b"queued").unwrap();
+        }
+        let err = writer.write_all(b"overflow").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_one();
     }
 }

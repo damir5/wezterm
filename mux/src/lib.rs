@@ -721,7 +721,9 @@ impl Mux {
         self.clients.write().remove(client_id);
     }
 
-    pub fn subscribe<F>(&self, subscriber: F)
+    /// Register a notification subscriber. Returns the subscription id
+    /// to pass to `unsubscribe` when the subscriber goes away.
+    pub fn subscribe<F>(&self, subscriber: F) -> usize
     where
         F: Fn(MuxNotification) -> bool + 'static + Send + Sync,
     {
@@ -729,6 +731,18 @@ impl Mux {
         self.subscribers
             .write()
             .insert(sub_id, Box::new(subscriber));
+        sub_id
+    }
+
+    /// Remove a subscriber registered via `subscribe`.
+    pub fn unsubscribe(&self, sub_id: usize) {
+        self.subscribers.write().remove(&sub_id);
+    }
+
+    /// Number of registered subscribers; lets tests verify that dead
+    /// sessions released their subscriptions.
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.read().len()
     }
 
     pub fn notify(&self, notification: MuxNotification) {
@@ -777,6 +791,14 @@ impl Mux {
         self.domains_by_name
             .write()
             .insert(domain.domain_name().to_string(), Arc::clone(domain));
+    }
+
+    pub fn remove_domain(&self, id: DomainId) -> Option<Arc<dyn Domain>> {
+        let domain = self.domains.write().remove(&id)?;
+        self.domains_by_name
+            .write()
+            .retain(|_, d| d.domain_id() != id);
+        Some(domain)
     }
 
     pub fn set_mux(mux: &Arc<Mux>) {
@@ -1150,11 +1172,17 @@ impl Mux {
             }
         }
 
+        let mut dead_tabs = vec![];
         {
             let mut windows = self.windows.write();
             for (_, win) in windows.iter_mut() {
                 for tab in win.iter_tabs() {
-                    tab.kill_panes_in_domain(domain);
+                    if tab.kill_panes_in_domain(domain) && tab.is_dead() {
+                        dead_tabs.push(tab.tab_id());
+                    }
+                }
+                for tab_id in &dead_tabs {
+                    win.remove_tab_id(*tab_id);
                 }
             }
         }
@@ -1162,6 +1190,10 @@ impl Mux {
         log::info!("domain detached panes: {:?}", dead_panes);
         for pane_id in dead_panes {
             self.remove_pane_internal(pane_id);
+        }
+
+        for tab_id in dead_tabs {
+            self.remove_tab_internal(tab_id);
         }
 
         self.prune_dead_windows();

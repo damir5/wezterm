@@ -1,4 +1,4 @@
-use crate::domain::{DomainId, WriterWrapper};
+use crate::domain::{DomainId, DomainState, WriterWrapper};
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
@@ -689,7 +689,7 @@ impl TmuxDomainState {
         Ok(())
     }
 
-    fn sync_window_state(&self, windows: &[WindowItem], new_window: bool) -> anyhow::Result<()> {
+    fn sync_window_state(&self, windows: &[WindowItem], _new_window: bool) -> anyhow::Result<()> {
         let Some(current_session) = *self.tmux_session.lock() else {
             return Ok(());
         };
@@ -863,14 +863,11 @@ impl TmuxDomainState {
                 }
             };
 
-            // For new window, we wait for nature ouput instead of capturing
-            if !new_window {
-                for p in local_tab.panes.iter() {
-                    self.cmd_queue.lock().push_back(Box::new(CapturePane {
-                        pane_id: *p,
-                        history_limit: window.history_limit,
-                    }));
-                }
+            for p in local_tab.panes.iter() {
+                self.cmd_queue.lock().push_back(Box::new(CapturePane {
+                    pane_id: *p,
+                    history_limit: window.history_limit,
+                }));
             }
 
             // To keep the active window last one to make it active after set the focus pane
@@ -908,6 +905,29 @@ impl TmuxDomainState {
         let mux = Mux::get();
         let domain_id = self.domain_id;
         mux.subscribe(move |n| {
+            let mux = Mux::get();
+            let domain = match mux.get_domain(domain_id) {
+                Some(d) => d,
+                None => return false,
+            };
+            if domain.state() != DomainState::Attached {
+                return false;
+            }
+            let tmux_domain = match domain.downcast_ref::<TmuxDomain>() {
+                Some(t) => t,
+                None => return false,
+            };
+
+            if matches!(n, MuxNotification::PaneRemoved(pane_id) if pane_id == tmux_domain.inner.pane_id) {
+                tmux_domain.inner.advance(Box::new(vec![Event::Exit { reason: None }]));
+                return false;
+            }
+
+            if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
+                return true;
+            }
+
+            let n = n.clone();
             promise::spawn::spawn_into_main_thread(async move {
                 let mux = Mux::get();
                 let domain = match mux.get_domain(domain_id) {
@@ -918,15 +938,6 @@ impl TmuxDomainState {
                     Some(t) => t,
                     None => return,
                 };
-
-                if matches!(n, MuxNotification::PaneRemoved(pane_id) if pane_id == tmux_domain.inner.pane_id) {
-                    tmux_domain.inner.advance(Box::new(vec![Event::Exit { reason: None }]));
-                    return;
-                }
-
-                if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
-                    return;
-                }
 
                 match n {
                     MuxNotification::PaneFocused(pane_id) => {
@@ -2309,6 +2320,58 @@ mod test {
         domain
             .inner
             .advance(Box::new(vec![Event::Exit { reason: None }]));
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn tmux_domain_unsubscribe_on_exit() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let domain = TmuxDomain::new(alloc_pane_id());
+        let dyn_domain: Arc<dyn crate::Domain> = Arc::new(domain);
+        mux.add_domain(&dyn_domain);
+
+        let initial_subscribers = mux.subscriber_count();
+        let tmux_domain = dyn_domain.downcast_ref::<TmuxDomain>().unwrap();
+        tmux_domain.inner.subscribe_notification();
+        assert_eq!(mux.subscriber_count(), initial_subscribers + 1);
+
+        // Advance domain to Exit
+        tmux_domain
+            .inner
+            .advance(Box::new(vec![Event::Exit { reason: None }]));
+
+        // Firing a notification should trigger retention check and drop the subscriber
+        mux.notify(MuxNotification::PaneFocused(alloc_pane_id()));
+        assert_eq!(mux.subscriber_count(), initial_subscribers);
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn tmux_domain_reset_clears_state_and_queues() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let domain = TmuxDomain::new(alloc_pane_id());
+        let dyn_domain: Arc<dyn crate::Domain> = Arc::new(domain);
+        mux.add_domain(&dyn_domain);
+
+        let tmux_domain = dyn_domain.downcast_ref::<TmuxDomain>().unwrap();
+        tmux_domain.inner.cmd_queue.lock().push_back(Box::new(SelectPane { pane_id: 1 }));
+        *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+
+        tmux_domain.reset();
+
+        assert_eq!(*tmux_domain.inner.attach_state.lock(), AttachState::Init);
+        assert_eq!(dyn_domain.state(), crate::domain::DomainState::Attached);
+        assert!(tmux_domain.inner.cmd_queue.lock().is_empty());
+        assert!(tmux_domain.inner.gui_tabs.lock().is_empty());
+        assert!(tmux_domain.inner.remote_panes.lock().is_empty());
+
         Mux::shutdown();
     }
 }

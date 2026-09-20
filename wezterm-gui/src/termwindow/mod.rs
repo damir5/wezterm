@@ -3338,6 +3338,8 @@ impl TermWindow {
                             .await?;
                     }
 
+                    crate::trigger_and_log_gui_attached(mux_lua::MuxDomain(domain.domain_id())).await;
+
                     Result::<(), anyhow::Error>::Ok(())
                 })
                 .detach();
@@ -3693,6 +3695,10 @@ impl TermWindow {
     }
 
     fn pos_pane_to_pane_info(pos: &PositionedPane) -> PaneInformation {
+        let domain_name = Mux::try_get()
+            .and_then(|mux| mux.get_domain(pos.pane.domain_id()))
+            .map(|domain| domain.domain_name().to_string())
+            .unwrap_or_default();
         PaneInformation {
             pane_id: pos.pane.pane_id(),
             pane_index: pos.index,
@@ -3714,10 +3720,7 @@ impl TermWindow {
                 .pane
                 .get_foreground_process_name(CachePolicy::AllowStale)
                 .unwrap_or_default(),
-            domain_name: Mux::try_get()
-                .and_then(|mux| mux.get_domain(pos.pane.domain_id()))
-                .map(|domain| domain.domain_name().to_string())
-                .unwrap_or_default(),
+            domain_name,
         }
     }
 

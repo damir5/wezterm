@@ -325,6 +325,44 @@ impl RenderableInner {
         self.poll_interval = BASE_POLL_INTERVAL;
     }
 
+    pub fn reestablish_and_backfill(&mut self) {
+        self.dead = false;
+        self.poll_interval = BASE_POLL_INTERVAL;
+        self.make_all_stale();
+
+        // Backdate last_poll so the guarded poll runs immediately; leave
+        // poll_in_progress alone so an in-flight poll can't be double-started.
+        self.last_poll = Instant::now() - self.max_poll_interval;
+        let _ = self.poll();
+
+        let top = self.dimensions.physical_top;
+        let rows = if self.dimensions.viewport_rows > 0 {
+            self.dimensions.viewport_rows as StableRowIndex
+        } else {
+            24
+        };
+        let visible_range = top..(top + rows);
+        let mut to_fetch = RangeSet::new();
+        for row in visible_range {
+            to_fetch.add(row);
+        }
+
+        let now = Instant::now();
+        for stable_row in to_fetch.iter().flat_map(|r| r.clone()) {
+            let prior = self.lines.pop(&stable_row);
+            let entry = match prior {
+                Some(LineEntry::Fetching(_)) | None => LineEntry::Fetching(now),
+                Some(LineEntry::LineAndFetching(old, ..))
+                | Some(LineEntry::Stale(old))
+                | Some(LineEntry::Line(old)) => LineEntry::LineAndFetching(old, now),
+            };
+            self.lines.put(stable_row, entry);
+        }
+
+        self.schedule_fetch_lines(to_fetch, now);
+        Mux::get().notify(mux::MuxNotification::PaneOutput(self.local_pane_id));
+    }
+
     pub fn apply_changes_to_surface(
         &mut self,
         delta: GetPaneRenderChangesResponse,
@@ -837,8 +875,10 @@ impl RenderableState {
             // domain session it is terminal... but we will detect that
             // terminal condition elsewhere
             if let Err(err) = err.downcast::<BrokenPromise>() {
-                log::error!("remote tab poll failed: {}, marking as dead", err);
-                inner.dead = true;
+                if !inner.client.client.is_reconnectable {
+                    log::error!("remote tab poll failed: {}, marking as dead", err);
+                    inner.dead = true;
+                }
             }
         }
 
@@ -879,5 +919,9 @@ impl RenderableState {
 
     pub fn get_dimensions(&self) -> RenderableDimensions {
         self.inner.borrow().dimensions
+    }
+
+    pub fn reestablish_and_backfill(&self) {
+        self.inner.borrow_mut().reestablish_and_backfill();
     }
 }
