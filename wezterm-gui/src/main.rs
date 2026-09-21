@@ -445,11 +445,10 @@ pub(crate) async fn check_and_notify_version_mismatch_at_attach(
                 server_version,
                 client_version
             );
-            let message = format!(
-                "Mux server version ({}) does not match client version ({}). Behavior may be broken.",
-                server_version, client_version
-            );
-            persistent_toast_notification("Version Mismatch", &message);
+            // No toast here. +[UNUserNotificationCenter currentNotificationCenter]
+            // asserts and aborts the process when macOS cannot resolve the
+            // bundle for this process, and this runs on every attach, so a
+            // transient failure there would cost us the whole GUI.
             trigger_and_log_client_version_mismatch(
                 server_version,
                 client_version,
