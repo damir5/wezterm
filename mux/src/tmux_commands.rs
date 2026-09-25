@@ -2,7 +2,9 @@ use crate::domain::{DomainId, DomainState, WriterWrapper};
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
-use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
+use crate::tmux::{
+    is_shell_command, AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab,
+};
 use crate::tmux_pty::{TmuxChild, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
 use anyhow::{anyhow, Context};
@@ -129,7 +131,7 @@ pub(crate) const PANE_CWD_SUBSCRIPTION: &str = "wezterm-pane-cwd";
 pub(crate) const PANE_COMMAND_SUBSCRIPTION: &str = "wezterm-pane-command";
 pub(crate) const PANE_TITLE_SUBSCRIPTION: &str = "wezterm-pane-title";
 pub(crate) const PANE_AGENT_HARNESS_SUBSCRIPTION: &str = "wezterm-pane-agent-harness";
-pub(crate) const PANE_AGENT_VARIANT_SUBSCRIPTION: &str = "wezterm-pane-agent-variant";
+pub(crate) const PANE_AGENT_LEGACY_SUBSCRIPTION: &str = "wezterm-pane-agent-legacy";
 
 fn pane_command(command: &str) -> Option<String> {
     (!command.is_empty()).then(|| command.to_owned())
@@ -233,14 +235,44 @@ impl TmuxDomainState {
         if *self.tmux_session.lock() != Some(session_id) {
             return;
         }
+        let mut clear_shell_identity = None;
         if let Some(pane) = self.remote_panes.lock().get(&pane_id) {
             let mut pane = pane.lock();
             if pane.window_id == window_id {
                 pane.current_command = pane_command(command);
+                if is_shell_command(command) && !pane.shell_identity_checked {
+                    pane.shell_identity_checked = true;
+                    let stale_option = pane.agent_identity.clone();
+                    pane.retired_agent_identity_version = Some(
+                        pane.retired_agent_identity_version
+                            .unwrap_or(0)
+                            .max(pane.agent_identity_version),
+                    );
+                    pane.agent_identity.clear();
+                    pane.agent_harness.clear();
+                    pane.agent_variant.clear();
+                    pane.agent_label.clear();
+                    pane.agent_project.clear();
+                    pane.agent_repo.clear();
+                    pane.agent_worktree.clear();
+                    clear_shell_identity = Some(stale_option);
+                } else if !is_shell_command(command) {
+                    pane.shell_identity_checked = false;
+                }
                 if let Err(err) = pane.rehydrate_agent_identity() {
                     log::error!("Failed to rehydrate tmux pane identity: {err:#}");
                 }
             }
+        }
+        if let Some(stale_option) = clear_shell_identity {
+            self.cmd_queue
+                .lock()
+                .push_back(Box::new(ClearPaneAgentIdentity {
+                    pane: pane_id,
+                    shell: command.to_owned(),
+                    stale_option,
+                }));
+            Self::schedule_send_next_command(self.domain_id);
         }
     }
 
@@ -249,7 +281,6 @@ impl TmuxDomainState {
         session_id: TmuxSessionId,
         window_id: TmuxWindowId,
         pane_id: TmuxPaneId,
-        name: &str,
         value: &str,
     ) {
         if *self.tmux_session.lock() != Some(session_id) {
@@ -258,7 +289,7 @@ impl TmuxDomainState {
         if let Some(pane) = self.remote_panes.lock().get(&pane_id) {
             let mut pane = pane.lock();
             if pane.window_id == window_id {
-                if let Err(err) = pane.update_agent_identity(name, value) {
+                if let Err(err) = pane.update_agent_identity(value) {
                     log::error!("Failed to update tmux pane identity: {err:#}");
                 }
                 return;
@@ -270,11 +301,36 @@ impl TmuxDomainState {
             *entry = Default::default();
             entry.window_id = window_id;
         }
-        match name {
-            "harness" => entry.harness = Some(value.to_string()),
-            "variant" => entry.variant = Some(value.to_string()),
-            _ => {}
+        entry.value = Some(value.to_string());
+    }
+
+    pub fn update_pane_legacy_identity(
+        &self,
+        session_id: TmuxSessionId,
+        window_id: TmuxWindowId,
+        pane_id: TmuxPaneId,
+        harness: &str,
+        variant: &str,
+    ) {
+        if *self.tmux_session.lock() != Some(session_id) {
+            return;
         }
+        if let Some(pane) = self.remote_panes.lock().get(&pane_id) {
+            let mut pane = pane.lock();
+            if pane.window_id == window_id {
+                if let Err(err) = pane.update_legacy_agent_identity(harness, variant) {
+                    log::error!("Failed to update legacy tmux pane identity: {err:#}");
+                }
+                return;
+            }
+        }
+        let mut pending = self.pending_agent_identity.lock();
+        let entry = pending.entry(pane_id).or_default();
+        if entry.window_id != window_id {
+            *entry = Default::default();
+            entry.window_id = window_id;
+        }
+        entry.legacy = Some((harness.to_string(), variant.to_string()));
     }
 
     pub fn update_pane_current_path(
@@ -339,15 +395,14 @@ impl TmuxDomainState {
             if let Some(identity) = identity.filter(|identity| identity.window_id == window_id) {
                 if let Some(remote) = self.remote_panes.lock().get(&remote_pane_id) {
                     let mut remote = remote.lock();
-                    if let Err(err) = remote
-                        .update_agent_identity("harness", identity.harness.as_deref().unwrap_or(""))
-                    {
-                        log::error!("Failed to restore tmux pane identity: {err:#}");
-                    }
-                    if let Err(err) = remote
-                        .update_agent_identity("variant", identity.variant.as_deref().unwrap_or(""))
-                    {
-                        log::error!("Failed to restore tmux pane identity: {err:#}");
+                    if let Some(value) = identity.value.filter(|value| !value.is_empty()) {
+                        if let Err(err) = remote.update_agent_identity(&value) {
+                            log::error!("Failed to restore tmux pane identity: {err:#}");
+                        }
+                    } else if let Some((harness, variant)) = identity.legacy {
+                        if let Err(err) = remote.update_legacy_agent_identity(&harness, &variant) {
+                            log::error!("Failed to restore legacy tmux pane identity: {err:#}");
+                        }
                     }
                 }
             }
@@ -489,8 +544,16 @@ impl TmuxDomainState {
             pane_left: pane.pane_left,
             pane_top: pane.pane_top,
             current_command: pane.current_command.clone(),
+            shell_identity_checked: false,
             agent_harness: String::new(),
             agent_variant: String::new(),
+            agent_label: String::new(),
+            agent_project: String::new(),
+            agent_repo: String::new(),
+            agent_worktree: String::new(),
+            agent_identity: String::new(),
+            agent_identity_version: 0,
+            retired_agent_identity_version: None,
             passthrough_pending: Vec::new(),
         }));
 
@@ -992,6 +1055,40 @@ impl TmuxDomainState {
             .detach();
             true
         });
+    }
+}
+
+#[derive(Debug)]
+struct ClearPaneAgentIdentity {
+    pane: TmuxPaneId,
+    shell: String,
+    stale_option: String,
+}
+
+impl TmuxCommand for ClearPaneAgentIdentity {
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        let condition = format!(
+            "#{{&&:#{{==:#{{pane_current_command}},{}}},#{{==:#{{@wezterm_agent_identity}},{}}}}}",
+            self.shell, self.stale_option,
+        );
+        let owner = self
+            .stale_option
+            .split('.')
+            .next()
+            .filter(|owner| !owner.is_empty())
+            .unwrap_or("MA==");
+        let tombstone = format!("{owner}......");
+        format!(
+            "if-shell -F -t %{pane} '{condition}' 'set-option -p -t %{pane} @wezterm_agent_identity {tombstone} ; set-option -p -u -t %{pane} @wezterm_agent_harness ; set-option -p -u -t %{pane} @wezterm_agent_variant'\n",
+            pane = self.pane,
+        )
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            anyhow::bail!("pane identity clear in domain={domain_id} failed: {result:#?}");
+        }
+        Ok(())
     }
 }
 
@@ -1550,7 +1647,7 @@ pub(crate) struct SubscribePaneAgentHarness;
 impl TmuxCommand for SubscribePaneAgentHarness {
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
-            "refresh-client -B '{}:%*:#{{@wezterm_agent_harness}}'\n",
+            "refresh-client -B '{}:%*:#{{@wezterm_agent_identity}}'\n",
             PANE_AGENT_HARNESS_SUBSCRIPTION
         )
     }
@@ -1564,19 +1661,21 @@ impl TmuxCommand for SubscribePaneAgentHarness {
 }
 
 #[derive(Debug)]
-pub(crate) struct SubscribePaneAgentVariant;
+pub(crate) struct SubscribePaneAgentLegacy;
 
-impl TmuxCommand for SubscribePaneAgentVariant {
+impl TmuxCommand for SubscribePaneAgentLegacy {
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
-            "refresh-client -B '{}:%*:#{{@wezterm_agent_variant}}'\n",
-            PANE_AGENT_VARIANT_SUBSCRIPTION
+            "refresh-client -B '{}:%*:#{{@wezterm_agent_harness}}|#{{@wezterm_agent_variant}}'\n",
+            PANE_AGENT_LEGACY_SUBSCRIPTION
         )
     }
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
-            anyhow::bail!("pane variant subscription in domain={domain_id} failed: {result:#?}");
+            anyhow::bail!(
+                "legacy pane identity subscription in domain={domain_id} failed: {result:#?}"
+            );
         }
         Ok(())
     }
@@ -2057,12 +2156,29 @@ mod test {
     fn pane_agent_identity_subscriptions_use_all_panes() {
         assert_eq!(
             SubscribePaneAgentHarness.get_command(0),
-            "refresh-client -B 'wezterm-pane-agent-harness:%*:#{@wezterm_agent_harness}'\n"
+            "refresh-client -B 'wezterm-pane-agent-harness:%*:#{@wezterm_agent_identity}'\n"
         );
         assert_eq!(
-            SubscribePaneAgentVariant.get_command(0),
-            "refresh-client -B 'wezterm-pane-agent-variant:%*:#{@wezterm_agent_variant}'\n"
+            SubscribePaneAgentLegacy.get_command(0),
+            "refresh-client -B 'wezterm-pane-agent-legacy:%*:#{@wezterm_agent_harness}|#{@wezterm_agent_variant}'\n"
         );
+    }
+
+    fn test_identity(version: u64, label: &str) -> String {
+        use base64::Engine;
+        [
+            version.to_string(),
+            "codex".into(),
+            "".into(),
+            label.into(),
+            "fisco".into(),
+            "fisco".into(),
+            "".into(),
+        ]
+        .iter()
+        .map(|field| base64::engine::general_purpose::STANDARD.encode(field))
+        .collect::<Vec<_>>()
+        .join(".")
     }
 
     // @fdb:remote-tmux-close-lifecycle-test
@@ -2111,6 +2227,107 @@ mod test {
     fn pane_command_changes_and_clears() {
         assert_eq!(pane_command("claude").as_deref(), Some("claude"));
         assert_eq!(pane_command(""), None);
+    }
+
+    #[test]
+    fn shell_after_killed_wrapper_clears_identity_before_next_command() {
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let domain = TmuxDomain::new(1);
+        *domain.inner.tmux_session.lock() = Some(1);
+        domain
+            .inner
+            .create_pane(
+                &parse_pane_item("$1\t@2\t%3\t0\t0\t0\t80\t24\t0\t0\t1\t0\t0\t0\t0\t0\tnode\t/tmp")
+                    .unwrap(),
+            )
+            .unwrap();
+        domain
+            .inner
+            .update_pane_agent_identity(1, 2, 3, &test_identity(10, "old"));
+        domain.inner.update_pane_current_command(1, 2, 3, "zsh");
+        domain
+            .inner
+            .update_pane_agent_identity(1, 2, 3, &test_identity(10, "old"));
+        domain.inner.update_pane_current_command(1, 2, 3, "python");
+
+        let pane = domain.inner.remote_panes.lock().get(&3).unwrap().clone();
+        assert_eq!(pane.lock().agent_harness, "");
+        let command = domain.inner.cmd_queue.lock().pop_front().unwrap();
+        assert_eq!(
+            command.get_command(domain.inner.domain_id),
+            format!("if-shell -F -t %3 '#{{&&:#{{==:#{{pane_current_command}},zsh}},#{{==:#{{@wezterm_agent_identity}},{}}}}}' 'set-option -p -t %3 @wezterm_agent_identity MTA=...... ; set-option -p -u -t %3 @wezterm_agent_harness ; set-option -p -u -t %3 @wezterm_agent_variant'\n", test_identity(10, "old"))
+        );
+    }
+
+    #[test]
+    fn new_wrapper_option_before_child_command_is_preserved() {
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let domain = TmuxDomain::new(1);
+        *domain.inner.tmux_session.lock() = Some(1);
+        domain
+            .inner
+            .create_pane(
+                &parse_pane_item("$1\t@2\t%3\t0\t0\t0\t80\t24\t0\t0\t1\t0\t0\t0\t0\t0\tnode\t/tmp")
+                    .unwrap(),
+            )
+            .unwrap();
+        domain
+            .inner
+            .update_pane_agent_identity(1, 2, 3, &test_identity(10, "old"));
+        domain.inner.update_pane_current_command(1, 2, 3, "zsh");
+        domain
+            .inner
+            .update_pane_agent_identity(1, 2, 3, &test_identity(10, "old"));
+        domain
+            .inner
+            .update_pane_agent_identity(1, 2, 3, &test_identity(11, "new"));
+        domain.inner.update_pane_current_command(1, 2, 3, "zsh");
+        domain.inner.update_pane_current_command(1, 2, 3, "node");
+
+        let pane = domain.inner.remote_panes.lock().get(&3).unwrap().clone();
+        assert_eq!(pane.lock().agent_harness, "codex");
+        assert_eq!(pane.lock().agent_label, "new");
+        domain
+            .inner
+            .update_pane_agent_identity(1, 2, 3, "MTA=......");
+        assert_eq!(pane.lock().agent_harness, "codex");
+        domain
+            .inner
+            .update_pane_agent_identity(1, 2, 3, "MTE=......");
+        domain
+            .inner
+            .update_pane_legacy_identity(1, 2, 3, "codex", "");
+        assert_eq!(pane.lock().agent_harness, "");
+    }
+
+    #[test]
+    fn legacy_wrapper_reconnect_and_shell_cleanup() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let domain = TmuxDomain::new(1);
+        *domain.inner.tmux_session.lock() = Some(1);
+        domain.inner.update_pane_agent_identity(1, 2, 3, "");
+        domain
+            .inner
+            .update_pane_legacy_identity(1, 2, 3, "codex", "");
+        let local = domain
+            .inner
+            .create_pane(
+                &parse_pane_item("$1\t@2\t%3\t0\t0\t0\t80\t24\t0\t0\t1\t0\t0\t0\t0\t0\tnode\t/tmp")
+                    .unwrap(),
+            )
+            .unwrap();
+        domain.inner.register_pane(&mux, &local, 3, 2);
+        let pane = domain.inner.remote_panes.lock().get(&3).unwrap().clone();
+        assert_eq!(pane.lock().agent_harness, "codex");
+        domain.inner.update_pane_current_command(1, 2, 3, "zsh");
+        domain
+            .inner
+            .update_pane_legacy_identity(1, 2, 3, "codex", "");
+        domain.inner.update_pane_current_command(1, 2, 3, "python");
+        assert_eq!(pane.lock().agent_harness, "");
     }
 
     #[test]

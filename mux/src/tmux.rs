@@ -4,8 +4,8 @@ use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
     KillPane, ListAllPanes, ListAllWindows, ListCommands, NewWindow, Resize, SplitPane,
-    SubscribePaneAgentHarness, SubscribePaneAgentVariant, SubscribePaneCommand, SubscribePaneCwd,
-    SwapWindow, TmuxCommand, PANE_AGENT_HARNESS_SUBSCRIPTION, PANE_AGENT_VARIANT_SUBSCRIPTION,
+    SubscribePaneAgentHarness, SubscribePaneAgentLegacy, SubscribePaneCommand, SubscribePaneCwd,
+    SwapWindow, TmuxCommand, PANE_AGENT_HARNESS_SUBSCRIPTION, PANE_AGENT_LEGACY_SUBSCRIPTION,
     PANE_COMMAND_SUBSCRIPTION, PANE_CWD_SUBSCRIPTION, PANE_TITLE_SUBSCRIPTION,
 };
 use crate::window::WindowId;
@@ -54,8 +54,16 @@ pub(crate) struct TmuxRemotePane {
     pub pane_left: u64,
     pub pane_top: u64,
     pub current_command: Option<String>,
+    pub shell_identity_checked: bool,
     pub agent_harness: String,
     pub agent_variant: String,
+    pub agent_label: String,
+    pub agent_project: String,
+    pub agent_repo: String,
+    pub agent_worktree: String,
+    pub agent_identity: String,
+    pub agent_identity_version: u64,
+    pub retired_agent_identity_version: Option<u64>,
     pub(crate) passthrough_pending: Vec<u8>,
 }
 
@@ -67,12 +75,76 @@ impl TmuxRemotePane {
         self.output_write.write_all(&data)
     }
 
-    pub fn update_agent_identity(&mut self, name: &str, value: &str) -> std::io::Result<()> {
-        match name {
-            "harness" => self.agent_harness = value.to_string(),
-            "variant" => self.agent_variant = value.to_string(),
-            _ => return Ok(()),
+    pub fn update_agent_identity(&mut self, value: &str) -> std::io::Result<()> {
+        if value.is_empty() {
+            if self.agent_identity.is_empty() {
+                return Ok(());
+            }
+            self.retired_agent_identity_version = Some(
+                self.retired_agent_identity_version
+                    .unwrap_or(0)
+                    .max(self.agent_identity_version),
+            );
+            self.agent_identity.clear();
+            self.agent_harness.clear();
+            self.agent_variant.clear();
+            self.agent_label.clear();
+            self.agent_project.clear();
+            self.agent_repo.clear();
+            self.agent_worktree.clear();
+            return self.rehydrate_agent_identity();
         }
+        let fields = value
+            .split('.')
+            .map(|field| base64::engine::general_purpose::STANDARD.decode(field))
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(fields) = fields else { return Ok(()) };
+        if fields.len() != 7 {
+            return Ok(());
+        }
+        let decoded = fields
+            .iter()
+            .map(|field| String::from_utf8(field.clone()))
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(decoded) = decoded else { return Ok(()) };
+        let Ok(version) = decoded[0].parse::<u64>() else {
+            return Ok(());
+        };
+        if self
+            .retired_agent_identity_version
+            .is_some_and(|retired| version <= retired)
+            || version < self.agent_identity_version
+        {
+            return Ok(());
+        }
+        self.agent_identity_version = version;
+        self.agent_identity = value.to_string();
+        self.agent_harness = decoded[1].clone();
+        self.agent_variant = decoded[2].clone();
+        self.agent_label = decoded[3].clone();
+        self.agent_project = decoded[4].clone();
+        self.agent_repo = decoded[5].clone();
+        self.agent_worktree = decoded[6].clone();
+        if self.agent_harness.is_empty() {
+            self.retired_agent_identity_version = Some(
+                self.retired_agent_identity_version
+                    .unwrap_or(0)
+                    .max(version),
+            );
+        }
+        self.rehydrate_agent_identity()
+    }
+
+    pub fn update_legacy_agent_identity(
+        &mut self,
+        harness: &str,
+        variant: &str,
+    ) -> std::io::Result<()> {
+        if self.agent_identity_version != 0 || self.retired_agent_identity_version.is_some() {
+            return Ok(());
+        }
+        self.agent_harness = harness.to_string();
+        self.agent_variant = variant.to_string();
         self.rehydrate_agent_identity()
     }
 
@@ -82,18 +154,33 @@ impl TmuxRemotePane {
                 self.current_command.as_deref(),
                 &self.agent_harness,
                 &self.agent_variant,
+                [
+                    &self.agent_label,
+                    &self.agent_project,
+                    &self.agent_repo,
+                    &self.agent_worktree,
+                ],
             )
             .as_bytes(),
         )
     }
 }
 
-fn agent_identity_osc(command: Option<&str>, harness: &str, variant: &str) -> String {
-    let shell = matches!(command, Some("sh" | "bash" | "zsh" | "fish"));
+fn agent_identity_osc(
+    command: Option<&str>,
+    harness: &str,
+    variant: &str,
+    metadata: [&str; 4],
+) -> String {
+    let shell = command.is_some_and(is_shell_command);
     let ready = command.is_some() && !shell;
     [
         ("AGENT_HARNESS", ready.then_some(harness).unwrap_or("")),
         ("AGENT_VARIANT", ready.then_some(variant).unwrap_or("")),
+        ("AGENT_LABEL", ready.then_some(metadata[0]).unwrap_or("")),
+        ("AGENT_PROJECT", ready.then_some(metadata[1]).unwrap_or("")),
+        ("AGENT_REPO", ready.then_some(metadata[2]).unwrap_or("")),
+        ("AGENT_WORKTREE", ready.then_some(metadata[3]).unwrap_or("")),
     ]
     .iter()
     .map(|&(name, value)| {
@@ -101,6 +188,10 @@ fn agent_identity_osc(command: Option<&str>, harness: &str, variant: &str) -> St
         format!("\x1b]1337;SetUserVar={name}={encoded}\x07")
     })
     .collect()
+}
+
+pub(crate) fn is_shell_command(command: &str) -> bool {
+    matches!(command, "sh" | "bash" | "zsh" | "fish")
 }
 
 pub(crate) type RefTmuxRemotePane = Arc<Mutex<TmuxRemotePane>>;
@@ -284,8 +375,8 @@ pub(crate) struct TmuxDomainState {
 #[derive(Default)]
 pub(crate) struct PendingAgentIdentity {
     pub(crate) window_id: TmuxWindowId,
-    pub(crate) harness: Option<String>,
-    pub(crate) variant: Option<String>,
+    pub(crate) value: Option<String>,
+    pub(crate) legacy: Option<(String, String)>,
 }
 
 #[cfg(test)]
@@ -362,12 +453,18 @@ mod tests {
 
     #[test]
     fn shell_panes_clear_persisted_agent_identity() {
-        let running = agent_identity_osc(Some("node"), "codex", "");
+        let running = agent_identity_osc(
+            Some("node"),
+            "codex",
+            "",
+            ["owner's review", "fisco", "fisco", ""],
+        );
         assert!(running.contains("SetUserVar=AGENT_HARNESS=Y29kZXg="));
-        let shell = agent_identity_osc(Some("fish"), "codex", "glm");
+        assert!(running.contains("SetUserVar=AGENT_LABEL=b3duZXIncyByZXZpZXc="));
+        let shell = agent_identity_osc(Some("fish"), "codex", "glm", ["", "", "", ""]);
         assert_eq!(
             shell,
-            "\x1b]1337;SetUserVar=AGENT_HARNESS=\x07\x1b]1337;SetUserVar=AGENT_VARIANT=\x07"
+            "\x1b]1337;SetUserVar=AGENT_HARNESS=\x07\x1b]1337;SetUserVar=AGENT_VARIANT=\x07\x1b]1337;SetUserVar=AGENT_LABEL=\x07\x1b]1337;SetUserVar=AGENT_PROJECT=\x07\x1b]1337;SetUserVar=AGENT_REPO=\x07\x1b]1337;SetUserVar=AGENT_WORKTREE=\x07"
         );
     }
 
@@ -787,7 +884,7 @@ impl TmuxDomainState {
                     cmd_queue.push_back(Box::new(SubscribePaneCwd));
                     cmd_queue.push_back(Box::new(SubscribePaneCommand));
                     cmd_queue.push_back(Box::new(SubscribePaneAgentHarness));
-                    cmd_queue.push_back(Box::new(SubscribePaneAgentVariant));
+                    cmd_queue.push_back(Box::new(SubscribePaneAgentLegacy));
 
                     self.subscribe_notification();
                     log::info!("tmux session changed:{}", session);
@@ -854,15 +951,15 @@ impl TmuxDomainState {
                         }
                     } else if name == PANE_AGENT_HARNESS_SUBSCRIPTION {
                         if let (Some(window), Some(pane)) = (window, pane) {
-                            self.update_pane_agent_identity(
-                                *session, *window, *pane, "harness", value,
-                            );
+                            self.update_pane_agent_identity(*session, *window, *pane, value);
                         }
-                    } else if name == PANE_AGENT_VARIANT_SUBSCRIPTION {
+                    } else if name == PANE_AGENT_LEGACY_SUBSCRIPTION {
                         if let (Some(window), Some(pane)) = (window, pane) {
-                            self.update_pane_agent_identity(
-                                *session, *window, *pane, "variant", value,
-                            );
+                            if let Some((harness, variant)) = value.split_once('|') {
+                                self.update_pane_legacy_identity(
+                                    *session, *window, *pane, harness, variant,
+                                );
+                            }
                         }
                     }
                 }
