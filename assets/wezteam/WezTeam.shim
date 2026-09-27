@@ -14,6 +14,9 @@ BIN="$DIR/wezteam-gui"
 	echo "Missing $BIN — build it first: cargo build -p wezterm-gui -p wezterm-mux-server" >&2
 	exit 1
 }
+
+# The mux server is never replaced here: that would kill every local pane.
+# Upgrade it explicitly with `make upgrade-server`.
 exec "$BIN" \
 	--config-file "$HOME/dev/test/wezterm-agent-poc/wezterm.lua" \
 	connect unix "$@"

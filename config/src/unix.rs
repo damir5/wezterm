@@ -116,16 +116,23 @@ impl UnixDomain {
     pub fn serve_command(&self) -> anyhow::Result<Vec<OsString>> {
         match self.serve_command.as_ref() {
             Some(cmd) => Ok(cmd.iter().map(Into::into).collect()),
-            None => Ok(vec![
-                std::env::current_exe()?
-                    .with_file_name(if cfg!(windows) {
-                        "wezterm-mux-server.exe"
-                    } else {
-                        "wezterm-mux-server"
-                    })
-                    .into_os_string(),
-                OsString::from("--daemonize"),
-            ]),
+            None => {
+                let name = if cfg!(windows) {
+                    "wezterm-mux-server.exe"
+                } else {
+                    "wezterm-mux-server"
+                };
+                // The fork pins its server outside the build tree
+                // (`make pin-server`), so a rebuild never changes which
+                // server a reconnect or CLI auto-start launches.
+                let pinned = RUNTIME_DIR.join("bin").join(name);
+                let server = if pinned.exists() {
+                    pinned
+                } else {
+                    std::env::current_exe()?.with_file_name(name)
+                };
+                Ok(vec![server.into_os_string(), OsString::from("--daemonize")])
+            }
         }
     }
 }

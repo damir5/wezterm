@@ -45,5 +45,16 @@ sockets, logs, and gui-sock discovery live under `~/.local/share/wezteam`,
 deliberately separate from stock wezterm (`~/.local/share/wezterm`) — the two
 mux codecs are incompatible and must never share a socket.
 
+Upgrading without losing panes (`assets/wezteam/upgrade.sh`):
+
+- `make swap-gui` builds and starts a new GUI and stops the old one only
+  after the new one shows every mux pane. Panes are untouched.
+- The mux server runs from the pinned copy `~/.local/share/wezteam/bin/`
+  (`make pin-server`), never from `target/debug`, so rebuilds do not change
+  which server starts. Restarting it kills every local pane:
+  `make upgrade-server` lists them and needs `CONFIRM=yes`.
+- Never start the GUI binary from a shell (nohup): LaunchServices does not
+  register it and the window accepts no typing. Use `open -n -a`.
+
 The sidebar is deliberately disabled for non-WebGpu windows; it must not reserve
 space or intercept input if it cannot be rendered.

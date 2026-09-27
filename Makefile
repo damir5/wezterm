@@ -32,7 +32,7 @@ APP_DIR := /Applications/WezTeam.app
 TARGET_DIR ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 CACHE_DAYS ?= 14
 
-.PHONY: install-app uninstall-app cache-size cache-gc install-cache-reminder remove-cache-reminder
+.PHONY: install-app uninstall-app swap-gui pin-server upgrade-server cache-size cache-gc install-cache-reminder remove-cache-reminder
 
 install-app: ## Install /Applications/WezTeam.app — NOT needed after rebuilds; the shim picks up new debug binaries at launch. Run only when icon/shim/plist change
 	mkdir -p "$(APP_DIR)/Contents/MacOS" "$(APP_DIR)/Contents/Resources"
@@ -45,6 +45,15 @@ install-app: ## Install /Applications/WezTeam.app — NOT needed after rebuilds;
 
 uninstall-app: ## Remove /Applications/WezTeam.app
 	rm -rf "$(APP_DIR)"
+
+swap-gui: ## Build and start a new GUI; stop the old one once the new one shows every pane
+	assets/wezteam/upgrade.sh gui
+
+pin-server: ## Build and pin the mux server under ~/.local/share/wezteam/bin; the running server is untouched
+	assets/wezteam/upgrade.sh pin-server
+
+upgrade-server: ## Restart the mux server on a fresh pinned build; kills local panes, needs CONFIRM=yes
+	assets/wezteam/upgrade.sh server
 
 cache-size: ## Show build cache size
 	@du -sh $(TARGET_DIR) 2>/dev/null || true

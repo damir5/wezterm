@@ -506,6 +506,11 @@ impl ClientDomain {
 
         ui.output_str("Checking server version\n");
         if let Err(err) = inner.client.verify_version_compat(&ui).await {
+            // A server upgraded while this client was away may speak another
+            // codec; listing panes over it would decode garbage.
+            if err.is::<crate::client::IncompatibleVersionError>() {
+                return Err(err);
+            }
             log::warn!("version check warning during reattach: {:#}", err);
         }
 
