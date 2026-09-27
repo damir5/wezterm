@@ -1029,6 +1029,12 @@ impl Parser {
         let event = match parse_line(&self.buffer) {
             Ok(event) => event,
             Err(err) => {
+                if !self.buffer.starts_with(b"%") {
+                    let line = String::from_utf8_lossy(&self.buffer).into_owned();
+                    log::warn!("tmux control stream ended with non-protocol line: {line}");
+                    self.buffer.clear();
+                    return Ok(Some(Event::Exit { reason: Some(line) }));
+                }
                 log::error!("Unrecognized tmux cc line: {}", err);
                 bail!("{}", String::from_utf8_lossy(&self.buffer));
             }
@@ -1091,6 +1097,19 @@ mod tests {
                 flags: 0,
             },
             parse_line(b"%end 12345 321 0").unwrap()
+        );
+    }
+
+    #[test]
+    fn non_protocol_line_ends_the_control_stream() {
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser
+                .advance_bytes(b"Shared connection to host closed.\n")
+                .unwrap(),
+            vec![Event::Exit {
+                reason: Some("Shared connection to host closed.".to_string())
+            }]
         );
     }
 
