@@ -56,5 +56,10 @@ Upgrading without losing panes (`assets/wezteam/upgrade.sh`):
 - Never start the GUI binary from a shell (nohup): LaunchServices does not
   register it and the window accepts no typing. Use `open -n -a`.
 
+Before any CLI QA, verify the target with `target/debug/wezterm cli list-clients`:
+the expected WezTeam GUI/server PIDs must appear. Never infer the target from
+the executable name; this fork hard-codes `~/.local/share/wezteam`, while an
+older binary may still target stock `~/.local/share/wezterm`.
+
 The sidebar is deliberately disabled for non-WebGpu windows; it must not reserve
 space or intercept input if it cannot be rendered.
