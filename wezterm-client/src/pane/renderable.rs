@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Underline};
 use termwiz::color::AnsiColor;
 use termwiz::image::{ImageCell, ImageData};
+use termwiz::hyperlink::Rule;
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
@@ -36,14 +37,56 @@ fn max_poll_interval(is_local: bool) -> Duration {
     }
 }
 
+fn apply_client_hyperlinks(line: &mut Line, rules: &[Rule]) {
+    line.invalidate_implicit_hyperlinks(line.current_seqno());
+    line.scan_and_create_hyperlinks(rules);
+}
+
+fn apply_client_hyperlinks_to_entry(entry: &mut LineEntry, rules: &[Rule]) {
+    let line = match entry {
+        LineEntry::Line(line) | LineEntry::LineAndFetching(line, _) | LineEntry::Stale(line) => {
+            line
+        }
+        LineEntry::Fetching(_) => return,
+    };
+    apply_client_hyperlinks(line, rules);
+}
+
 #[cfg(test)]
 mod test {
-    use super::{max_poll_interval, LOCAL_MAX_POLL_INTERVAL, MAX_POLL_INTERVAL};
+    use super::{
+        apply_client_hyperlinks, apply_client_hyperlinks_to_entry, max_poll_interval, Line,
+        LineEntry, Rule, LOCAL_MAX_POLL_INTERVAL, MAX_POLL_INTERVAL,
+    };
 
     #[test]
     fn only_local_mux_uses_five_second_poll_cap() {
         assert_eq!(max_poll_interval(true), LOCAL_MAX_POLL_INTERVAL);
         assert_eq!(max_poll_interval(false), MAX_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn client_rescans_lines_with_its_hyperlink_rules() {
+        let mut line: Line = "/tmp/project/src/main.rs".into();
+        line.scan_and_create_hyperlinks(&[]);
+
+        let rules = [Rule::new(r"(/\S+)", "file://$1").unwrap()];
+        apply_client_hyperlinks(&mut line, &rules);
+
+        assert!(line.has_hyperlink());
+    }
+
+    #[test]
+    fn client_rescans_cached_lines_with_its_hyperlink_rules() {
+        let mut entry = LineEntry::Line("/tmp/project/src/main.rs".into());
+        let rules = [Rule::new(r"(/\S+)", "file://$1").unwrap()];
+
+        apply_client_hyperlinks_to_entry(&mut entry, &rules);
+
+        let LineEntry::Line(line) = entry else {
+            unreachable!()
+        };
+        assert!(line.has_hyperlink());
     }
 }
 
@@ -513,7 +556,7 @@ impl RenderableInner {
         config: &ConfigHandle,
         fetch_start: Option<Instant>,
     ) {
-        line.scan_and_create_hyperlinks(&config.hyperlink_rules);
+        apply_client_hyperlinks(&mut line, &config.hyperlink_rules);
 
         let entry = if let Some(fetch_start) = fetch_start {
             // If we're completing a fetch, only replace entries that were
@@ -781,6 +824,15 @@ pub(crate) async fn hydrate_lines(
 }
 
 impl RenderableState {
+    pub fn apply_hyperlinks(&self, lines: Range<StableRowIndex>, rules: &[Rule]) {
+        let mut inner = self.inner.borrow_mut();
+        for row in lines {
+            if let Some(entry) = inner.lines.get_mut(&row) {
+                apply_client_hyperlinks_to_entry(entry, rules);
+            }
+        }
+    }
+
     pub fn get_cursor_position(&self) -> StableCursorPosition {
         self.inner.borrow().cursor_position
     }

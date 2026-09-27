@@ -366,8 +366,8 @@ impl Pane for ClientPane {
         mux::pane::impl_get_logical_lines_via_get_lines(self, lines)
     }
 
-    fn apply_hyperlinks(&self, _lines: Range<StableRowIndex>, _rules: &[Rule]) {
-        // RenderableInner::put_line scans fetched lines before caching them.
+    fn apply_hyperlinks(&self, lines: Range<StableRowIndex>, rules: &[Rule]) {
+        self.renderable.lock().apply_hyperlinks(lines, rules);
     }
 
     fn get_current_seqno(&self) -> SequenceNo {
