@@ -19,24 +19,43 @@ pub const COMPACT_MAX_WIDTH_PT: f32 = 120.0;
 pub const REGULAR_MIN_WIDTH_PT: f32 = 240.0;
 pub const REGULAR_MAX_WIDTH_PT: f32 = 520.0;
 
+fn click_tab_id(action: &DynamicValue) -> Option<TabId> {
+    let DynamicValue::Object(object) = action else {
+        return None;
+    };
+    object
+        .get_by_str("tab_id")
+        .and_then(DynamicValue::coerce_unsigned)
+        .map(|tab_id| tab_id as TabId)
+}
+
+fn click_pane_id(action: &DynamicValue) -> Option<PaneId> {
+    let DynamicValue::Object(object) = action else {
+        return None;
+    };
+    object
+        .get_by_str("pane_id")
+        .and_then(DynamicValue::coerce_unsigned)
+        .map(|pane_id| pane_id as PaneId)
+}
+
 fn activate_tab_id(action: &DynamicValue) -> Option<TabId> {
     let DynamicValue::Object(object) = action else {
         return None;
     };
-    matches!(object.get_by_str("action"), Some(DynamicValue::String(action)) if action == "activate-tab")
-        .then(|| object.get_by_str("tab_id").and_then(DynamicValue::coerce_unsigned))
+    matches!(object.get_by_str("action"), Some(DynamicValue::String(name)) if name == "activate-tab")
+        .then(|| click_tab_id(action))
         .flatten()
-        .map(|tab_id| tab_id as TabId)
 }
 
+#[cfg(test)]
 fn activate_pane_id(action: &DynamicValue) -> Option<PaneId> {
     let DynamicValue::Object(object) = action else {
         return None;
     };
-    matches!(object.get_by_str("action"), Some(DynamicValue::String(action)) if action == "activate-pane")
-        .then(|| object.get_by_str("pane_id").and_then(DynamicValue::coerce_unsigned))
+    matches!(object.get_by_str("action"), Some(DynamicValue::String(name)) if name == "activate-pane")
+        .then(|| click_pane_id(action))
         .flatten()
-        .map(|pane_id| pane_id as PaneId)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -421,20 +440,6 @@ impl TermWindow {
             self.mark_tab_sidebar_dirty();
             return;
         }
-        if let Some(tab_id) = activate_tab_id(&action) {
-            self.activate_sidebar_tab(tab_id);
-            return;
-        }
-        if let Some(pane_id) = activate_pane_id(&action) {
-            if let Err(err) = Mux::get().focus_pane_and_containing_tab(pane_id) {
-                log::warn!("activate-pane {pane_id}: {err:#}");
-                return;
-            }
-            self.request_terminal_repaint();
-            self.mark_tab_sidebar_dirty();
-            self.emit_status_event();
-            return;
-        }
         if let Some(target) = spawn_host_tab_target(&action) {
             let domain = match target {
                 SpawnHostTabTarget::DefaultDomain => {
@@ -449,6 +454,25 @@ impl TermWindow {
                 }
             };
             self.spawn_tab(&domain); // @fdb:fleet-navigation-and-gui-qa
+            return;
+        }
+        if let Some(pane_id) = click_pane_id(&action) {
+            if Mux::get().get_pane(pane_id).is_some() {
+                if let Err(err) = Mux::get().focus_pane_and_containing_tab(pane_id) {
+                    log::warn!("activate-pane {pane_id}: {err:#}");
+                } else if let Some(pane) = Mux::get().get_pane(pane_id) {
+                    pane.focus_changed(true);
+                }
+                let _ = self.ensure_live_active_pane();
+                self.request_terminal_repaint();
+                self.mark_tab_sidebar_dirty();
+                self.emit_status_event();
+                return;
+            }
+            log::warn!("sidebar pane {pane_id} is not in this mux");
+        }
+        if let Some(tab_id) = click_tab_id(&action) {
+            self.activate_sidebar_tab(tab_id);
             return;
         }
         self.emit_sidebar_action(action);
@@ -582,6 +606,19 @@ struct CallbackResult {
     refresh_after: Option<Duration>,
 }
 
+/// Tabs in the order their rows are drawn. Collapsed groups and filtered
+/// states have no rows, so relative navigation skips them.
+fn drawn_tab_ids(node: &UiNode, tab_ids: &mut Vec<TabId>) {
+    if let Some(tab_id) = node.on_click.as_ref().and_then(activate_tab_id) {
+        if !tab_ids.contains(&tab_id) {
+            tab_ids.push(tab_id);
+        }
+    }
+    for child in &node.children {
+        drawn_tab_ids(child, tab_ids);
+    }
+}
+
 fn validate_callback_entries(
     valid_tabs: &std::collections::HashSet<TabId>,
     entries: &HashMap<TabId, SidebarEntry>,
@@ -598,8 +635,16 @@ fn install_callback(
     callback: CallbackResult,
 ) -> anyhow::Result<Option<Duration>> {
     validate_callback_entries(valid_tabs, &callback.entries)?;
+    let mut tab_ids = vec![];
+    if let Some(tree) = &callback.ui_tree {
+        drawn_tab_ids(tree, &mut tab_ids);
+    }
+    sidebar.tab_ids = if tab_ids.is_empty() {
+        callback.tab_ids
+    } else {
+        tab_ids
+    };
     sidebar.ui_tree = callback.ui_tree;
-    sidebar.tab_ids = callback.tab_ids;
     sidebar.ui_target_layout = None;
     sidebar.ui_layout_size = None;
     Ok(callback.refresh_after)
@@ -849,24 +894,33 @@ mod tests {
     }
 
     #[test]
-    fn callback_order_wins_over_duplicated_layout_rows() {
+    fn relative_navigation_follows_drawn_rows_not_entry_order() {
         let lua = mlua::Lua::new();
         let value = lua
             .load("return { entries = {{tab_id=10}, {tab_id=20}, {tab_id=30}} }")
             .eval()
             .unwrap();
-        let callback = decode_callback(&lua, value).unwrap();
-        let mut layout_tabs = vec![];
-        for tab_id in [20, 10, 20, 30] {
-            if !layout_tabs.contains(&tab_id) {
-                layout_tabs.push(tab_id);
-            }
-        }
-        assert_eq!(relative_sidebar_tab_id(&layout_tabs, 10, 1, true), Some(30));
-        let sidebar = TabSidebar {
-            tab_ids: callback.tab_ids,
-            ..Default::default()
-        };
+        let mut callback = decode_callback(&lua, value).unwrap();
+        // Tab 30 sits in a collapsed group, so it has no row; tab 20 has a
+        // group header row and a tab row but is one navigation stop.
+        let tree = lua
+            .load(
+                "return { type='column', children = {
+                    { type='row', on_click={action='sidebar-action', kind='toggle-group'} },
+                    { type='row', on_click={action='activate-tab', tab_id=20} },
+                    { type='row', on_click={action='activate-tab', tab_id=10, pane_id=1} },
+                    { type='row', on_click={action='activate-tab', tab_id=20} },
+                } }",
+            )
+            .eval()
+            .unwrap();
+        callback.ui_tree = sidebar_ui::decode(tree, &lua).unwrap();
+        let valid = [10usize, 20, 30].iter().copied().collect();
+        let mut sidebar = TabSidebar::default();
+        install_callback(&mut sidebar, &valid, callback).unwrap();
+
+        assert_eq!(sidebar.tab_ids, vec![20, 10]);
+        assert_eq!(sidebar.relative_tab_id(20, 1, true), Some(10));
         assert_eq!(sidebar.relative_tab_id(10, 1, true), Some(20));
     }
 
@@ -902,5 +956,18 @@ mod tests {
             activate_pane_id(&luahelper::lua_value_to_dynamic(action).unwrap()),
             Some(42)
         );
+    }
+
+    #[test]
+    fn tab_action_can_carry_a_pane_id() {
+        let lua = mlua::Lua::new();
+        let action = lua
+            .load("return {action='activate-tab', tab_id=7, pane_id=42}")
+            .eval::<Value>()
+            .unwrap();
+        let action = luahelper::lua_value_to_dynamic(action).unwrap();
+        assert_eq!(activate_tab_id(&action), Some(7));
+        assert_eq!(click_tab_id(&action), Some(7));
+        assert_eq!(click_pane_id(&action), Some(42));
     }
 }
