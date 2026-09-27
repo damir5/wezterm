@@ -1598,6 +1598,18 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window"],
             icon: Some("md_fullscreen"),
         },
+        ActivateRecentTab(n) => CommandDef {
+            brief: if *n < 0 {
+                "Activate the next recently used tab".into()
+            } else {
+                "Activate the previous recently used tab".into()
+            },
+            doc: "Walks tabs in most-recently-used order while CTRL is held".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: None,
+        },
         ActivateLastTab => CommandDef {
             brief: "Activate the last active tab".into(),
             doc: "If there was no prior active tab, has no effect.".into(),

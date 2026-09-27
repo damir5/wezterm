@@ -10,7 +10,8 @@ pub struct Window {
     id: WindowId,
     tabs: Vec<Arc<Tab>>,
     active_tab_idx: usize,
-    last_active_tab_id: Option<TabId>,
+    /// Previously active tabs, most recent first.
+    recent_tab_ids: Vec<TabId>,
     workspace: String,
     title: String,
     initial_position: Option<GuiPosition>,
@@ -23,7 +24,7 @@ impl Window {
             id: WIN_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed),
             tabs: vec![],
             active_tab_idx: 0,
-            last_active_tab_id: None,
+            recent_tab_ids: vec![],
             title: String::new(),
             workspace: workspace.unwrap_or_else(|| Mux::get().active_workspace()),
             initial_position,
@@ -271,6 +272,7 @@ impl Window {
             }
         }
         let tab = self.tabs.remove(idx);
+        self.recent_tab_ids.retain(|&id| id != tab.tab_id());
         self.fixup_active_tab_after_removal(active);
         tab
     }
@@ -290,19 +292,41 @@ impl Window {
 
     /// Remember current tab as the "last active" tab.
     pub fn remember_current_as_last_active_tab(&mut self) {
-        self.last_active_tab_id = self
-            .get_tab_at_idx(self.active_tab_idx)
-            .map(|tab| tab.tab_id());
+        if let Some(tab_id) = self.get_tab_at_idx(self.active_tab_idx).map(|tab| tab.tab_id()) {
+            self.remember_tab_as_last_active(tab_id);
+        }
+    }
+
+    /// Put `tab_id` at the front of the recently used list.
+    pub fn remember_tab_as_last_active(&mut self, tab_id: TabId) {
+        self.recent_tab_ids.retain(|&id| id != tab_id);
+        self.recent_tab_ids.insert(0, tab_id);
     }
 
     /// Return index of previously active tab, if any.
-    #[inline]
     pub fn get_last_active_tab_idx(&self) -> Option<usize> {
-        if let Some(tab_id) = self.last_active_tab_id {
-            self.get_tab_idx_for_id(tab_id)
-        } else {
-            None
+        let active = self.get_active_tab().map(|tab| tab.tab_id());
+        self.recent_tab_ids
+            .iter()
+            .filter(|&&id| Some(id) != active)
+            .find_map(|&id| self.get_tab_idx_for_id(id))
+    }
+
+    /// All tabs, most recently used first: the active tab, then previously
+    /// active tabs, then never-visited tabs in window order.
+    pub fn tabs_by_recent_use(&self) -> Vec<TabId> {
+        let mut ids: Vec<TabId> = self.get_active_tab().map(|tab| tab.tab_id()).into_iter().collect();
+        for &id in &self.recent_tab_ids {
+            if !ids.contains(&id) && self.get_tab_idx_for_id(id).is_some() {
+                ids.push(id);
+            }
         }
+        for tab in &self.tabs {
+            if !ids.contains(&tab.tab_id()) {
+                ids.push(tab.tab_id());
+            }
+        }
+        ids
     }
 
     /// Remember current tab as the "last active" tab, then make tab at given index active.
@@ -390,5 +414,35 @@ fn pane_input_rank(pane: &Arc<dyn Pane>) -> u8 {
         Some(controller) if controller == pane_id => 2,
         Some(_) => 0,
         None => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tabs_by_recent_use_puts_last_focused_tabs_first() {
+        let _mux_guard = crate::tmux::MUX_TEST_LOCK.lock();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let mut window = Window::new(Some("default".into()), None);
+        let tabs: Vec<_> = (0..4)
+            .map(|_| Arc::new(Tab::new(&Default::default())))
+            .collect();
+        for tab in &tabs {
+            window.push_tab(tab);
+        }
+        let id = |idx: usize| tabs[idx].tab_id();
+
+        window.remember_and_set_active_tab_idx(2);
+        window.remember_and_set_active_tab_idx(1);
+        // Ctrl+Tab steps back through the tabs in the order they were used,
+        // and still reaches tabs never visited.
+        assert_eq!(window.tabs_by_recent_use(), vec![id(1), id(2), id(0), id(3)]);
+        assert_eq!(window.get_last_active_tab_idx(), Some(2));
+
+        window.remove_tab_idx(2);
+        assert_eq!(window.tabs_by_recent_use(), vec![id(1), id(0), id(3)]);
     }
 }

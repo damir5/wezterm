@@ -555,6 +555,9 @@ pub enum KeyAssignment {
     ResetFontAndWindowSize,
     ActivateTab(isize),
     ActivateLastTab,
+    /// Step through tabs in most-recently-used order; the walk is committed
+    /// when CTRL is released. Negative steps walk forward again.
+    ActivateRecentTab(isize),
     SendString(String),
     SendKey(KeyNoAction),
     Nop,

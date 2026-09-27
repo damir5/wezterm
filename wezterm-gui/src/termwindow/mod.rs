@@ -434,6 +434,12 @@ mod window_event_tests {
     }
 }
 
+/// Tabs in recently used order when the walk began, and the current step.
+struct TabCycle {
+    order: Vec<TabId>,
+    position: usize,
+}
+
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
@@ -471,6 +477,8 @@ pub struct TermWindow {
     /// Last resize issued by `fit_active_tab`, so a mismatch the mux cannot
     /// resolve is retried once instead of on every frame.
     last_tab_fit: Option<resize::TabFit>,
+    /// Ctrl+Tab walk through recently used tabs, committed on Ctrl release.
+    tab_cycle: Option<TabCycle>,
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
@@ -862,6 +870,7 @@ impl TermWindow {
             tab_sidebar_refresh_queued: false,
             tab_sidebar_enabled,
             last_tab_fit: None,
+            tab_cycle: None,
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -1095,6 +1104,9 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::FocusChanged(focused) => {
+                if !focused {
+                    self.commit_tab_cycle();
+                }
                 self.focus_changed(focused, window);
                 Ok(true)
             }
@@ -1129,6 +1141,9 @@ impl TermWindow {
             }
             WindowEvent::AdviseModifiersLedStatus(modifiers, leds) => {
                 self.current_modifier_and_leds = (modifiers, leds);
+                if !modifiers.contains(::window::Modifiers::CTRL) {
+                    self.commit_tab_cycle();
+                }
                 self.update_title();
                 window.invalidate();
                 Ok(true)
@@ -2463,6 +2478,49 @@ impl TermWindow {
         self.activate_tab(tab)
     }
 
+    /// Like the macOS app switcher: while CTRL is held each press steps
+    /// further back through recently used tabs without reordering them.
+    fn activate_recent_tab(&mut self, delta: isize) -> anyhow::Result<()> {
+        let mux = Mux::get();
+        let mut window = mux
+            .get_window_mut(self.mux_window_id)
+            .ok_or_else(|| anyhow!("no such window"))?;
+        let active = window.get_active_tab().map(|tab| tab.tab_id());
+        let cycle = match self.tab_cycle.take() {
+            Some(cycle) if active == cycle.order.get(cycle.position).copied() => cycle,
+            _ => TabCycle {
+                order: window.tabs_by_recent_use(),
+                position: 0,
+            },
+        };
+        let len = cycle.order.len() as isize;
+        ensure!(len > 0, "no more tabs");
+        let position = (cycle.position as isize + delta).rem_euclid(len) as usize;
+        if let Some(idx) = window.get_tab_idx_for_id(cycle.order[position]) {
+            window.set_active_tab_idx_without_saving(idx);
+        }
+        drop(window);
+        self.tab_cycle = Some(TabCycle { position, ..cycle });
+        if let Some(pane) = self.ensure_live_active_pane() {
+            pane.focus_changed(true);
+        }
+        self.update_title();
+        self.update_scrollbar();
+        Ok(())
+    }
+
+    fn commit_tab_cycle(&mut self) {
+        let Some(cycle) = self.tab_cycle.take() else {
+            return;
+        };
+        if cycle.position == 0 {
+            return;
+        }
+        if let Some(mut window) = Mux::get().get_window_mut(self.mux_window_id) {
+            window.remember_tab_as_last_active(cycle.order[0]);
+        }
+    }
+
     fn activate_last_tab(&mut self) -> anyhow::Result<()> {
         let mux = Mux::get();
         let window = mux
@@ -2950,6 +3008,7 @@ impl TermWindow {
                 self.activate_tab_relative(*n, false)?;
             }
             ActivateLastTab => self.activate_last_tab()?,
+            ActivateRecentTab(n) => self.activate_recent_tab(*n)?,
             DecreaseFontSize => self.decrease_font_size(),
             IncreaseFontSize => self.increase_font_size(),
             ResetFontSize => self.reset_font_size(),
