@@ -468,6 +468,9 @@ pub struct TermWindow {
     tab_sidebar: tab_sidebar::TabSidebar,
     tab_sidebar_refresh_queued: bool,
     tab_sidebar_enabled: bool,
+    /// Last resize issued by `fit_active_tab`, so a mismatch the mux cannot
+    /// resolve is retried once instead of on every frame.
+    last_tab_fit: Option<resize::TabFit>,
     fancy_tab_bar: Option<box_model::ComputedElement>,
     pub right_status: String,
     pub left_status: String,
@@ -858,6 +861,7 @@ impl TermWindow {
             },
             tab_sidebar_refresh_queued: false,
             tab_sidebar_enabled,
+            last_tab_fit: None,
             fancy_tab_bar: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -1411,37 +1415,12 @@ impl TermWindow {
                     alert: Alert::ToastNotification { .. },
                     ..
                 } => {}
-                MuxNotification::TabAddedToWindow {
-                    window_id: _,
-                    tab_id,
-                } => {
+                MuxNotification::TabAddedToWindow { .. } => {
                     self.mark_tab_sidebar_dirty();
-                    let mux = Mux::get();
-                    let mut size = self.terminal_size;
-                    if let Some(tab) = mux.get_tab(tab_id) {
-                        // If we attached to a remote domain and loaded in
-                        // a tab async, we need to fixup its size, either
-                        // by resizing it or resizes ourselves.
-                        // The strategy here is to adjust both by taking
-                        // the maximal size in both horizontal and vertical
-                        // dimensions and applying that. In practice that
-                        // means that a new local client will resize larger
-                        // to adjust to the size of an existing client.
-                        let tab_size = tab.get_size();
-                        size.rows = size.rows.max(tab_size.rows);
-                        size.cols = size.cols.max(tab_size.cols);
-
-                        if size.rows != self.terminal_size.rows
-                            || size.cols != self.terminal_size.cols
-                            || size.pixel_width != self.terminal_size.pixel_width
-                            || size.pixel_height != self.terminal_size.pixel_height
-                        {
-                            self.set_window_size(size, window)?;
-                        } else if tab_size.dpi == 0 {
-                            log::debug!("fixup dpi in newly added tab");
-                            tab.resize(self.terminal_size);
-                        }
-                    }
+                    // The window keeps its size; the tab is fitted to it by
+                    // `fit_active_tab` when it is shown. Growing the window to
+                    // a larger tab fails once the window fills the screen.
+                    self.fit_active_tab();
                     self.emit_status_event();
                 }
                 MuxNotification::PaneOutput(pane_id) => {

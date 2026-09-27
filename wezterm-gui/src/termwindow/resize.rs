@@ -2,10 +2,16 @@ use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
+use mux::pane::PaneId;
+use mux::tab::TabId;
 use mux::Mux;
 use std::rc::Rc;
 use wezterm_font::FontConfiguration;
 use wezterm_term::TerminalSize;
+
+/// Active tab, its size, and the first pane whose reported size differs
+/// from its layout, as seen when `fit_active_tab` last resized.
+pub type TabFit = (TabId, TerminalSize, Option<(PaneId, usize, usize)>);
 
 #[derive(Debug, Clone, Copy)]
 pub struct RowsAndCols {
@@ -68,6 +74,31 @@ impl super::TermWindow {
             modal.reconfigure(self);
         }
         self.emit_window_event("window-resized", None);
+    }
+
+    /// Make the active tab match the window. Covers tabs added or restored
+    /// at another size, hidden tabs skipped by `apply_dimensions`, and panes
+    /// whose mux-reported size diverged (eg: a resize lost while reconnecting).
+    pub fn fit_active_tab(&mut self) {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        let stale = tab.iter_panes().into_iter().find_map(|pos| {
+            let dims = pos.pane.get_dimensions();
+            (dims.cols != pos.width || dims.viewport_rows != pos.height)
+                .then(|| (pos.pane.pane_id(), dims.cols, dims.viewport_rows))
+        });
+        let tab_size = tab.get_size();
+        if tab_size == self.terminal_size && stale.is_none() {
+            self.last_tab_fit = None;
+            return;
+        }
+        let attempt = (tab.tab_id(), tab_size, stale);
+        if self.last_tab_fit == Some(attempt) {
+            return;
+        }
+        self.last_tab_fit = Some(attempt);
+        tab.resize(self.terminal_size);
     }
 
     pub fn apply_pending_scale_changes(&mut self) {
@@ -294,12 +325,9 @@ impl super::TermWindow {
 
         self.terminal_size = size;
 
-        let mux = Mux::get();
-        if let Some(window) = mux.get_window(self.mux_window_id) {
-            for tab in window.iter_tabs() {
-                tab.resize(size);
-            }
-        };
+        // Hidden tabs are fitted by `fit_active_tab` when shown; resizing
+        // them on every live-resize frame makes each app redraw for nothing.
+        self.fit_active_tab();
         self.resize_overlays();
         self.invalidate_fancy_tab_bar();
         self.update_title();

@@ -466,6 +466,17 @@ impl TmuxDomainState {
         Ok(())
     }
 
+    fn refresh_pane_sizes(&self, panes: &[PaneItem]) {
+        let pane_map = self.remote_panes.lock();
+        for item in panes {
+            if let Some(pane) = pane_map.get(&item.pane_id) {
+                let mut pane = pane.lock();
+                pane.pane_width = item.pane_width;
+                pane.pane_height = item.pane_height;
+            }
+        }
+    }
+
     fn remove_detached_pane(
         &self,
         window_id: TmuxWindowId,
@@ -1248,6 +1259,7 @@ impl TmuxCommand for ListAllPanes {
                 if !self.prune {
                     return tmux_domain.inner.sync_pane_state(&items);
                 } else {
+                    tmux_domain.inner.refresh_pane_sizes(&items);
                     return tmux_domain
                         .inner
                         .remove_detached_pane(self.window_id, &pane_set);
@@ -1394,17 +1406,16 @@ impl TmuxCommand for Resize {
 
         let pane_map = tmux_domain.inner.remote_panes.lock();
         {
-            let mut pane = match pane_map.get(&self.pane_id) {
+            let pane = match pane_map.get(&self.pane_id) {
                 Some(x) => x.lock(),
                 None => return "".to_string(),
             };
 
+            // The cached size changes only when tmux reports it (list-panes),
+            // so a resize tmux did not apply is sent again next time.
             if pane.pane_width == self.size.cols as u64 && pane.pane_height == self.size.rows as u64
             {
                 return "".to_string();
-            } else {
-                pane.pane_width = self.size.cols as u64;
-                pane.pane_height = self.size.rows as u64;
             }
         }
 
@@ -2644,6 +2655,14 @@ mod test {
         assert!(encoded.contains("resize-window -x 120 -y 40"));
         assert!(!encoded.contains("resize-pane"));
         assert_eq!(encoded.matches('\n').count(), 1);
+        // A resize counts as applied only once tmux reports the new size;
+        // otherwise a resize tmux ignored would never be sent again.
+        assert_eq!(replay.get_command(domain.inner.domain_id), encoded);
+        domain.inner.refresh_pane_sizes(&[parse_pane_item(
+            "$1\t@2\t%3\t0\t0\t0\t120\t40\t0\t0\t1\t0\t0\t0\t0\t0\tclaude\t/tmp",
+        )
+        .unwrap()]);
+        assert_eq!(replay.get_command(domain.inner.domain_id), "");
         assert_eq!(
             queue
                 .pop_front()

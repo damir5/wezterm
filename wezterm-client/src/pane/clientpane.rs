@@ -20,7 +20,9 @@ use ratelim::RateLimiter;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use termwiz::hyperlink::Rule;
 use termwiz::input::KeyEvent;
 use termwiz::surface::SequenceNo;
@@ -45,6 +47,10 @@ fn apply_process_info_update(
     }
 }
 
+/// A window drag produces a resize per frame; the server only needs the size
+/// the drag settles on. Each resize makes the app in the pane redraw.
+const RESIZE_QUIET_PERIOD: Duration = Duration::from_millis(50);
+
 pub struct ClientPane {
     client: Arc<ClientInner>,
     local_pane_id: PaneId,
@@ -65,6 +71,8 @@ pub struct ClientPane {
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
     foreground_process_info: Mutex<Option<procinfo::LocalProcessInfo>>,
+    /// Bumped per requested size; only the latest request is sent.
+    resize_generation: Arc<AtomicU64>,
 }
 
 impl ClientPane {
@@ -152,6 +160,7 @@ impl ClientPane {
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
             foreground_process_info: Mutex::new(None),
+            resize_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -488,8 +497,15 @@ impl Pane for ClientPane {
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             let remote_tab_id = self.remote_tab_id;
+            let resize_generation = Arc::clone(&self.resize_generation);
+            let generation = resize_generation.fetch_add(1, Ordering::Relaxed) + 1;
             promise::spawn::spawn(async move {
-                client
+                smol::Timer::after(RESIZE_QUIET_PERIOD).await;
+                if resize_generation.load(Ordering::Relaxed) != generation {
+                    return;
+                }
+                // The GUI re-sends when the pane's reported size stays wrong.
+                if let Err(err) = client
                     .client
                     .resize(Resize {
                         containing_tab_id: remote_tab_id,
@@ -497,6 +513,9 @@ impl Pane for ClientPane {
                         size,
                     })
                     .await
+                {
+                    log::warn!("resize remote pane {remote_pane_id} to {size:?}: {err:#}");
+                }
             })
             .detach();
             inner.update_last_send();
