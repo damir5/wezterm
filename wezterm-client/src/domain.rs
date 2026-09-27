@@ -516,7 +516,7 @@ impl ClientDomain {
 
         ui.output_str("Requesting pane list...\n");
         let panes = inner.client.list_panes().await?;
-        Self::process_pane_list(Arc::clone(&inner), panes, None)?;
+        Self::process_pane_list(Arc::clone(&inner), panes, None, true)?;
 
         ui.close();
         Ok(())
@@ -525,7 +525,7 @@ impl ClientDomain {
     pub async fn resync(&self) -> anyhow::Result<()> {
         if let Some(inner) = self.inner() {
             let panes = inner.client.list_panes().await?;
-            Self::process_pane_list(inner, panes, None)?;
+            Self::process_pane_list(inner, panes, None, false)?;
         }
         Ok(())
     }
@@ -554,6 +554,7 @@ impl ClientDomain {
         inner: Arc<ClientInner>,
         panes: ListPanesResponse,
         mut primary_window_id: Option<WindowId>,
+        reestablish_existing: bool,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
         log::debug!(
@@ -633,12 +634,18 @@ impl ClientDomain {
                         match mux.get_pane(pane_id) {
                             Some(pane) => {
                                 if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
-                                    client_pane.set_remote_controller_pane_id(entry.controller_pane_id);
+                                    client_pane
+                                        .set_remote_controller_pane_id(entry.controller_pane_id);
                                     client_pane.set_current_working_dir(
                                         entry.working_dir.clone().map(Into::into),
                                     );
-                                    inner.record_remote_to_local_pane_mapping(entry.pane_id, pane_id);
-                                    client_pane.reestablish_and_backfill();
+                                    inner.record_remote_to_local_pane_mapping(
+                                        entry.pane_id,
+                                        pane_id,
+                                    );
+                                    if reestablish_existing {
+                                        client_pane.reestablish_and_backfill();
+                                    }
                                 }
                                 pane
                             }
@@ -827,7 +834,7 @@ impl ClientDomain {
         ));
         *domain.inner.lock().unwrap() = Some(Arc::clone(&inner));
 
-        Self::process_pane_list(inner, panes, primary_window_id)?;
+        Self::process_pane_list(inner, panes, primary_window_id, false)?;
 
         Ok(())
     }
