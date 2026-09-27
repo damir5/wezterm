@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use codec::*;
 use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
 use filedescriptor::FileDescriptor;
-use futures::FutureExt;
+use futures::AsyncReadExt;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
@@ -15,11 +15,12 @@ use mux::ssh::ssh_connect_with_ui;
 use mux::Mux;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
+use parking_lot::{Mutex, RwLock};
 use portable_pty::Child;
-use parking_lot::RwLock;
 use smol::channel::{bounded, unbounded, Receiver, Sender};
 use smol::prelude::*;
 use smol::{block_on, Async};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::marker::Unpin;
@@ -106,7 +107,6 @@ enum ReaderMessage {
         pdu: Pdu,
         promise: Sender<anyhow::Result<Pdu>>,
     },
-    Readable,
 }
 
 #[derive(Clone)]
@@ -408,7 +408,7 @@ async fn client_thread_async(
     local_domain_id: Option<DomainId>,
     rx: &mut Receiver<ReaderMessage>,
 ) -> anyhow::Result<()> {
-    let mut next_serial = 1u64;
+    let next_serial = Cell::new(1u64);
 
     struct Promises {
         map: HashMap<u64, Sender<anyhow::Result<Pdu>>>,
@@ -428,85 +428,83 @@ async fn client_thread_async(
             self.fail_all("Client was destroyed");
         }
     }
-    let mut promises = Promises {
+    let promises = Mutex::new(Promises {
         map: HashMap::new(),
-    };
+    });
 
-    let mut stream = reconnectable.take_stream().unwrap();
+    let stream = reconnectable.take_stream().unwrap();
+    let (mut reader, mut writer) = stream.split();
 
-    loop {
-        let rx_msg = rx.recv();
-        let wait_for_read = stream
-            .wait_for_readable()
-            .map(|_| Ok(ReaderMessage::Readable));
+    let write = async {
+        loop {
+            if let Ok(ReaderMessage::SendPdu { pdu, promise }) = rx.recv().await {
+                let serial = next_serial.get();
+                next_serial.set(serial + 1);
+                promises.lock().map.insert(serial, promise);
 
-        match smol::future::or(rx_msg, wait_for_read).await {
-            Ok(ReaderMessage::SendPdu { pdu, promise }) => {
-                let serial = next_serial;
-                next_serial += 1;
-                promises.map.insert(serial, promise);
-
-                pdu.encode_async(&mut stream, serial)
+                pdu.encode_async(&mut writer, serial)
                     .await
                     .context("encoding a PDU to send to the server")?;
-                stream.flush().await.context("flushing PDU to server")?;
-            }
-            Ok(ReaderMessage::Readable) => {
-                match Pdu::decode_async(&mut stream, Some(next_serial)).await {
-                    Ok(decoded) => {
-                        log::debug!(
-                            "decoded serial {} {}",
-                            decoded.serial,
-                            decoded.pdu.pdu_name()
-                        );
-                        if decoded.serial == 0 {
-                            process_unilateral(local_domain_id, decoded)
-                                .context("processing unilateral PDU from server")
-                                .map_err(|e| {
-                                    log::error!("process_unilateral: {:?}", e);
-                                    e
-                                })?;
-                        } else if let Some(promise) = promises.map.remove(&decoded.serial) {
-                            let error = match &decoded.pdu {
-                                Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                                    Some(reason.clone())
-                                }
-                                _ => None,
-                            };
-                            if promise.try_send(Ok(decoded.pdu)).is_err() {
-                                if let Some(reason) = error {
-                                    log::error!(
-                                        "unobserved error response for serial {}: {}",
-                                        decoded.serial,
-                                        reason
-                                    );
-                                } else {
-                                    log::debug!(
-                                        "promise for serial {} was dropped by caller",
-                                        decoded.serial
-                                    );
-                                }
-                            }
-                        } else {
-                            let reason =
-                                format!("got serial {:?} without a corresponding promise", decoded);
-                            promises.fail_all(&reason);
-                            anyhow::bail!("{}", reason);
-                        }
-                    }
-                    Err(err) => {
-                        let reason = format!("Error while decoding response pdu: {:#}", err);
-                        log::error!("{}", reason);
-                        promises.fail_all(&reason);
-                        return Err(err).context("Error while decoding response pdu");
-                    }
-                }
-            }
-            Err(_) => {
-                return Err(NotReconnectableError::ClientWasDestroyed.into());
+                writer.flush().await.context("flushing PDU to server")?;
+            } else {
+                return Err::<(), anyhow::Error>(NotReconnectableError::ClientWasDestroyed.into());
             }
         }
-    }
+    };
+    let read = async {
+        loop {
+            match Pdu::decode_async(&mut reader, Some(next_serial.get())).await {
+                Ok(decoded) => {
+                    log::debug!(
+                        "decoded serial {} {}",
+                        decoded.serial,
+                        decoded.pdu.pdu_name()
+                    );
+                    if decoded.serial == 0 {
+                        process_unilateral(local_domain_id, decoded)
+                            .context("processing unilateral PDU from server")
+                            .map_err(|e| {
+                                log::error!("process_unilateral: {:?}", e);
+                                e
+                            })?;
+                    } else if let Some(promise) = promises.lock().map.remove(&decoded.serial) {
+                        let error = match &decoded.pdu {
+                            Pdu::ErrorResponse(ErrorResponse { reason }) => Some(reason.clone()),
+                            _ => None,
+                        };
+                        if promise.try_send(Ok(decoded.pdu)).is_err() {
+                            if let Some(reason) = error {
+                                log::error!(
+                                    "unobserved error response for serial {}: {}",
+                                    decoded.serial,
+                                    reason
+                                );
+                            } else {
+                                log::debug!(
+                                    "promise for serial {} was dropped by caller",
+                                    decoded.serial
+                                );
+                            }
+                        }
+                    } else {
+                        let reason =
+                            format!("got serial {:?} without a corresponding promise", decoded);
+                        promises.lock().fail_all(&reason);
+                        anyhow::bail!("{}", reason);
+                    }
+                }
+                Err(err) => {
+                    let reason = format!("Error while decoding response pdu: {:#}", err);
+                    log::error!("{}", reason);
+                    promises.lock().fail_all(&reason);
+                    return Err::<(), anyhow::Error>(err)
+                        .context("Error while decoding response pdu");
+                }
+            }
+        }
+    };
+    futures::try_join!(write, read)?;
+    Ok(())
 }
 
 pub fn unix_connect_with_retry(
@@ -1515,14 +1513,68 @@ mod test {
         }
 
         for expected_pane_id in [1, 2] {
-            let ReaderMessage::SendPdu { pdu, .. } = receiver.try_recv().unwrap() else {
-                panic!("expected queued PDU");
-            };
+            let ReaderMessage::SendPdu { pdu, .. } = receiver.try_recv().unwrap();
             let Pdu::WriteToPane(request) = pdu else {
                 panic!("expected WriteToPane");
             };
             assert_eq!(request.pane_id, expected_pane_id);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_requests_and_responses_make_progress_together() {
+        let (client_stream, server_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (sender, mut receiver) = unbounded();
+        let mut reconnectable = Reconnectable::new(
+            ClientDomainConfig::Unix(UnixDomain::default()),
+            Some(Box::new(Async::new(client_stream).unwrap())),
+        );
+        let client = thread::spawn(move || client_thread(&mut reconnectable, None, &mut receiver));
+
+        let server = thread::spawn(move || {
+            block_on(async move {
+                let mut stream = Async::new(server_stream).unwrap();
+                for _ in 0..16 {
+                    let request = Pdu::decode_async(&mut stream, None).await.unwrap();
+                    assert!(matches!(request.pdu, Pdu::WriteToPane(_)));
+                    Pdu::ErrorResponse(ErrorResponse {
+                        reason: "response".repeat(512),
+                    })
+                    .encode_async(&mut stream, request.serial)
+                    .await
+                    .unwrap();
+                    stream.flush().await.unwrap();
+                }
+            });
+        });
+
+        let mut replies = Vec::new();
+        for _ in 0..16 {
+            let (promise, reply) = bounded(1);
+            sender
+                .try_send(ReaderMessage::SendPdu {
+                    pdu: Pdu::WriteToPane(WriteToPane {
+                        pane_id: 1,
+                        data: vec![b'x'; 4096],
+                    }),
+                    promise,
+                })
+                .unwrap();
+            replies.push(reply);
+        }
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let received = replies
+                .into_iter()
+                .all(|reply| matches!(block_on(reply.recv()), Ok(Ok(Pdu::ErrorResponse(_)))));
+            let _ = done_tx.send(received);
+        });
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        drop(sender);
+        server.join().unwrap();
+        let _ = client.join();
     }
 
     #[test]
