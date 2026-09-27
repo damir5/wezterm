@@ -975,10 +975,7 @@ impl Mux {
     }
 
     pub fn prune_dead_windows(&self) {
-        if Activity::count() > 0 {
-            log::trace!("prune_dead_windows: Activity::count={}", Activity::count());
-            return;
-        }
+        let activity = Activity::count();
         let live_tab_ids: Vec<TabId> = self.tabs.read().keys().cloned().collect();
         let mut dead_windows = vec![];
         let dead_tab_ids: Vec<TabId>;
@@ -987,8 +984,13 @@ impl Mux {
             let mut windows = match self.windows.try_write() {
                 Some(w) => w,
                 None => {
-                    // It's ok if our caller already locked it; we can prune later.
                     log::trace!("prune_dead_windows: self.windows already borrowed");
+                    promise::spawn::spawn_into_main_thread(async move {
+                        if let Some(mux) = Mux::try_get() {
+                            mux.prune_dead_windows();
+                        }
+                    })
+                    .detach();
                     return;
                 }
             };
@@ -996,7 +998,13 @@ impl Mux {
                 win.prune_dead_tabs(&live_tab_ids);
                 if win.is_empty() {
                     log::trace!("prune_dead_windows: window is now empty");
-                    dead_windows.push(*window_id);
+                    // Tmux control mode holds Activity for the life of the
+                    // domain so the window is not deleted mid-attach. Dead
+                    // tabs still have to go, otherwise the window can sit
+                    // on a removed bootstrap pane and swallow input.
+                    if activity == 0 {
+                        dead_windows.push(*window_id);
+                    }
                 }
             }
 
@@ -1018,7 +1026,7 @@ impl Mux {
             self.remove_window_internal(window_id);
         }
 
-        if self.is_empty() {
+        if activity == 0 && self.is_empty() {
             log::trace!("prune_dead_windows: is_empty, send MuxNotification::Empty");
             self.notify(MuxNotification::Empty);
         } else {

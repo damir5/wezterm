@@ -386,6 +386,7 @@ pub(crate) static MUX_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Domain;
     use crate::tmux_commands::SendKeys;
 
     #[test]
@@ -415,6 +416,20 @@ mod tests {
             .push_back(Box::new(TwoLineCommand));
         domain.inner.send_next_command();
         assert!(domain.inner.cmd_queue.lock().is_empty());
+    }
+
+    #[test]
+    fn inner_for_controller_pane_finds_the_domain() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let controller_id = crate::pane::alloc_pane_id();
+        let domain = Arc::new(TmuxDomain::new(controller_id));
+        let dyn_domain: Arc<dyn Domain> = domain.clone();
+        mux.add_domain(&dyn_domain);
+        assert!(TmuxDomain::inner_for_controller_pane(controller_id).is_some());
+        assert!(TmuxDomain::inner_for_controller_pane(controller_id.wrapping_add(1)).is_none());
     }
 
     #[test]
@@ -1098,11 +1113,53 @@ impl TmuxDomainState {
     }
 }
 
+impl TmuxDomainState {
+    /// Local pane that should receive typed input. Never the control
+    /// connection, which swallows keys except `q`.
+    pub fn preferred_input_pane_id(&self) -> Option<PaneId> {
+        let mux = Mux::try_get()?;
+        if let Some(window_id) = self.gui_window.lock().as_ref().map(|window| **window) {
+            if let Some(window) = mux.get_window(window_id) {
+                if let Some(pane) = window
+                    .get_active_tab()
+                    .and_then(|tab| tab.get_active_pane())
+                {
+                    if pane.pane_id() != self.pane_id && pane.domain_id() == self.domain_id {
+                        return Some(pane.pane_id());
+                    }
+                }
+                for tab in window.iter_tabs() {
+                    if let Some(pane) = tab.get_active_pane() {
+                        if pane.pane_id() != self.pane_id && pane.domain_id() == self.domain_id {
+                            return Some(pane.pane_id());
+                        }
+                    }
+                }
+            }
+        }
+        self.remote_panes
+            .lock()
+            .values()
+            .map(|pane| pane.lock().local_pane_id)
+            .find(|&pane_id| pane_id != self.pane_id)
+    }
+}
+
 impl TmuxDomain {
     /// Pane that owns the tmux control connection.  GUI consumers use this to
     /// associate tmux-created tabs with their original connection pane.
     pub fn controller_pane_id(&self) -> PaneId {
         self.inner.pane_id
+    }
+
+    pub(crate) fn inner_for_controller_pane(pane_id: PaneId) -> Option<Arc<TmuxDomainState>> {
+        Mux::try_get()?
+            .iter_domains()
+            .into_iter()
+            .find_map(|domain| {
+                let tmux = domain.downcast_ref::<TmuxDomain>()?;
+                (tmux.controller_pane_id() == pane_id).then(|| Arc::clone(&tmux.inner))
+            })
     }
 
     pub fn reorder_tab(&self, source: TabId, target: TabId, before: bool) -> bool {

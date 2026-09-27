@@ -1735,13 +1735,22 @@ impl TabInner {
 
     fn get_active_pane(&mut self) -> Option<Arc<dyn Pane>> {
         if let Some(zoomed) = self.zoomed.as_ref() {
-            return Some(Arc::clone(zoomed));
+            if !zoomed.is_dead() {
+                return Some(Arc::clone(zoomed));
+            }
         }
 
-        self.iter_panes_ignoring_zoom()
-            .iter()
-            .nth(self.active)
-            .map(|p| Arc::clone(&p.pane))
+        let panes = self.iter_panes_ignoring_zoom();
+        if let Some(item) = panes.get(self.active) {
+            if !item.pane.is_dead() {
+                return Some(Arc::clone(&item.pane));
+            }
+        }
+        if let Some(item) = panes.iter().find(|item| !item.pane.is_dead()) {
+            self.active = item.index;
+            return Some(Arc::clone(&item.pane));
+        }
+        None
     }
 
     fn get_active_idx(&self) -> usize {

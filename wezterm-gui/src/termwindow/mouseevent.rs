@@ -241,10 +241,13 @@ impl super::TermWindow {
 
         if let Some(index) = index {
             let _ = self.activate_tab(index as isize);
-            self.request_terminal_repaint();
-            self.mark_tab_sidebar_dirty();
-            self.emit_status_event();
+        } else {
+            log::warn!("sidebar tab {tab_id} is not in this window");
         }
+        let _ = self.ensure_live_active_pane();
+        self.request_terminal_repaint();
+        self.mark_tab_sidebar_dirty();
+        self.emit_status_event();
     }
 
     fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
@@ -293,7 +296,7 @@ impl super::TermWindow {
             return;
         }
 
-        let pane = match self.get_active_pane_or_overlay() {
+        let pane = match self.ensure_live_active_pane() {
             Some(pane) => pane,
             None => return,
         };
@@ -521,7 +524,7 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        let pane = match self.get_active_pane_or_overlay() {
+        let pane = match self.ensure_live_active_pane() {
             Some(pane) => pane,
             None => return,
         };
@@ -638,7 +641,7 @@ impl super::TermWindow {
     }
 
     fn do_new_tab_button_click(&mut self, button: MousePress) {
-        let pane = match self.get_active_pane_or_overlay() {
+        let pane = match self.ensure_live_active_pane() {
             Some(pane) => pane,
             None => return,
         };

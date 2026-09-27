@@ -558,7 +558,7 @@ impl super::TermWindow {
             self.schedule_next_status_update();
         }
 
-        let pane = match self.get_active_pane_or_overlay() {
+        let pane = match self.ensure_live_active_pane() {
             Some(pane) => pane,
             None => return,
         };
@@ -700,7 +700,7 @@ impl super::TermWindow {
         if self.input_stack_key_event(&window_key, context) {
             return;
         }
-        let pane = match self.get_active_pane_or_overlay() {
+        let pane = match self.ensure_live_active_pane() {
             Some(pane) => pane,
             None => return,
         };

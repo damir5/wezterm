@@ -727,19 +727,19 @@ impl TmuxDomainState {
                     }
                 }
                 if pane.pane_active {
-                    let gui_tabs = self.gui_tabs.lock();
-
-                    let Some(local_tab) = gui_tabs.get(&pane.window_id) else {
-                        anyhow::bail!("invalid tmux window id {}", pane.window_id);
-                    };
-
-                    match mux.get_tab(local_tab.tab_id) {
-                        Some(tab) => {
-                            tab.set_active_pane(&local_pane);
-                            mux.notify(MuxNotification::PaneFocused(local_pane.pane_id()));
+                    if let Err(err) = mux.focus_pane_and_containing_tab(local_pane.pane_id()) {
+                        log::warn!(
+                            "focus tmux pane {} after attach: {err:#}",
+                            local_pane.pane_id()
+                        );
+                        let gui_tabs = self.gui_tabs.lock();
+                        if let Some(local_tab) = gui_tabs.get(&pane.window_id) {
+                            if let Some(tab) = mux.get_tab(local_tab.tab_id) {
+                                tab.set_active_pane(&local_pane);
+                            }
                         }
-                        None => {}
                     }
+                    mux.notify(MuxNotification::PaneFocused(local_pane.pane_id()));
                 }
                 // tmux retains these per pane but does not replay them to new control clients.
                 local_pane.perform_actions(tmux_mouse_mode_actions(pane));
@@ -1978,6 +1978,49 @@ mod test {
     }
 
     #[test]
+    fn pane_removal_retries_tab_pruning_after_window_lock_contention() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let domain = TmuxDomain::new(alloc_pane_id());
+        let pane = domain
+            .inner
+            .create_pane(
+                &parse_pane_item("$1\t@2\t%3\t0\t0\t0\t80\t24\t0\t0\t1\t0\t0\t0\t0\t0\tzsh\t/tmp")
+                    .unwrap(),
+            )
+            .unwrap();
+        mux.add_pane(&pane).unwrap();
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        tab.assign_pane(&pane);
+        mux.add_tab_no_panes(&tab);
+        let window_builder = mux.new_empty_window(None, None);
+        let window_id = *window_builder;
+        mux.add_tab_to_window(&tab, window_id).unwrap();
+
+        let window = mux.get_window(window_id).unwrap();
+        mux.remove_pane(pane.pane_id());
+        assert!(mux.get_tab(tab.tab_id()).is_some());
+        drop(window);
+
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark_drained = Arc::clone(&drained);
+        promise::spawn::spawn_into_main_thread(async move {
+            mark_drained.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .detach();
+        while !drained.load(std::sync::atomic::Ordering::Acquire) {
+            executor.tick().unwrap();
+        }
+        assert!(mux.get_tab(tab.tab_id()).is_none());
+        assert!(mux
+            .get_window(window_id)
+            .map(|window| window.get_tab_idx_for_id(tab.tab_id()).is_none())
+            .unwrap_or(true));
+    }
+
+    #[test]
     fn window_names_with_whitespace_survive_attach() {
         let _mux_guard = MUX_TEST_LOCK.lock();
         let _executor = promise::spawn::SimpleExecutor::new();
@@ -2328,6 +2371,97 @@ mod test {
             .update_pane_legacy_identity(1, 2, 3, "codex", "");
         domain.inner.update_pane_current_command(1, 2, 3, "python");
         assert_eq!(pane.lock().agent_harness, "");
+    }
+
+    #[test]
+    fn preferred_input_and_attach_focus_leave_the_controller() {
+        let _mux_guard = MUX_TEST_LOCK.lock();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let mut domain = TmuxDomain::new(alloc_pane_id());
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            ..TerminalSize::default()
+        };
+        let controller = domain
+            .inner
+            .create_pane(
+                &parse_pane_item(
+                    "$1\t@99\t%99\t0\t0\t0\t80\t24\t0\t0\t1\t0\t0\t0\t0\t0\tzsh\t/tmp",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        Arc::get_mut(&mut domain.inner).unwrap().pane_id = controller.pane_id();
+        mux.add_pane(&controller).unwrap();
+        let controller_tab = Arc::new(Tab::new(&size));
+        controller_tab.assign_pane(&controller);
+        mux.add_tab_no_panes(&controller_tab);
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&controller_tab, window_id).unwrap();
+
+        let remote = domain
+            .inner
+            .create_pane(
+                &parse_pane_item("$1\t@2\t%3\t0\t0\t0\t80\t24\t0\t0\t1\t0\t0\t0\t0\t0\tzsh\t/tmp")
+                    .unwrap(),
+            )
+            .unwrap();
+        mux.add_pane(&remote).unwrap();
+        let remote_tab = Arc::new(Tab::new(&size));
+        remote_tab.assign_pane(&remote);
+        mux.add_tab_no_panes(&remote_tab);
+        mux.add_tab_to_window(&remote_tab, window_id).unwrap();
+        *domain.inner.gui_window.lock() = Some(window);
+
+        assert_eq!(
+            mux.get_active_tab_for_window(window_id)
+                .unwrap()
+                .get_active_pane()
+                .unwrap()
+                .pane_id(),
+            controller.pane_id()
+        );
+        assert_eq!(
+            domain.inner.preferred_input_pane_id(),
+            Some(remote.pane_id())
+        );
+
+        mux.focus_pane_and_containing_tab(remote.pane_id()).unwrap();
+        assert_eq!(
+            mux.get_active_tab_for_window(window_id)
+                .unwrap()
+                .get_active_pane()
+                .unwrap()
+                .pane_id(),
+            remote.pane_id()
+        );
+        assert!(mux
+            .get_window(window_id)
+            .unwrap()
+            .first_live_pane()
+            .is_some());
+
+        mux.get_window_mut(window_id)
+            .unwrap()
+            .remove_tab_id(controller_tab.tab_id());
+        assert_eq!(
+            mux.get_active_tab_for_window(window_id)
+                .unwrap()
+                .get_active_pane()
+                .unwrap()
+                .pane_id(),
+            remote.pane_id()
+        );
+
+        remote_tab.set_active_idx(99);
+        assert_eq!(
+            remote_tab.get_active_pane().unwrap().pane_id(),
+            remote.pane_id()
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::pane::CloseReason;
+use crate::pane::{CloseReason, Pane};
 use crate::{Mux, MuxNotification, Tab, TabId};
 use config::GuiPosition;
 use std::sync::Arc;
@@ -163,20 +163,83 @@ impl Window {
 
     /// Re-establish a valid active tab after a tab removal.
     fn fixup_active_tab_after_removal(&mut self, active: Option<Arc<Tab>>) {
-        let len = self.tabs.len();
         if let Some(active) = active {
             for (idx, tab) in self.tabs.iter().enumerate() {
                 if tab.tab_id() == active.tab_id() {
                     self.set_active_tab_idx_without_saving(idx);
+                    self.ensure_live_active_tab();
                     return;
                 }
             }
         }
 
-        if len > 0 && self.active_tab_idx >= len {
-            self.set_active_tab_idx_without_saving(len - 1);
+        if !self.tabs.is_empty() && self.active_tab_idx >= self.tabs.len() {
+            self.set_active_tab_idx_without_saving(self.tabs.len() - 1);
         } else {
             self.invalidate();
+        }
+        self.ensure_live_active_tab();
+    }
+
+    /// Prefer a live tmux content pane over a control-mode controller.
+    pub fn first_live_pane(&self) -> Option<Arc<dyn Pane>> {
+        let mut best: Option<(u8, Arc<dyn Pane>)> = None;
+        for tab in self.iter_tabs() {
+            for pos in tab.iter_panes_ignoring_zoom() {
+                if pos.pane.is_dead() {
+                    continue;
+                }
+                let rank = pane_input_rank(&pos.pane);
+                if best
+                    .as_ref()
+                    .map(|(best_rank, _)| rank < *best_rank)
+                    .unwrap_or(true)
+                {
+                    let pane = Arc::clone(&pos.pane);
+                    if rank == 0 {
+                        return Some(pane);
+                    }
+                    best = Some((rank, pane));
+                }
+            }
+        }
+        best.map(|(_, pane)| pane)
+    }
+
+    pub fn pane_is_controller(&self, pane: &Arc<dyn Pane>) -> bool {
+        let pane_id = pane.pane_id();
+        if pane.controller_pane_id() == Some(pane_id) {
+            return true;
+        }
+        self.iter_tabs().any(|tab| {
+            tab.iter_panes_ignoring_zoom().iter().any(|pos| {
+                pos.pane.pane_id() != pane_id && pos.pane.controller_pane_id() == Some(pane_id)
+            })
+        })
+    }
+
+    fn ensure_live_active_tab(&mut self) {
+        if self
+            .get_active_tab()
+            .and_then(|tab| tab.get_active_pane())
+            .map(|pane| !pane.is_dead())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let Some(pane) = self.first_live_pane() else {
+            return;
+        };
+        let Some(idx) = self.tabs.iter().position(|tab| {
+            tab.iter_panes_ignoring_zoom()
+                .iter()
+                .any(|pos| pos.pane.pane_id() == pane.pane_id())
+        }) else {
+            return;
+        };
+        self.set_active_tab_idx_without_saving(idx);
+        if let Some(tab) = self.get_active_tab() {
+            tab.set_active_pane(&pane);
         }
     }
 
@@ -318,5 +381,14 @@ impl Window {
         if invalidated {
             self.invalidate();
         }
+    }
+}
+
+fn pane_input_rank(pane: &Arc<dyn Pane>) -> u8 {
+    let pane_id = pane.pane_id();
+    match pane.controller_pane_id() {
+        Some(controller) if controller == pane_id => 2,
+        Some(_) => 0,
+        None => 1,
     }
 }

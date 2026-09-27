@@ -644,7 +644,7 @@ impl TermWindow {
         // force cursor to be repainted
         window.invalidate();
 
-        if let Some(pane) = self.get_active_pane_or_overlay() {
+        if let Some(pane) = self.ensure_live_active_pane() {
             pane.focus_changed(focused);
         }
 
@@ -2441,7 +2441,7 @@ impl TermWindow {
 
             drop(window);
 
-            if let Some(pane) = self.get_active_pane_or_overlay() {
+            if let Some(pane) = self.ensure_live_active_pane() {
                 pane.focus_changed(true);
             }
 
@@ -3669,16 +3669,71 @@ impl TermWindow {
             .as_ref()
             .map(|overlay| overlay.pane.clone())
         {
-            Some(tab_overlay)
-        } else {
-            let pane = tab.get_active_pane()?;
-            let pane_id = pane.pane_id();
-            self.pane_state(pane_id)
-                .overlay
-                .as_ref()
-                .map(|overlay| overlay.pane.clone())
-                .or_else(|| Some(pane))
+            if !tab_overlay.is_dead() {
+                return Some(tab_overlay);
+            }
         }
+        let pane = tab.get_active_pane()?;
+        if pane.is_dead() {
+            return None;
+        }
+        let pane_id = pane.pane_id();
+        self.pane_state(pane_id)
+            .overlay
+            .as_ref()
+            .map(|overlay| overlay.pane.clone())
+            .filter(|overlay| !overlay.is_dead())
+            .or_else(|| Some(pane))
+    }
+
+    /// After the bootstrap tab dies, or a tmux attach leaves the window on
+    /// the control pane, key/mouse/paint used to see `None` and drop input.
+    /// Pick a live pane in this window and make it the focused tab.
+    pub(super) fn ensure_live_active_pane(&self) -> Option<Arc<dyn Pane>> {
+        if let Some(pane) = self.get_active_pane_or_overlay() {
+            if !pane.is_dead() {
+                let mux = Mux::get();
+                if let Some(window) = mux.get_window(self.mux_window_id) {
+                    if window.pane_is_controller(&pane) {
+                        if let Some(better) = window.first_live_pane() {
+                            if better.pane_id() != pane.pane_id() {
+                                drop(window);
+                                return self.focus_recovered_pane(better);
+                            }
+                        }
+                    }
+                }
+                return Some(pane);
+            }
+        }
+        self.recover_live_pane()
+    }
+
+    fn recover_live_pane(&self) -> Option<Arc<dyn Pane>> {
+        let mux = Mux::get();
+        let pane = {
+            let window = mux.get_window(self.mux_window_id)?;
+            window.first_live_pane()?
+        };
+        self.focus_recovered_pane(pane)
+    }
+
+    fn focus_recovered_pane(&self, pane: Arc<dyn Pane>) -> Option<Arc<dyn Pane>> {
+        let pane_id = pane.pane_id();
+        let mux = Mux::get();
+        if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
+            log::warn!(
+                "window {} had no live active pane; using pane {pane_id} without mux focus: {err:#}",
+                self.mux_window_id
+            );
+            return Some(pane);
+        }
+        pane.focus_changed(true);
+        log::info!(
+            "window {} had no live active pane; recovered pane {pane_id}",
+            self.mux_window_id
+        );
+        Some(pane)
     }
 
     fn get_splits(&mut self) -> Vec<PositionedSplit> {

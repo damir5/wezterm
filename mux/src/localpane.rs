@@ -432,6 +432,20 @@ impl Pane for LocalPane {
                 if let Some(domain) = Mux::get().get_domain(tmux.domain_id) {
                     domain.detach()?;
                 }
+                return Ok(());
+            }
+            // After a GUI reconnect the window often stays on this control
+            // pane, which otherwise swallows every key.  Route typing into
+            // a live tmux pane and switch the window there.
+            if let Some(pane_id) = tmux.preferred_input_pane_id() {
+                if pane_id != self.pane_id {
+                    if let Some(pane) = Mux::get().get_pane(pane_id) {
+                        let mux = Mux::get();
+                        let _ = mux.focus_pane_and_containing_tab(pane_id);
+                        mux.notify(MuxNotification::PaneFocused(pane_id));
+                        return pane.key_down(key, mods);
+                    }
+                }
             }
             return Ok(());
         } else {
@@ -469,7 +483,17 @@ impl Pane for LocalPane {
 
     fn send_paste(&self, text: &str) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
-        if self.tmux_domain.lock().is_some() {
+        if let Some(tmux) = self.tmux_domain.lock().clone() {
+            if let Some(pane_id) = tmux.preferred_input_pane_id() {
+                if pane_id != self.pane_id {
+                    if let Some(pane) = Mux::get().get_pane(pane_id) {
+                        let mux = Mux::get();
+                        let _ = mux.focus_pane_and_containing_tab(pane_id);
+                        mux.notify(MuxNotification::PaneFocused(pane_id));
+                        return pane.send_paste(text);
+                    }
+                }
+            }
             anyhow::bail!(
                 "Cannot paste into the tmux connection pane; select a remote terminal pane"
             )
@@ -949,16 +973,13 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                     log::info!("tmux -CC mode requested");
 
                     let mux = Mux::get();
-                    let existing = mux.iter_domains().into_iter().find_map(|d| {
-                        let tmux = d.downcast_ref::<TmuxDomain>()?;
-                        (tmux.controller_pane_id() == self.pane_id)
-                            .then(|| (Arc::clone(&d), Arc::clone(&tmux.inner)))
-                    });
-                    let tmux_domain = match existing {
-                        Some((domain, inner)) => {
-                            log::info!("reusing existing tmux domain {}", domain.domain_id());
-                            if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
-                                tmux.reset();
+                    let tmux_domain = match TmuxDomain::inner_for_controller_pane(self.pane_id) {
+                        Some(inner) => {
+                            log::info!("reusing existing tmux domain {}", inner.domain_id);
+                            if let Some(domain) = mux.get_domain(inner.domain_id) {
+                                if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                                    tmux.reset();
+                                }
                             }
                             inner
                         }
@@ -1012,6 +1033,19 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                 }
             }
             DeviceControlMode::TmuxEvents(events) => {
+                if self.tmux_domain.is_none() {
+                    // Domain reset/detach can drop the handler pointer while
+                    // the control stream is still in DCS. Recover the domain
+                    // for this controller rather than dropping the protocol.
+                    if let Some(inner) = TmuxDomain::inner_for_controller_pane(self.pane_id) {
+                        if let Some(pane) = Mux::get().get_pane(self.pane_id) {
+                            if let Some(pane) = pane.downcast_ref::<LocalPane>() {
+                                pane.tmux_domain.lock().replace(Arc::clone(&inner));
+                            }
+                        }
+                        self.tmux_domain.replace(inner);
+                    }
+                }
                 if let Some(tmux) = self.tmux_domain.as_ref() {
                     tmux.advance(events);
                 } else {
