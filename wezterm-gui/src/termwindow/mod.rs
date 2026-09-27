@@ -377,7 +377,9 @@ impl EventState {
                         "Cannot queue {} event for pane {:?}, as \
                          there is already an event queued for pane {:?} \
                          in the same window",
-                        name, pane_id, panes.front().unwrap()
+                        name,
+                        pane_id,
+                        panes.front().unwrap()
                     );
                 }
                 false
@@ -3338,7 +3340,8 @@ impl TermWindow {
                             .await?;
                     }
 
-                    crate::trigger_and_log_gui_attached(mux_lua::MuxDomain(domain.domain_id())).await;
+                    crate::trigger_and_log_gui_attached(mux_lua::MuxDomain(domain.domain_id()))
+                        .await;
 
                     Result::<(), anyhow::Error>::Ok(())
                 })

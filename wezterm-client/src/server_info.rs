@@ -239,7 +239,8 @@ mod test {
 
     #[test]
     fn parse_valid_server_info() {
-        let json = r#"{"pid": 42123, "version": "20260918-123456-abcdef", "started_at_unix": 1773837986}"#;
+        let json =
+            r#"{"pid": 42123, "version": "20260918-123456-abcdef", "started_at_unix": 1773837986}"#;
         let info = ServerInfo::parse(json).expect("should parse");
         assert_eq!(info.pid, 42123);
         assert_eq!(info.version, "20260918-123456-abcdef");
@@ -362,7 +363,8 @@ mod test {
 
     #[test]
     fn read_server_info_file_handling() {
-        let test_dir = std::env::temp_dir().join(format!("wezterm-test-server-info-{}", std::process::id()));
+        let test_dir =
+            std::env::temp_dir().join(format!("wezterm-test-server-info-{}", std::process::id()));
         std::fs::create_dir_all(&test_dir).unwrap();
 
         // 1. Absent file -> None
@@ -374,7 +376,11 @@ mod test {
         assert!(read_server_info(&test_dir).is_none());
 
         // 3. Stale info with pid 0 -> None
-        std::fs::write(&file_path, r#"{"pid": 0, "version": "v1", "started_at_unix": 100}"#).unwrap();
+        std::fs::write(
+            &file_path,
+            r#"{"pid": 0, "version": "v1", "started_at_unix": 100}"#,
+        )
+        .unwrap();
         assert!(read_server_info(&test_dir).is_none());
 
         // 4. Valid info with current process PID -> Some(info)

@@ -71,11 +71,15 @@ pub(crate) fn detect(harness: &str, screen: &str) -> DeliveryReadiness {
                 .windows(4)
                 .any(|cells| cells.iter().all(|cell| matches!(cell, '■' | '⬝')));
         let agy_tasks = harness == "agy" && {
-            clean.split_whitespace().collect::<Vec<_>>().windows(3).any(|fields| {
-                fields[0] == "·"
-                    && fields[1].parse::<usize>().is_ok()
-                    && fields[2].starts_with("task")
-            })
+            clean
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(3)
+                .any(|fields| {
+                    fields[0] == "·"
+                        && fields[1].parse::<usize>().is_ok()
+                        && fields[2].starts_with("task")
+                })
         };
         if lower.contains("esc to interrupt")
             || (lower.contains("ctrl+c") && lower.contains("interrupt"))

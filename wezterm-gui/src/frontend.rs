@@ -1199,10 +1199,13 @@ mod input_stack_tests {
         });
         status.paint(&ctx, &pane);
         let output = ctx.end_pass();
-        assert!(output.shapes.iter().any(|shape| {
-            matches!(&shape.shape,
+        assert!(
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape,
             egui::Shape::Text(text) if text.galley.job.text == status.message)
-        }), "Paste failure must render on the first frame of an idle terminal");
+            }),
+            "Paste failure must render on the first frame of an idle terminal"
+        );
     }
 
     #[test]

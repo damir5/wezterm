@@ -2578,7 +2578,11 @@ mod test {
         mux.add_domain(&dyn_domain);
 
         let tmux_domain = dyn_domain.downcast_ref::<TmuxDomain>().unwrap();
-        tmux_domain.inner.cmd_queue.lock().push_back(Box::new(SelectPane { pane_id: 1 }));
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(SelectPane { pane_id: 1 }));
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
 
         tmux_domain.reset();

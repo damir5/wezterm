@@ -555,11 +555,7 @@ impl WriterWrapper {
             }
         });
         Self {
-            target: WriterTarget::Queued {
-                tx,
-                error,
-                pane_id,
-            },
+            target: WriterTarget::Queued { tx, error, pane_id },
         }
     }
 

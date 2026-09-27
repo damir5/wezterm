@@ -1118,10 +1118,8 @@ impl Client {
         let client_id = ClientId::new();
 
         thread::spawn(move || {
-            let mut backoff = ReconnectBackoff::new(
-                Duration::from_secs(1),
-                Duration::from_secs(10),
-            );
+            let mut backoff =
+                ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(10));
 
             loop {
                 if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
@@ -1169,7 +1167,9 @@ impl Client {
                                 log::info!("Reconnected to mux server!");
                                 crate::clear_toast();
                                 promise::spawn::spawn_into_main_thread(async move {
-                                    if let Err(err) = ClientDomain::reattach(local_domain_id, ui).await {
+                                    if let Err(err) =
+                                        ClientDomain::reattach(local_domain_id, ui).await
+                                    {
                                         log::error!("Error during reattach: {:#}", err);
                                     } else {
                                         crate::domain::fire_reattach_callback(local_domain_id);
@@ -1179,10 +1179,7 @@ impl Client {
                                 break;
                             }
                             Err(err) => {
-                                log::debug!(
-                                    "problem reconnecting: {}; will retry",
-                                    err
-                                );
+                                log::debug!("problem reconnecting: {}; will retry", err);
                             }
                         }
                     }

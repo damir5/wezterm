@@ -3,7 +3,7 @@ use crate::termwindow::{
     GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
-    Modifiers, CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
+    CursorIcon, Modifiers, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
     WindowDecorations, WindowOps, WindowState,
 };
 use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};

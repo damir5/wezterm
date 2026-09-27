@@ -200,8 +200,7 @@ impl TermWindow {
         let active_tab_id = Mux::get()
             .get_window(self.mux_window_id)
             .and_then(|window| window.get_active_tab().map(|tab| tab.tab_id()))?;
-        self.tab_sidebar
-            .relative_tab_id(active_tab_id, delta, wrap)
+        self.tab_sidebar.relative_tab_id(active_tab_id, delta, wrap)
     }
 
     pub fn tab_sidebar_width_pixels(&self) -> usize {

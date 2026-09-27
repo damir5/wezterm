@@ -656,7 +656,10 @@ impl ClientDomain {
                                     entry.working_dir.clone().map(Into::into),
                                     entry.controller_pane_id,
                                 ));
-                                inner.record_remote_to_local_pane_mapping(entry.pane_id, pane.pane_id());
+                                inner.record_remote_to_local_pane_mapping(
+                                    entry.pane_id,
+                                    pane.pane_id(),
+                                );
                                 mux.add_pane(&pane).expect("failed to add pane to mux");
                                 if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
                                     client_pane.reestablish_and_backfill();
