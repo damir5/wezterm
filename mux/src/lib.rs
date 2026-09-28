@@ -403,6 +403,83 @@ mod spawn_domain_test {
             SpawnTabDomain::DefaultDomain
         );
     }
+
+    struct TermWizDomain(DomainId);
+
+    #[async_trait::async_trait(?Send)]
+    impl Domain for TermWizDomain {
+        async fn spawn_pane(
+            &self,
+            size: TerminalSize,
+            _command: Option<CommandBuilder>,
+            _command_dir: Option<String>,
+        ) -> anyhow::Result<Arc<dyn Pane>> {
+            Ok(crate::termwiztermtab::allocate(size, Arc::new(config::TermConfig::new())).1)
+        }
+        fn detachable(&self) -> bool {
+            false
+        }
+        fn domain_id(&self) -> DomainId {
+            self.0
+        }
+        fn domain_name(&self) -> &str {
+            "test"
+        }
+        async fn attach(&self, _window_id: Option<WindowId>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn detach(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn state(&self) -> DomainState {
+            DomainState::Attached
+        }
+    }
+
+    #[test]
+    fn new_tab_opens_after_the_focused_tab_and_returns_to_it() {
+        let _mux_guard = crate::tmux::MUX_TEST_LOCK.lock();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let domain: Arc<dyn Domain> = Arc::new(TermWizDomain(domain::alloc_domain_id()));
+        let mux = Arc::new(Mux::new(Some(domain)));
+        Mux::set_mux(&mux);
+        let spawn = |window_id, current_pane_id| {
+            promise::spawn::block_on(mux.spawn_tab_or_window(
+                window_id,
+                SpawnTabDomain::DefaultDomain,
+                None,
+                None,
+                TerminalSize::default(),
+                current_pane_id,
+                "default".to_string(),
+                None,
+            ))
+            .unwrap()
+        };
+
+        let (a, a_pane, window_id) = spawn(None, None);
+        let (b, _, _) = spawn(Some(window_id), None);
+        let (c, _, _) = spawn(Some(window_id), None);
+        let order = || -> Vec<TabId> {
+            mux.get_window(window_id)
+                .unwrap()
+                .iter_tabs()
+                .map(|tab| tab.tab_id())
+                .collect()
+        };
+        assert_eq!(order(), vec![a.tab_id(), b.tab_id(), c.tab_id()]);
+
+        mux.get_window_mut(window_id)
+            .unwrap()
+            .remember_and_set_active_tab_idx(0);
+        let (d, _, _) = spawn(Some(window_id), Some(a_pane.pane_id()));
+        // The new tab sits right below the tab it was opened from, not at the end...
+        assert_eq!(order(), vec![a.tab_id(), d.tab_id(), b.tab_id(), c.tab_id()]);
+        // ...and "back to previous" returns to that tab.
+        let window = mux.get_window(window_id).unwrap();
+        assert_eq!(window.get_active_tab().unwrap().tab_id(), d.tab_id());
+        assert_eq!(window.get_last_active_tab_idx(), Some(0));
+    }
 }
 
 impl MuxWindowBuilder {
@@ -1444,6 +1521,16 @@ impl Mux {
             (*window_builder, size)
         };
 
+        // The new tab goes right after the tab that was focused when the spawn started.
+        let current_tab_id = current_pane_id
+            .and_then(|id| self.resolve_pane_id(id))
+            .filter(|&(_, pane_window_id, _)| pane_window_id == window_id)
+            .map(|(_, _, tab_id)| tab_id);
+        let origin_tab_id = current_tab_id.or_else(|| {
+            self.get_window(window_id)
+                .and_then(|window| window.get_active_tab().map(|tab| tab.tab_id()))
+        });
+
         if domain.state() == DomainState::Detached {
             domain.attach(Some(window_id)).await?;
         }
@@ -1499,6 +1586,9 @@ impl Mux {
         let mut window = self
             .get_window_mut(window_id)
             .ok_or_else(|| anyhow!("no such window!?"))?;
+        if let Some(origin_tab_id) = origin_tab_id {
+            window.move_tab_by_id(tab.tab_id(), origin_tab_id, false);
+        }
         if let Some(idx) = window.get_tab_idx_for_id(tab.tab_id()) {
             window.remember_and_set_active_tab_idx(idx);
         }
