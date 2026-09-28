@@ -92,6 +92,14 @@ impl UserData for MuxPane {
             }))
         });
         methods.add_method("pane_id", |_, this, _: ()| Ok(this.0));
+        // The mux server's id stays stable across GUI restarts; the local id does not.
+        methods.add_method("remote_pane_id", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            Ok(pane
+                .downcast_ref::<wezterm_client::pane::ClientPane>()
+                .map(|pane| pane.remote_pane_id()))
+        });
 
         methods.add_async_method("split", |_, this, args: Option<SplitPane>| async move {
             args.unwrap_or_default().run(this).await

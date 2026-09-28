@@ -23,6 +23,21 @@ impl UserData for MuxTab {
             }))
         });
         methods.add_method("tab_id", |_, this, _: ()| Ok(this.0));
+        // The mux server's id stays stable across GUI restarts; the local id does not.
+        methods.add_method("remote_tab_id", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let tab = this.resolve(&mux)?;
+            let Some(pane) = tab.get_active_pane() else {
+                return Ok(None);
+            };
+            Ok(mux
+                .get_domain(pane.domain_id())
+                .and_then(|domain| {
+                    domain
+                        .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                        .and_then(|domain| domain.local_to_remote_tab_id(this.0))
+                }))
+        });
         methods.add_method("window", |_, this, _: ()| {
             let mux = get_mux()?;
             for window_id in mux.iter_windows() {
